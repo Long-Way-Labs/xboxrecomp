@@ -66,8 +66,9 @@ void mcpx_debug_end_frame(void) {}
  * (dma_resolve in nv2a_pb_exec.c, bus_resolve in usb/ohci.c) -- but not in
  * the same order. The contiguous allocator hands out physical numbers inside
  * the image's range, so a page there can be both an image page and a window
- * page. The APU asks the page map first (below: a title's voice array can
- * be contiguous memory inside its image). The OHCI asks the image first:
+ * page. The APU asks first whether the title named the page from RAM, then
+ * the page map (below: a title's voice array can be contiguous memory inside
+ * its image). The OHCI asks the image first:
  * Burnout 3's XPP reads its first descriptor into .data at 0x0041A904, a
  * page the boot has also allocated as contiguous memory, and the window copy
  * is not where the driver looks.
@@ -116,7 +117,14 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
      * to 48 MB (its BSS), and DirectSound's voice array sits at a physical
      * address inside it. Resolved to RAM, the VP never saw the driver
      * take an idle voice off its list and re-trapped it every frame. */
-    if (xbox_ContiguousPageMap()[a >> 12])   /* a is below the window's 64 MB here */
+    /* Except a heap page the title named from RAM through
+     * MmGetPhysicalAddress (image pages are never recorded, so the voice
+     * array case above stands). Burnout 3's sound effects and music stream
+     * sit in its heap at physical numbers inside a contiguous block, and read
+     * from the window they played as noise and silence. */
+    if (xbox_PhysRamNameMap()[a >> 12])      /* a is below the window's 64 MB here */
+        return g_apu_ram_ptr + a;
+    if (xbox_ContiguousPageMap()[a >> 12])
         return g_apu_ram_ptr + 0x80000000u + a;
     if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
         return g_apu_ram_ptr + a;
@@ -126,7 +134,8 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
 }
 
 /* Which of the cases above resolved an address, for the RECOMP_APU_TRACE
- * per-voice line: "win" (a page the contiguous allocator handed out), "img"
+ * per-voice line: "named" (a heap page MmGetPhysicalAddress named), "win"
+ * (a page the contiguous allocator handed out), "img"
  * (inside the XBE image), "hiwin" (below the arena's high-water mark but not
  * a live page), "ram" (plain RAM below 64 MB) or "wrap" (at or above 64 MB,
  * which the fallback folds into the low 64 MB). */
@@ -135,6 +144,8 @@ const char *mcpx_apu_phys_class(uint64_t addr)
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
     if (a >= (64u << 20))
         return a < apu_mapped_ram() ? "ram" : "wrap";
+    if (xbox_PhysRamNameMap()[a >> 12])
+        return "named";
     if (xbox_ContiguousPageMap()[a >> 12])
         return "win";
     if (a >= g_xbox_image_lo && a < g_xbox_image_hi)

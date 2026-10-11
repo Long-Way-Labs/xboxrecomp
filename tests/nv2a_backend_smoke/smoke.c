@@ -572,6 +572,75 @@ static uint32_t sample_rtt(const struct nv2a_pb_backend *b, uint32_t tex)
     return px_at(BUF0, W * 4u, 132, 132);
 }
 
+/* The NV2A's 1/16-pixel truncation of screen positions: the XDK's 0.53125
+ * offset lands an aligned edge on a pixel centre (nv2a_screen_snap). 1 on
+ * failure. */
+static int snap_case(void)
+{
+    static const float in[][2] = {
+        {0.53125f, 0.5f}, {16.53125f, 16.5f}, {640.53125f, 640.5f},
+        {320.0f, 320.0f}, {100.0625f, 100.0625f}, {100.09f, 100.0625f},
+        /* trunc, not floor: toward zero, as xemu's roundScreenCoords */
+        {-0.53125f, -0.5f}, {-0.03f, 0.0f},
+    };
+    unsigned i;
+    int f = 0;
+    for (i = 0; i < sizeof in / sizeof in[0]; i++)
+        if (nv2a_screen_snap(in[i][0]) != in[i][1]) {
+            fprintf(stderr, "[backend-smoke] screen snap: %g -> %g, want %g\n",
+                    in[i][0], nv2a_screen_snap(in[i][0]), in[i][1]);
+            f = 1;
+        }
+    return f;
+}
+
+/* The XDK's rectangle: every corner at a pixel edge plus 0.53125. Snapped
+ * to x.5, its edges sit on pixel centres, and the top-left rule keeps the
+ * first column and row and leaves the column and row past the far edges
+ * (Burnout 3's pause overlay: the hardware draws columns 0..w-1). One quad at
+ * the origin, one inside. On backend b (the CPU rasteriser included).
+ * Returns the failures. */
+static int edge_case(const struct nv2a_pb_backend *b, const char *name)
+{
+    static const uint32_t white[4] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+    static const struct { uint32_t x, y, lit; } pr[] = {
+        {0, 0, 1}, {0, 30, 1}, {30, 0, 1}, {63, 63, 1}, {64, 30, 0}, {30, 64, 0},
+        {64, 64, 0},
+        {100, 100, 1}, {99, 130, 0}, {130, 99, 0}, {163, 163, 1}, {164, 130, 0},
+        {130, 164, 0},
+    };
+    const struct nv2a_pb_present *p;
+    uint32_t i;
+    int a, f = 0;
+
+    nv2a_pb_set_backend(b);
+    for (i = 0; i < W * H; i++)
+        ((uint32_t *)guest(BUF0))[i] = 0xFFFF00FFu;
+    surf(BUF0, W, H, 1, 0xFF000000u);
+    for (a = 0; a < 16; a++)
+        M(0x1760 + 4 * a, a == 0 ? 0x42u : a == 3 ? 0x40u : 0x02u);
+    quad_uv(0.53125f, 0.53125f, 64.53125f, 64.53125f, white, NULL);
+    quad_uv(100.53125f, 100.53125f, 164.53125f, 164.53125f, white, NULL);
+    M(0x0210, BUF1);
+    M(0x0130, 0);
+    p = nv2a_pb_present_state();
+    if (b->sync_guest)
+        b->sync_guest(p->offset, p->pitch, p->w, p->h);
+    for (i = 0; i < sizeof pr / sizeof pr[0]; i++) {
+        uint32_t got = px_at(BUF0, W * 4u, pr[i].x, pr[i].y);
+        uint32_t want = pr[i].lit ? 0xFFFFFFFFu : 0xFF000000u;
+        if (got != want) {
+            fprintf(stderr, "[backend-smoke] edges %s: pixel (%u,%u) %08X, want %08X\n",
+                    name, pr[i].x, pr[i].y, got, want);
+            f++;
+        }
+    }
+    fprintf(stderr, "[backend-smoke] edges %s: 0.53125-offset quads keep column and"
+            " row 0, not w and h %s\n", name, f ? "FAIL" : "PASS");
+    nv2a_pb_set_backend(NULL);
+    return f;
+}
+
 /* A 64x64 R5G6B5 target at BUF6 drawn, sampled (a decode: this backend binds
  * only 32-bit targets as they are), drawn again and sampled again, all in one
  * flip -- Burnout 3's speed blur. The second sample must see the second
@@ -1109,6 +1178,12 @@ int main(int argc, char **argv)
         fprintf(stderr, "[backend-smoke] FAIL: index limit\n");
         failures++;
     }
+    if (!guard && !noalias && snap_case()) {
+        fprintf(stderr, "[backend-smoke] FAIL: screen snap\n");
+        failures++;
+    }
+    if (!guard && !noalias)
+        failures += edge_case(nv2a_pb_cpu_backend(), "cpu");
     /* So is the CPU clear box. */
     if (!guard && !noalias && clip_cpu_cases()) {
         fprintf(stderr, "[backend-smoke] FAIL: CPU clip clear or clear rect\n");
@@ -1185,6 +1260,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "[backend-smoke] FAIL: %d write-back checks\n", f);
         failures += f;
         failures += redraw_case(gpu);
+        failures += edge_case(gpu, "gpu");
         f = alias_cases(gpu);
         if (f)
             fprintf(stderr, "[backend-smoke] FAIL: %d render-target ownership checks\n", f);

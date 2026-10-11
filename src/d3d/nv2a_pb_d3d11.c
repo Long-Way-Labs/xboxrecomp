@@ -401,8 +401,9 @@ static const char s_ps_src[] =
     "}\n";
 
 /* Batches without a vertex program: attribute 0 is already in surface pixels
- * (x, y, z, rhw); 3 and 4 are the diffuse and specular colours, 9..12 the
- * texture coordinates. */
+ * (x, y, z, rhw), snapped to the NV2A's 1/16-pixel grid (nv2a_screen_snap);
+ * 3 and 4 are the diffuse and specular colours, 9..12 the texture
+ * coordinates. */
 static const char s_vs_passthrough_src[] =
     "cbuffer VSH_Viewport : register(b2) { float4 vp_scale; float4 vp_off; };\n"
     "struct VS_IN { float4 v0 : ATTR0; float4 v3 : ATTR3; float4 v4 : ATTR4;\n"
@@ -411,7 +412,7 @@ static const char s_vs_passthrough_src[] =
     VS_OUT_DECL
     "VS_OUT main(VS_IN i) {\n"
     "    VS_OUT o = (VS_OUT)0;\n"
-    "    o.oPos = float4(i.v0.xy * vp_scale.xy + vp_off.xy,\n"
+    "    o.oPos = float4((trunc(i.v0.xy * 16.0) / 16.0) * vp_scale.xy + vp_off.xy,\n"
     "                    saturate(i.v0.z * vp_scale.z), 1.0);\n"
     "    o.oD0 = i.v3; o.oD1 = i.v4; o.oFog = 1.0;\n"
     "    o.oT0 = i.v9; o.oT1 = i.v10; o.oT2 = i.v11; o.oT3 = i.v12;\n"

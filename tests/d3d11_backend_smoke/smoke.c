@@ -306,6 +306,49 @@ static int index_probe(uint32_t buf, const char *what, int x, int y, uint32_t wa
     return !ok;
 }
 
+/* The XDK's rectangle: every corner at a pixel edge plus 0.53125. Snapped to
+ * the NV2A's 1/16 grid its edges sit on pixel centres, and the top-left rule
+ * keeps the first column and row and leaves the column and row past the far
+ * edges (nv2a_backend_smoke's edge_case, on D3D11). Returns the failures. */
+static int edge_cases(const uint32_t *buf)
+{
+    static const struct { int x, y, lit; } pr[] = {
+        {0, 0, 1}, {0, 30, 1}, {30, 0, 1}, {63, 63, 1}, {64, 30, 0}, {30, 64, 0},
+        {64, 64, 0},
+        {100, 100, 1}, {99, 130, 0}, {130, 99, 0}, {163, 163, 1}, {164, 130, 0},
+        {130, 164, 0},
+    };
+    static const float q[2][2] = {{0.53125f, 64.53125f}, {100.53125f, 164.53125f}};
+    unsigned i;
+    int a, k, f = 0;
+
+    surf_clear(buf[0], 640, 480, 0xFF000000u);
+    for (a = 0; a < 16; a++)
+        M(0x1760 + 4 * a, a == 0 ? 0x42u : a == 3 ? 0x40u : 0x02u);
+    for (k = 0; k < 2; k++) {
+        M(0x17FC, 8);
+        vertex(q[k][0], q[k][0], 0xFFFFFFFFu);
+        vertex(q[k][1], q[k][0], 0xFFFFFFFFu);
+        vertex(q[k][1], q[k][1], 0xFFFFFFFFu);
+        vertex(q[k][0], q[k][1], 0xFFFFFFFFu);
+        M(0x17FC, 0);
+    }
+    for (i = 0; i < sizeof pr / sizeof pr[0]; i++) {
+        uint32_t c = nv2a_pb_d3d11_pixel(buf[0], pr[i].x, pr[i].y) & 0x00FFFFFFu;
+        uint32_t want = pr[i].lit ? 0x00FFFFFFu : 0;
+        if (c != want) {
+            fprintf(stderr, "[backend-smoke] edges: pixel (%d,%d) %06X, want %06X\n",
+                    pr[i].x, pr[i].y, c, want);
+            f++;
+        }
+    }
+    M(0x0210, buf[1]);
+    M(0x0130, 0);
+    fprintf(stderr, "[backend-smoke] edges: 0.53125-offset quads keep column and row 0,"
+            " not w and h %s\n", f ? "FAIL" : "PASS");
+    return f;
+}
+
 /* Returns the failures. */
 static int index_cases(const uint32_t *buf)
 {
@@ -1106,6 +1149,10 @@ int main(int argc, char **argv)
     if (cpu_clip_cases(buf[0])) {
         fprintf(stderr, "[backend-smoke] FAIL: CPU clip clear or clear rect\n");
         return 6;
+    }
+    if (edge_cases(buf)) {
+        fprintf(stderr, "[backend-smoke] FAIL: 0.53125-offset edges\n");
+        return 7;
     }
     fprintf(stderr, "[backend-smoke] done\n");
     return 0;

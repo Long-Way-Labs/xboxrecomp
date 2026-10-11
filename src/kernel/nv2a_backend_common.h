@@ -889,6 +889,24 @@ void nv2a_ps_consts_fill(const struct nv2a_pb_vsh *v,
                          const struct nv2a_stage st[4],
                          struct nv2a_ps_consts *pc);
 
+/* A screen-space vertex coordinate on the NV2A rasteriser's grid: 4 fraction
+ * bits, truncated (xemu's roundScreenCoords). XDK D3D adds 0.53125 to every
+ * position so that, after this, a D3D pixel-aligned edge lands exactly on a
+ * host pixel centre and the top-left rule keeps the first row and column. A
+ * host rasteriser with finer sub-pixel precision kept the 1/32 and drew every
+ * full-screen pass one pixel right and down. The MSL and HLSL epilogues and
+ * the Metal and D3D11 pass-through shaders apply the same expression.
+ *
+ * trunc, not floor, on purpose: a negative coordinate rounds toward zero
+ * (-0.53125 -> -0.5, -0.03 -> 0), as xemu's roundScreenCoords does. Geometry
+ * that starts left of or above the surface keeps the same edge the hardware
+ * gives it; floor would move it a sixteenth out and change which column the
+ * top-left rule includes. */
+static inline float nv2a_screen_snap(float p)
+{
+    return truncf(p * 16.0f) / 16.0f;
+}
+
 /* The vertex stage's viewport and fog constants: c = 2/w, -2/h, 1/zmax, 0,
  * -1, 1, 0, 0, fog params 0..2, 0; u = fog on, fog func, fog abs, fog
  * edge-one, specular on, light_ctl bit 17 (separate specular), 0, 0. */

@@ -339,9 +339,11 @@ int d3d8_vsh_generate_msl(const NV2AVshProgram *program, unsigned flags,
     }
     sb_append(&sb, "#undef R12\n    VOut o;\n");
     if (flags & D3D8_MSL_SCREEN_SPACE) {
-        /* As the HLSL: pixels -> NDC, z -> [0,1], times w again so the
-         * rasteriser's divide gives perspective-correct interpolation. */
+        /* As the HLSL: onto the NV2A's 1/16-pixel grid (nv2a_screen_snap),
+         * pixels -> NDC, z -> [0,1], times w again so the rasteriser's
+         * divide gives perspective-correct interpolation. */
         sb_append(&sb,
+            "    oPos.xy = trunc(oPos.xy * 16.0) / 16.0;\n"
             "    float  pw = (oPos.w == 0.0) ? 1.0 : oPos.w;\n"
             "    o.pos = float4((oPos.xy * vp.vp_scale.xy + vp.vp_off.xy) * pw,\n"
             "                   oPos.z * vp.vp_scale.z * pw, pw);\n"

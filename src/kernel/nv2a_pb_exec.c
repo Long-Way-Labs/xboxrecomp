@@ -1702,6 +1702,26 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
     }
 }
 
+/* Top-left fill rule (D3D's, and the NV2A's). With positions on the 1/16
+ * grid a vertex often lands exactly on a pixel centre -- the XDK's 0.53125
+ * offset puts every rectangle edge on x.5 -- so an inclusive test would draw
+ * both triangles' copy of a shared edge, and a full-screen quad would light
+ * the column and row past its right and bottom edges. A pixel centre on an
+ * edge belongs to the triangle whose interior is to its right (a left edge),
+ * or below it on a horizontal edge (a top edge): exactly one of two triangles
+ * sharing that edge owns it. s is the sign of the area; (dx, dy) runs along
+ * the edge in the winding the edge functions use. */
+static inline int edge_owns_tie(float s, float dx, float dy)
+{
+    float gx = -s * dy, gy = s * dx;   /* points into the interior */
+    return gx > 0.0f || (gx == 0.0f && gy > 0.0f);
+}
+
+static inline int edge_in(float s, float w, int owns_tie)
+{
+    return s * w > 0.0f || (w == 0.0f && owns_tie);
+}
+
 /* Half-space fill. Barycentric edge functions rather than scanline slopes:
  * the same test decides both windings, so a title that emits clockwise
  * triangles does not silently render nothing. */
@@ -1711,8 +1731,8 @@ static void raster_triangle(const float a[2], const float b[2],
 {
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
-    float area;
-    int minx, maxx, miny, maxy, x, y;
+    float area, s_;
+    int minx, maxx, miny, maxy, x, y, t0, t1, t2;
     int textured = uv && s_gpu.tex.valid;
 
     if (bpp != 4 && bpp != 2)
@@ -1721,6 +1741,10 @@ static void raster_triangle(const float a[2], const float b[2],
     area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
     if (area == 0.0f)
         return;                            /* degenerate */
+    s_ = area > 0.0f ? 1.0f : -1.0f;
+    t0 = edge_owns_tie(s_, b[0] - a[0], b[1] - a[1]);
+    t1 = edge_owns_tie(s_, c[0] - b[0], c[1] - b[1]);
+    t2 = edge_owns_tie(s_, a[0] - c[0], a[1] - c[1]);
 
     /* Where this batch writes. The same check the per-pixel path made, made
      * once: a surface address landing on the title's own image is no safer
@@ -1748,8 +1772,8 @@ static void raster_triangle(const float a[2], const float b[2],
             float w0 = (b[0] - a[0]) * (py - a[1]) - (b[1] - a[1]) * (px - a[0]);
             float w1 = (c[0] - b[0]) * (py - b[1]) - (c[1] - b[1]) * (px - b[0]);
             float w2 = (a[0] - c[0]) * (py - c[1]) - (a[1] - c[1]) * (px - c[0]);
-            if (!((w0 >= 0 && w1 >= 0 && w2 >= 0)
-               || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
+            if (!(edge_in(s_, w0, t0) && edge_in(s_, w1, t1)
+                  && edge_in(s_, w2, t2)))
                 continue;
             if (textured) {
                 /* Barycentric, straight from the edge functions already
@@ -1942,12 +1966,16 @@ static void dump_surface_bmp(void);
 static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
 {
     float p[3][4], uv[3][2];
-    int textured;
+    int textured, k;
 
     if (!fetch_attr(&s_gpu.attr[0], i0, p[0])
      || !fetch_attr(&s_gpu.attr[0], i1, p[1])
      || !fetch_attr(&s_gpu.attr[0], i2, p[2]))
         return;
+    for (k = 0; k < 3; k++) {   /* the NV2A's sub-pixel grid, as the GPU paths */
+        p[k][0] = nv2a_screen_snap(p[k][0]);
+        p[k][1] = nv2a_screen_snap(p[k][1]);
+    }
 
     textured = fetch_texcoord(i0, uv[0])
             && fetch_texcoord(i1, uv[1])
@@ -2361,8 +2389,8 @@ static void vsh_transform(uint32_t index, XfVert *xv)
     nv2a_vsh_run((const uint32_t (*)[4])s_vsh.prog, s_vsh.start, s_vsh.c,
                  s_vsh.cxt_write, (const float (*)[4])v, &o);
     s_vsh.verts_run++;
-    xv->x = o.o[NV2A_VSH_O_POS][0];
-    xv->y = o.o[NV2A_VSH_O_POS][1];
+    xv->x = nv2a_screen_snap(o.o[NV2A_VSH_O_POS][0]);
+    xv->y = nv2a_screen_snap(o.o[NV2A_VSH_O_POS][1]);
     xv->z = o.o[NV2A_VSH_O_POS][2];
     xv->w = o.o[NV2A_VSH_O_POS][3];
     /* oPos.w == 0 means a program that never divided by w (x, y, z are
@@ -3192,8 +3220,8 @@ static void raster_tri_xf(const XfVert *a, const XfVert *b, const XfVert *c,
 {
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
-    float area, inv_w[3], zscale = 1.0f / vsh_zmax();
-    int minx, maxx, miny, maxy, x, y, use_z, use_s, use_rc, n;
+    float area, inv_w[3], zscale = 1.0f / vsh_zmax(), s_;
+    int minx, maxx, miny, maxy, x, y, use_z, use_s, use_rc, n, t0, t1, t2;
     LodTri lod;
 
     if (bpp != 4 && bpp != 2)
@@ -3242,6 +3270,10 @@ static void raster_tri_xf(const XfVert *a, const XfVert *b, const XfVert *c,
 
     inv_w[0] = 1.0f / a->w; inv_w[1] = 1.0f / b->w; inv_w[2] = 1.0f / c->w;
     lod_tri_setup(a, b, c, area, inv_w, &lod);
+    s_ = area > 0.0f ? 1.0f : -1.0f;
+    t0 = edge_owns_tie(s_, b->x - a->x, b->y - a->y);
+    t1 = edge_owns_tie(s_, c->x - b->x, c->y - b->y);
+    t2 = edge_owns_tie(s_, a->x - c->x, a->y - c->y);
 
     for (y = miny; y < maxy; y++) {
         for (x = minx; x < maxx; x++) {
@@ -3255,8 +3287,8 @@ static void raster_tri_xf(const XfVert *a, const XfVert *b, const XfVert *c,
             uint32_t argb, zs_op = 0;
             int k, zs = 0;
 
-            if (!((w0 >= 0 && w1 >= 0 && w2 >= 0)
-               || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
+            if (!(edge_in(s_, w0, t0) && edge_in(s_, w1, t1)
+                  && edge_in(s_, w2, t2)))
                 continue;
             /* w1 is opposite a, w2 opposite b, w0 opposite c. */
             la = w1 / area; lb = w2 / area; lc = w0 / area;
@@ -3827,7 +3859,8 @@ typedef struct {
     uint8_t *mem;
     uint32_t bpp;
     float area, inv_w[3], zscale;
-    float e0dx, e0dy, e1dx, e1dy, e2dx, e2dy;
+    float e0dx, e0dy, e1dx, e1dy, e2dx, e2dy, s_;
+    int t0, t1, t2;   /* edge_owns_tie per edge */
     int minx, maxx, miny, maxy, use_z, use_s, use_rc, textured, unit_w;
     LodTri lod;
 } FastTri;
@@ -3854,6 +3887,8 @@ static void fast_rows(const FastTri *T, int y0, int step)
     const float e2dx = T->e2dx, e2dy = T->e2dy;
     const int minx = T->minx, maxx = T->maxx, use_z = T->use_z, use_s = T->use_s;
     const int use_rc = T->use_rc;
+    const float s_ = T->s_;
+    const int t0 = T->t0, t1 = T->t1, t2 = T->t2;
     float r[16][4];
     int x, y, n;
 
@@ -3865,7 +3900,8 @@ static void fast_rows(const FastTri *T, int y0, int step)
         float p0 = py - a->y, p1 = py - b->y, p2 = py - c->y;
         int lo, hi, ga, gb, la_, lb_, ia, ib;
 
-        /* Columns where all three are >= 0, and where all three are <= 0. */
+        /* Columns where all three are >= 0, and where all three are <= 0:
+         * inclusive, so a superset of what the top-left test below keeps. */
         edge_interval(e0dx, p0, e0dy, a->x, 1, minx, maxx, &ga, &gb);
         edge_interval(e1dx, p1, e1dy, b->x, 1, ga, gb > ga ? gb : ga, &ia, &ib);
         ga = ia; gb = ib;
@@ -3899,8 +3935,8 @@ static void fast_rows(const FastTri *T, int y0, int step)
             uint32_t argb, zs_op = 0;
             int k, zs = 0;
 
-            if (!((w0 >= 0 && w1 >= 0 && w2 >= 0)
-               || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
+            if (!(edge_in(s_, w0, t0) && edge_in(s_, w1, t1)
+                  && edge_in(s_, w2, t2)))
                 continue;
             la = w1 / area; lb = w2 / area; lc = w0 / area;
 
@@ -4236,6 +4272,10 @@ static void raster_tri_xf_fast(const XfVert *a, const XfVert *b, const XfVert *c
     T.e0dx = b->x - a->x; T.e0dy = b->y - a->y;
     T.e1dx = c->x - b->x; T.e1dy = c->y - b->y;
     T.e2dx = a->x - c->x; T.e2dy = a->y - c->y;
+    T.s_ = area > 0.0f ? 1.0f : -1.0f;
+    T.t0 = edge_owns_tie(T.s_, T.e0dx, T.e0dy);
+    T.t1 = edge_owns_tie(T.s_, T.e1dx, T.e1dy);
+    T.t2 = edge_owns_tie(T.s_, T.e2dx, T.e2dy);
 
     fast_rows_parallel(&T);
 

@@ -454,8 +454,11 @@ int d3d8_vsh_generate_hlsl_ex(const NV2AVshProgram *program, unsigned flags,
          * of w, mad with c[59]). NV2A has no viewport stage after the
          * program; D3D11 does. Undo it: pixels -> NDC, z -> [0,1], then
          * multiply back by w so the rasteriser divides it out again and
-         * interpolates perspective-correctly. */
+         * interpolates perspective-correctly. First the NV2A rasteriser's
+         * 1/16-pixel truncation (nv2a_screen_snap): without it the XDK's
+         * 0.53125 offset moves full-screen passes one pixel. */
         sb_append(&sb,
+            "    oPos.xy = trunc(oPos.xy * 16.0) / 16.0;\n"
             "    float  pw = (oPos.w == 0.0) ? 1.0 : oPos.w;\n"
             "    o.oPos = float4((oPos.xy * vp_scale.xy + vp_off.xy) * pw,\n"
             "                    oPos.z * vp_scale.z * pw, pw);\n");

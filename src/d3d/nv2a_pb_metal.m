@@ -170,15 +170,16 @@ static const char s_msl[] =
     /* The emitters' VOut (d3d8_msl.h), so vs_pass links with a combiner
      * fs_main and a program's vs_main with fs_basic. */
     D3D8_MSL_VOUT
-    /* Attribute 0 is already in surface pixels (x, y, z, rhw): c[0] is
-     * (2/w, -2/h, 1/zmax, 0) and c[1] (-1, 1, 0, 0), as the D3D11
-     * pass-through's vp_scale / vp_off. */
+    /* Attribute 0 is already in surface pixels (x, y, z, rhw), snapped to
+     * the NV2A's 1/16-pixel grid (nv2a_screen_snap): c[0] is (2/w, -2/h,
+     * 1/zmax, 0) and c[1] (-1, 1, 0, 0), as the D3D11 pass-through's
+     * vp_scale / vp_off. */
     "vertex VOut vs_pass(uint vid [[vertex_id]],\n"
     "                    const device float4 *vb [[buffer(0)]],\n"
     "                    constant VpConsts &vp [[buffer(1)]]) {\n"
     "    const device float4 *v = vb + vid * 7u;\n"
     "    VOut o;\n"
-    "    o.pos = float4(v[0].xy * vp.c[0].xy + vp.c[1].xy,\n"
+    "    o.pos = float4((trunc(v[0].xy * 16.0) / 16.0) * vp.c[0].xy + vp.c[1].xy,\n"
     "                   saturate(v[0].z * vp.c[0].z), 1.0);\n"
     "    o.d0 = v[1]; o.d1 = v[2];\n"
     "    o.t0 = v[3]; o.t1 = v[4]; o.t2 = v[5]; o.t3 = v[6];\n"

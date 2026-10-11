@@ -1200,6 +1200,7 @@ static Stage s_stage[4];
 #define TEX_CACHE 512   /* array bound; entries in use: tex_cache_n() */
 typedef struct {
     uint32_t       offset, color, width, height, pitch, palette, levels;
+    uint32_t       bytes;       /* nv2a_tex_extent, for tex_cache_stale */
     uint32_t       gen, used;
     uint32_t       pack_gen;    /* nv2a_tex_pack_gen() it was uploaded under */
     uint64_t       hash;
@@ -1223,6 +1224,24 @@ static uint32_t tex_cache_n(void)
     return (uint32_t)n;
 }
 static uint32_t       s_tc_clock;
+
+/* A write-back just rewrote guest [addr, addr + bytes): the cache entries over
+ * it rehash at their next bind even inside this flip. tex_bind hashes a
+ * texture once a flip, so without this a target drawn, sampled, redrawn and
+ * sampled again in one flip (Burnout 3's speed blur redraws the 16-bit bloom
+ * target and composites it) kept the first decode, and the blur showed the
+ * dark bright-pass instead of the scene. */
+static void tex_cache_stale(uint32_t addr, uint32_t bytes)
+{
+    uint32_t n = tex_cache_n(), lo = addr & 0x07FFFFFFu, hi = lo + bytes, i;
+    for (i = 0; i < n; i++) {
+        TexEntry *c = &s_tc[i];
+        uint32_t clo = c->offset & 0x07FFFFFFu;
+        if (c->live && clo < hi && lo < clo + c->bytes)
+            c->gen = nv2a_pb_gpu_state()->flips - 1u;
+    }
+}
+
 static uint32_t      *s_texels;
 static size_t         s_texels_cap;
 static id<MTLTexture> s_black, s_magenta;
@@ -1449,6 +1468,7 @@ static id<MTLTexture> tex_bind(const Stage *t)
         e->pitch = t->pitch;
         e->palette = t->palette;
         e->levels = t->levels;
+        e->bytes = bytes;
         e->gen = g->flips;
         e->hash = h;
         e->pack_gen = nv2a_tex_pack_gen();
@@ -2149,6 +2169,7 @@ static void write_back(RenderTarget *rt, uint32_t addr, uint32_t pitch)
     } else {
         return;
     }
+    tex_cache_stale(addr, pitch * rt->h);
     s_writebacks++;
 }
 
@@ -2206,6 +2227,7 @@ static void write_back_scaled(RenderTarget *rt, const uint8_t *px, uint32_t addr
     } else {
         return;
     }
+    tex_cache_stale(addr, pitch * rt->h);
     s_writebacks++;
 }
 

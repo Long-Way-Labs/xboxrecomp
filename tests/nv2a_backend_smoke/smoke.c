@@ -105,6 +105,7 @@ recomp_func_t recomp_lookup_manual(unsigned int va) { (void)va; return 0; }
 #define BUF3      0x01600000u   /* clip_cases' grow: clear of every other buffer */
 #define BUF4      0x01740000u   /* and its render.scale 2 twin */
 #define BUF5      0x01880000u   /* the draw clip at render.scale 3 */
+#define BUF6      0x01A00000u   /* redraw_case: a 64x64 R5G6B5 target */
 #define REPORT    0x00F00000u   /* occ_case's report: GET_REPORT takes 24 bits */
 #define TEX_GUEST 0x02800000u   /* 64x64 swizzled A8R8G8B8, then YUY2 64x32 */
 #define RTT0      0x01400000u   /* 64x64 render-to-texture targets, pitch 256 */
@@ -569,6 +570,62 @@ static uint32_t sample_rtt(const struct nv2a_pb_backend *b, uint32_t tex)
     p = nv2a_pb_present_state();
     b->sync_guest(p->offset, p->pitch, p->w, p->h);
     return px_at(BUF0, W * 4u, 132, 132);
+}
+
+/* A 64x64 R5G6B5 target at BUF6 drawn, sampled (a decode: this backend binds
+ * only 32-bit targets as they are), drawn again and sampled again, all in one
+ * flip -- Burnout 3's speed blur. The second sample must see the second
+ * colour: the texture cache hashes once a flip, so the write-back has to
+ * mark it stale. Returns the failures. */
+static int redraw_case(const struct nv2a_pb_backend *b)
+{
+    static const uint32_t white[4] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+    static const float uv[4][2] = {{0, 0}, {64, 0}, {64, 64}, {0, 64}};
+    static const uint32_t col[2] = {0xFFFF0000u, 0xFF00FF00u};
+    const struct nv2a_pb_present *p;
+    uint32_t got[2];
+    int a, k, f = 0;
+
+    nv2a_pb_set_backend(b);
+    surf(BUF0, W, H, 1, 0xFF0000FFu);
+    for (k = 0; k < 2; k++) {
+        M(0x0200, 64u << 16);
+        M(0x0204, 64u << 16);
+        M(0x0208, 0x00000123u);            /* R5G6B5, Z24S8 */
+        M(0x020C, 128u);
+        M(0x0210, BUF6);
+        M(0x1D90, col[k]);
+        M(0x1D94, 0xF0);
+        surf(BUF0, W, H, 0, 0);
+        for (a = 0; a < 16; a++)
+            M(0x1760 + 4 * a, a == 0 ? 0x42u : a == 3 ? 0x40u : a == 9 ? 0x22u : 0x02u);
+        M(0x1B00, BUF6);
+        M(0x1B04, (0x11u << 8) | (1u << 4) | (2u << 0));   /* linear R5G6B5 */
+        M(0x1B08, 0x00000303u);
+        M(0x1B0C, 0x40000000u);
+        M(0x1B10, 128u << 16);
+        M(0x1B1C, (64u << 16) | 64u);
+        quad_uv(100.0f + 200.0f * (float)k, 100.0f, 164.0f + 200.0f * (float)k, 164.0f,
+                white, uv);
+        M(0x1B0C, 0);
+        M(0x1760 + 4 * 9, 0x02u);
+    }
+    M(0x0210, BUF1);
+    M(0x0130, 0);
+    p = nv2a_pb_present_state();
+    b->sync_guest(p->offset, p->pitch, p->w, p->h);
+    got[0] = px_at(BUF0, W * 4u, 132, 132);
+    got[1] = px_at(BUF0, W * 4u, 332, 132);
+    for (k = 0; k < 2; k++)
+        if (got[k] != col[k]) {
+            fprintf(stderr, "[backend-smoke] redraw: sample %d is %08X, want %08X\n", k,
+                    got[k], col[k]);
+            f++;
+        }
+    fprintf(stderr, "[backend-smoke] redraw: a 16-bit target resampled in one flip %s\n",
+            f ? "FAIL" : "PASS");
+    nv2a_pb_set_backend(NULL);
+    return f;
 }
 
 /* Render-target ownership. Returns the failures. */
@@ -1127,6 +1184,7 @@ int main(int argc, char **argv)
         if (f)
             fprintf(stderr, "[backend-smoke] FAIL: %d write-back checks\n", f);
         failures += f;
+        failures += redraw_case(gpu);
         f = alias_cases(gpu);
         if (f)
             fprintf(stderr, "[backend-smoke] FAIL: %d render-target ownership checks\n", f);

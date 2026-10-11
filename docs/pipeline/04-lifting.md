@@ -495,7 +495,7 @@ loc_00012340: ;
 The first test of the condition never waits. `RECOMP_SPIN_WAIT`
 (`templates/runtime/recomp_types.h`) does nothing unless the runtime's
 pacing mode is `sleep` (the `present.pacing` key,
-[enhance-config](../runtime/enhance-config.md)); then the thread blocks until
+[config](../runtime/config.md)); then the thread blocks until
 the kernel signals a state change or 1 ms passes (`src/kernel/kernel_pacing.h`).
 
 The matcher (`tools/recomp/spin_waits.py`) is deliberately narrow. A

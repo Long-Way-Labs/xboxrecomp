@@ -3,7 +3,7 @@
 A texture pack holds host-side replacements for guest textures, keyed by
 the hash the GPU backends compute for every texture they upload. The
 enhancements layer loads one through `textures.pack`
-([enhance-config.md](../runtime/enhance-config.md)); the Metal and D3D11
+([config.md](../runtime/config.md)); the Metal and D3D11
 backends look each upload's texel hash up in it and, on a hit, create the
 host texture at the pack entry's size from the pack's texels instead of
 the decoded guest texels. The guest texture, the game's files and the CPU
@@ -75,7 +75,7 @@ v2 entry flags:
 
 Every other bit is refused, so a later meaning is never misread by this
 reader. The kind is the unit a player turns off (`textures.font`,
-`textures.text`, [enhance-config.md](../runtime/enhance-config.md)): a
+`textures.text`, [config.md](../runtime/config.md)): a
 turned-off entry is not found, and the guest texture goes up as without a
 pack. The header scale describes the art; each entry carries its own size,
 so text built at 2x and art at 4x share one pack.

@@ -1,7 +1,7 @@
 /*
  * recomp_cfg.h - a small TOML-subset config reader. C11, no dependencies.
  *
- * The subset (docs/runtime/enhance-config.md has the full grammar):
+ * The subset (docs/runtime/config.md has the full grammar):
  *
  *   # comment
  *   [render]                 table; dotted names allowed: [aspect.program]

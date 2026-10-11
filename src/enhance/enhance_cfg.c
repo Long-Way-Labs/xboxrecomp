@@ -1,6 +1,6 @@
 /*
- * enhance_cfg.c - the enhancements file under the environment; see
- * enhance_cfg.h.
+ * enhance_cfg.c - config.toml over config.default.toml under the
+ * environment; see enhance_cfg.h.
  */
 #include "enhance_cfg.h"
 
@@ -9,9 +9,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
+#include "recomp_exe_dir.h"
 
 #define ENHANCE_MAX_BINDS 64
-#define ENHANCE_FILES 2   /* title, root */
+/* Slots in lookup order: the first that holds a key answers. */
+#define SLOT_TITLE 0
+#define SLOT_USER 1
+#define SLOT_DEFAULTS 2
+#define ENHANCE_FILES 3
+#define CFG_PATH_MAX 1024
 
 typedef struct {
     char key[64];
@@ -26,6 +37,8 @@ static int s_builtin_bound;
 static recomp_cfg *s_file[ENHANCE_FILES];
 /* Per file entry: bit 0 read by a lookup, bit 1 type warning printed. */
 static unsigned char *s_flags[ENHANCE_FILES];
+/* The file a writer (the menu's Save) targets; empty under none. */
+static char s_user_path[CFG_PATH_MAX];
 
 static void bind_builtins(void)
 {
@@ -111,15 +124,16 @@ void enhance_cfg_shutdown(void)
         free(s_flags[i]);
         s_flags[i] = NULL;
     }
+    s_user_path[0] = 0;
 }
 
+/* Whether `path` names anything. stat, not a trial fopen: a file the
+ * player cannot read is still there, and must never count as absent to
+ * the rename or the header, which would replace or truncate it. */
 static int file_exists(const char *path)
 {
-    FILE *f = fopen(path, "rb");
-    if (!f)
-        return 0;
-    fclose(f);
-    return 1;
+    struct stat st;
+    return stat(path, &st) == 0;
 }
 
 /* Load `path` into slot `i`. 1 loaded, 0 absent (when optional), -1 error. */
@@ -139,48 +153,200 @@ static int load_slot(int i, const char *path, int optional)
     return 1;
 }
 
+static int is_dir(const char *path)
+{
+    struct stat st;
+    return stat(path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR;
+}
+
+/* The part of `path` after its last separator. */
+static const char *base_of(const char *path)
+{
+    const char *b = path, *p;
+    for (p = path; *p; p++)
+        if (*p == '/' || *p == '\\')
+            b = p + 1;
+    return b;
+}
+
+/* `path`'s directory into `out` ("." when it names none). */
+static void dir_of(const char *path, char *out, size_t cap)
+{
+    size_t n = (size_t)(base_of(path) - path);
+    if (n == 0) {
+        snprintf(out, cap, ".");
+        return;
+    }
+    if (n > 1)
+        n--;                            /* drop the separator, keep a lone "/" */
+    if (n >= cap)
+        n = cap - 1;
+    memcpy(out, path, n);
+    out[n] = 0;
+}
+
+/* Move `from` to `to` only while `to` is absent. POSIX rename() replaces
+ * the target, so a config.toml that appeared since the check (another
+ * launch, the player) would be lost; link() fails with EEXIST instead.
+ * A file system without hard links falls back to rename(). Windows'
+ * rename() already refuses an existing target. 0 moved, -1 errno set. */
+static int move_no_replace(const char *from, const char *to)
+{
+#ifndef _WIN32
+    if (link(from, to) == 0)
+        return unlink(from) == 0 || errno == ENOENT ? 0 : -1;
+    if (errno == EEXIST || errno == ENOENT)
+        return -1;
+#endif
+    return rename(from, to);
+}
+
+/* The one-time rename of an earlier version's enhance.toml (same keys) to
+ * a missing config.toml beside it. Only a file named config.toml is a
+ * candidate, so an explicit RECOMP_CONFIG with another name never moves a
+ * file. 0 nothing to do or renamed, -1 the rename failed (the caller then
+ * leaves the directory alone, so the next run retries). */
+static int migrate(const char *path)
+{
+    char dir[CFG_PATH_MAX], old[CFG_PATH_MAX + 16];
+    if (strcmp(base_of(path), "config.toml") != 0 || file_exists(path))
+        return 0;
+    dir_of(path, dir, sizeof dir);
+    snprintf(old, sizeof old, "%s/enhance.toml", dir);
+    if (!file_exists(old))
+        return 0;
+    if (move_no_replace(old, path) != 0) {
+        /* A second launch racing this one: it moved the file first. */
+        if (file_exists(path))
+            return 0;
+        fprintf(stderr, "[ENHANCE] config: cannot rename %s to config.toml (%s); left as is\n",
+                old, strerror(errno));
+        return -1;
+    }
+    fprintf(stderr, "[ENHANCE] config: renamed %s to config.toml (one-time migration)\n", old);
+    return 0;
+}
+
+/* An absent user file becomes a comment header, so a player finds a file
+ * to edit that says where every other key comes from, and a writer always
+ * patches an existing file. Never a directory: a missing one means the
+ * data root is not set up, and the run reads the defaults alone. */
+static void write_header(const char *path, const char *title)
+{
+    char dir[CFG_PATH_MAX];
+    FILE *f;
+    if (file_exists(path))
+        return;
+    dir_of(path, dir, sizeof dir);
+    if (!is_dir(dir))
+        return;
+    /* "x": create only. A launch racing this one may have just renamed
+     * or written the file; that one wins and nothing is said. */
+    f = fopen(path, "wbx");
+    if (!f) {
+        if (errno == EEXIST)
+            return;
+        fprintf(stderr, "[ENHANCE] config: cannot create %s (%s)\n", path, strerror(errno));
+        return;
+    }
+    fprintf(f, "# %s settings: only the keys you change go here. Every other key\n"
+               "# comes from config.default.toml shipped with the game, which is read,\n"
+               "# never copied, so a new version's keys apply to you too.\n"
+               "# Environment variables (RECOMP_*, config/launch.env in a bundle)\n"
+               "# override this file.\n",
+            title && *title ? title : "Your");
+    fclose(f);
+}
+
+/* config.default.toml beside the executable; in a macOS app bundle the
+ * read-only files sit in Contents/Resources, next to Contents/MacOS. */
+static void defaults_path(char *out, size_t cap)
+{
+    snprintf(out, cap, "%s/config.default.toml", recomp_exe_dir());
+#ifdef __APPLE__
+    if (!file_exists(out)) {
+        char alt[CFG_PATH_MAX + 32];
+        snprintf(alt, sizeof alt, "%s/../Resources/config.default.toml", recomp_exe_dir());
+        if (file_exists(alt))
+            snprintf(out, cap, "%s", alt);
+    }
+#endif
+}
+
 int enhance_cfg_init(const char *root, const char *title)
 {
     const char *over;
-    char path[1024];
-    int loaded = 0, bad = 0, r, i;
-    size_t keys = 0;
+    char path[CFG_PATH_MAX], tpath[CFG_PATH_MAX], upath[CFG_PATH_MAX];
+    int loaded = 0, bad = 0, r, i, listed = 0, have_title;
 
     enhance_cfg_shutdown();
     bind_builtins();
 #ifdef RECOMP_ENV_HAVE_ENHANCE_KEYS
-    over = recomp_env(RENV_ENHANCE_CONFIG);
+    over = recomp_env(RENV_CONFIG);
 #else
     over = NULL;
 #endif
-    if (over && *over) {
-        if (strcmp(over, "none") != 0) {
-            r = load_slot(0, over, 0);
-            loaded += r > 0;
-            bad |= r < 0;
-        }
-    } else {
-        if (root && title && *title) {
-            snprintf(path, sizeof path, "%s/%s/enhance.toml", root, title);
-            r = load_slot(0, path, 1);
-            loaded += r > 0;
-            bad |= r < 0;
-        }
-        snprintf(path, sizeof path, "%s/enhance.toml", root && *root ? root : ".");
-        r = load_slot(1, path, 1);
-        loaded += r > 0;
-        bad |= r < 0;
+    if (over && *over && !strcmp(over, "none")) {
+        /* The golden pin: code defaults and the environment, whatever a
+         * shipped config.default.toml turns on. Nothing is written. */
+        fprintf(stderr, "[ENHANCE] config: none (RECOMP_CONFIG)\n");
+        goto env_lines;
     }
 
-    fprintf(stderr, "[ENHANCE] config: ");
-    if (!s_file[0] && !s_file[1])
-        fprintf(stderr, "%s", over && !strcmp(over, "none") ? "none (RECOMP_ENHANCE_CONFIG)" : "none");
-    for (i = 0; i < ENHANCE_FILES; i++)
-        if (s_file[i]) {
-            fprintf(stderr, "%s%s", i && s_file[0] ? ", " : "", recomp_cfg_name(s_file[i]));
-            keys += recomp_cfg_count(s_file[i]);
+    defaults_path(path, sizeof path);
+    r = load_slot(SLOT_DEFAULTS, path, 1);
+    loaded += r > 0;
+    bad |= r < 0;
+
+    if (over && *over) {
+        snprintf(s_user_path, sizeof s_user_path, "%s", over);
+        if (migrate(over) == 0)
+            write_header(over, title);
+        r = load_slot(SLOT_USER, over, 0);
+        loaded += r > 0;
+        bad |= r < 0;
+    } else {
+        int mt = 0, mu;
+        if (!root || !*root)
+            root = ".";
+        have_title = title && *title;
+        if (have_title) {
+            snprintf(tpath, sizeof tpath, "%s/%s/config.toml", root, title);
+            mt = migrate(tpath);
         }
-    fprintf(stderr, " (%zu keys)\n", keys);
+        snprintf(upath, sizeof upath, "%s/config/config.toml", root);
+        mu = migrate(upath);
+        /* One header, on the file a writer would target. */
+        snprintf(path, sizeof path, "%s/%s", root, have_title ? title : "");
+        if (have_title && is_dir(path)) {
+            if (mt == 0)
+                write_header(tpath, title);
+        } else if (mu == 0) {
+            write_header(upath, title);
+        }
+        if (have_title) {
+            r = load_slot(SLOT_TITLE, tpath, 1);
+            loaded += r > 0;
+            bad |= r < 0;
+        }
+        r = load_slot(SLOT_USER, upath, 1);
+        loaded += r > 0;
+        bad |= r < 0;
+        snprintf(s_user_path, sizeof s_user_path, "%s",
+                 have_title && s_file[SLOT_TITLE] ? tpath : upath);
+    }
+
+    /* Lowest layer first, each file with its own count, so the layering is
+     * visible in every run log. */
+    fprintf(stderr, "[ENHANCE] config: ");
+    for (i = ENHANCE_FILES - 1; i >= 0; i--)
+        if (s_file[i]) {
+            size_t n = recomp_cfg_count(s_file[i]);
+            fprintf(stderr, "%s%s (%zu key%s)", listed++ ? ", " : "",
+                    recomp_cfg_name(s_file[i]), n, n == 1 ? "" : "s");
+        }
+    fprintf(stderr, "%s\n", listed ? "" : "none");
+env_lines:
     for (i = 0; i < s_n_binds; i++) {
         const char *v = recomp_env(s_binds[i].id);
         if (v && *v)
@@ -188,6 +354,16 @@ int enhance_cfg_init(const char *root, const char *title)
                     recomp_env_name(s_binds[i].id));
     }
     return bad ? -1 : loaded;
+}
+
+const char *enhance_cfg_user_path(void)
+{
+    return s_user_path[0] ? s_user_path : NULL;
+}
+
+const recomp_cfg *enhance_cfg_defaults(void)
+{
+    return s_file[SLOT_DEFAULTS];
 }
 
 const recomp_cfg *enhance_cfg_file(int i)
@@ -367,7 +543,7 @@ enhance_cfg_source enhance_cfg_source_of(const char *key)
         return ENHANCE_SRC_ENV;
     for (i = 0; i < ENHANCE_FILES; i++)
         if (recomp_cfg_find(s_file[i], key) >= 0)
-            return ENHANCE_SRC_FILE;
+            return i == SLOT_DEFAULTS ? ENHANCE_SRC_DEFAULTS : ENHANCE_SRC_FILE;
     return ENHANCE_SRC_DEFAULT;
 }
 
@@ -379,8 +555,9 @@ int enhance_cfg_report_unused(void)
         for (k = 0; k < recomp_cfg_count(s_file[i]); k++) {
             const char *key = recomp_cfg_key_at(s_file[i], k);
             int used = s_flags[i] ? s_flags[i][k] & 1 : 1, j;
-            /* A key the title file overrides is used even if the root's
-             * copy was never read. */
+            /* A key a higher file overrides (the title file over the user
+             * file, either over the defaults) is used even if this copy
+             * was never read. */
             for (j = 0; !used && j < i; j++)
                 used = recomp_cfg_find(s_file[j], key) >= 0;
             if (!used) {

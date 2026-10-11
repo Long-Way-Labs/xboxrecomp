@@ -11,6 +11,7 @@
 #include "kernel_pacing.h"
 #include "nv2a_backend_common.h"
 #include "nv2a_tex_pack.h"
+#include "recomp_exe_dir.h"
 
 #define LOGP "[ENHANCE] "
 #define SCALE_MAX 4
@@ -21,12 +22,14 @@ static int path_is_absolute(const char *p)
         || (((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':');
 }
 
-/* textures.pack: a pack file, relative to the root the file itself is
- * read from (the executable's directory), so a bundle names
- * enhance/hud.pack. A bad or missing pack is said and the run stays
+/* textures.pack: a pack file, relative to the executable's directory,
+ * where config.default.toml (which --hud-pack writes the key into) and the
+ * pack ship, so a bundle names enhance/hud.pack; not relative to `root`,
+ * the user data root. A bad or missing pack is said and the run stays
  * stock; nothing in the backends runs until nv2a_tex_pack_count() > 0. */
-static void load_tex_pack(const char *root, const struct nv2a_host_opts *o)
+static void load_tex_pack(const struct nv2a_host_opts *o)
 {
+    const char *root = recomp_exe_dir();
     const char *pack = enhance_cfg_string("textures.pack", "");
     char path[1024], err[128];
     int n;
@@ -106,7 +109,7 @@ int xbox_enhance_init(const char *root, const char *title)
     fprintf(stderr, LOGP "render.scale=%u present.filter=%s present.fullscreen=%d"
             " present.pacing=%s (display.aspect=%s)\n", o.render_scale,
             s_filters[o.present_filter], o.fullscreen, s_pacing[pacing], aspect);
-    load_tex_pack(root, &o);
+    load_tex_pack(&o);
     /* No enhance_cfg_report_unused() here: the title reads its own keys
      * (game.mode, say) after this, and calls it then. */
     return rc;

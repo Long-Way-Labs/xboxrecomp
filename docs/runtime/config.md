@@ -1,53 +1,96 @@
-# Enhancements config (`enhance.toml`)
+# Configuration (`config.toml`, `config.default.toml`)
 
 The enhancements layer (`src/enhance/`) is opt-in. It is built only with
 `-DXBOXRECOMP_ENHANCE=ON` (off by default), and a title that turns it on calls
-it. This page describes its config file: the format, where the file is read
-from, how the environment overrides it, and the key names.
+it. This page describes its configuration: the two files and how they layer,
+where they are read from, how the environment overrides them, the format and
+the key names.
 
-## Where the file is read from, and precedence
+## Two files and the environment
 
 A title calls `xbox_enhance_init(root, title)` (`src/enhance/enhance.h`) once
 at startup, after `recomp_env_init` and before the guest starts. `root` is
-where the file lives. The file is runtime configuration that belongs to an
-installed game, so a title passes the directory of its executable,
-`recomp_exe_dir()` (`src/platform/recomp_exe_dir.h`: `_NSGetExecutablePath`
-on macOS, `GetModuleFileNameA` on Windows, `/proc/self/exe` on Linux, the
-working directory if none works). During development that is the build
-directory; `RECOMP_ENHANCE_CONFIG=<path>` points anywhere else. A title with
-one executable passes `title = NULL`, so the file is `<root>/enhance.toml`.
+the user data root, the directory that holds the player's files; a title
+passes `"."`, the working directory, which a bundle's launcher sets to the
+bundle. A title with one executable passes `title = NULL`.
+
+There are two kinds of file:
+
+- **`config.default.toml`**, the defaults that ship with the game. It sits
+  beside the executable, `recomp_exe_dir()` (`src/platform/recomp_exe_dir.h`:
+  `_NSGetExecutablePath` on macOS, `GetModuleFileNameA` on Windows,
+  `/proc/self/exe` on Linux, the working directory if none works); on macOS
+  a `.app` keeps it in `Contents/Resources`, which the layer looks in when
+  the executable's directory has none. It is read, never copied, so a new
+  version's keys and values reach every player. Nobody edits it: an update
+  replaces it.
+- **`config.toml`**, the player's file. It holds only the keys the player
+  changed. An update never writes it.
 
 For a key, the first of these that has a value wins:
 
-1. The environment variable bound to the key, for example `RECOMP_RENDER_SCALE`
-   for `render.scale` (see [Environment](#environment)).
-2. `<root>/<title>/enhance.toml`, the per-title file.
-3. `<root>/enhance.toml`, the file shared by all titles.
-4. The default that the module passes in.
+| Tier | Source | Log source |
+|---|---|---|
+| 1 | the environment variable bound to the key, for example `RECOMP_RENDER_SCALE` for `render.scale` (see [Environment](#environment)) | `env` |
+| 2 | `<root>/<title>/config.toml`, the per-title file | `file` |
+| 3 | `<root>/config/config.toml`, the file shared by all titles | `file` |
+| 4 | `config.default.toml` beside the executable | `defaults` |
+| 5 | the default that the module passes in | `default` |
 
-`RECOMP_ENHANCE_CONFIG=<path>` replaces 2 and 3 with that one file.
-`RECOMP_ENHANCE_CONFIG=none` reads no file, so only the environment and the
-defaults apply.
+`RECOMP_CONFIG=<path>` replaces tiers 2 and 3 with that one file; the
+defaults file is still read under it. `RECOMP_CONFIG=none` reads no file at
+all, the defaults file included, so only the environment and the code
+defaults apply: a golden run pins it, so a shipped default never changes a
+golden. `RECOMP_ENHANCE_CONFIG`, the variable's earlier name, is still read,
+with one `[ENV] RECOMP_ENHANCE_CONFIG is deprecated; use RECOMP_CONFIG` line.
+
+When the player's file is absent and its directory exists, the layer writes
+it as a short comment header that says what goes there (the per-title file
+when the title's directory exists, else the shared one; a `RECOMP_CONFIG`
+file whose directory exists gets one too). A `RECOMP_CONFIG` file whose
+directory is missing is an error. Under `none` nothing is written.
+
+### Migration from `enhance.toml`
+
+An earlier version named the player's file `enhance.toml`, with the same
+keys. When a location the layer reads as `config.toml` is absent and an
+`enhance.toml` is beside it, the layer renames it once and says so:
+
+```
+[ENHANCE] config: renamed ./config/enhance.toml to config.toml (one-time migration)
+```
+
+Only a file named `config.toml` is a candidate (so a `RECOMP_CONFIG` file
+with another name never is), `<root>/enhance.toml` itself is not, and
+nothing is renamed under `none`. A rename that fails is reported once; the old file is left alone and
+not read, and the next run tries again.
+
+### Errors and the log
 
 If a file does not parse, the layer reports it with its line number and
-ignores the whole file. A typo therefore never applies half a file:
+ignores the whole file; the other files still apply. A typo therefore never
+applies half a file:
 
 ```
-[ENHANCE] config error: data/enhance.toml:3: duplicate key 'render.scale' (first set on line 2) (file ignored)
+[ENHANCE] config error: ./config/config.toml:3: duplicate key 'render.scale' (first set on line 2) (file ignored)
 ```
 
-At startup the layer logs one line that names the files, and one line for
-each environment override:
+At startup the layer logs one line that names the files, lowest layer first,
+each with its own key count, and one line for each environment override:
 
 ```
-[ENHANCE] config: data/TITLE/enhance.toml, data/enhance.toml (6 keys)
+[ENHANCE] config: /opt/game/config.default.toml (6 keys), ./config/config.toml (1 key)
 [ENHANCE] render.scale = 2 from RECOMP_RENDER_SCALE
 ```
 
+With `RECOMP_CONFIG=none` the line is `[ENHANCE] config: none (RECOMP_CONFIG)`,
+and with no file found it is `[ENHANCE] config: none`.
+
 When a value has the wrong type (`scale = "2"`), the layer reports it once,
 names the file and line, and uses the next tier. The layer can also list keys
-that nothing read (`enhance_cfg_report_unused`), so that a misspelled key such
-as `scael = 2` is visible instead of being ignored silently.
+that nothing read (`enhance_cfg_report_unused`), in either file, so that a
+misspelled key such as `scael = 2` is visible instead of being ignored
+silently.
 
 ## File format: a subset of TOML
 
@@ -118,7 +161,8 @@ the stock settings.
 | `textures.text` | string | `"on"`, `"off"`: the pack's baked-text entries | `"on"` | `RECOMP_TEXTURES_TEXT` |
 | `aspect.program.<hash>` | string | `"hud"`, `"stretch"`, `"3d"`: a per-shader override of the aspect classifier | none | none |
 
-A title adds its own tables (`[fps]`, `[fx]`, ...) in the same file. The
+A title adds its own tables (`[fps]`, `[fx]`, ...) in the same files, and
+lists them with their stock values in its `config.default.toml`. The
 title reads them through the same layering and binds each to one of its own
 environment variables, `enhance_cfg_bind_env("game.mode", RENV_GAME_MODE)`,
 where `RENV_GAME_MODE` is a row of its `recomp_env_game.h`. A title that
@@ -209,8 +253,9 @@ presenters read them at start.
 - **`textures.pack = "<file>"`.** A pack of host-side texture replacements
   ([texture-pack.md](../formats/texture-pack.md)), keyed by the hash the
   Metal and D3D11 backends already compute for every upload. A relative
-  path is resolved against the executable's directory, the root the file
-  itself is read from, so a bundle names `enhance/hud.pack`. The layer
+  path is resolved against the executable's directory, where
+  `config.default.toml` is, so a bundle's defaults name `enhance/hud.pack`
+  (a `.app` keeps the pack beside the executable too). The layer
   loads the pack's index at startup and logs one line after the settings
   line: `[ENHANCE] textures.pack=none` when unset, or
   `[ENHANCE] textures.pack=enhance/hud.pack (41 entries: 30 art, 1 font, 10 text; scale 4, text 2; 10 bc3) textures.font=on textures.text=on`
@@ -267,7 +312,7 @@ exist only when the layer is built (`RECOMP_ENV_HAVE_ENHANCE_KEYS`):
 
 | Variable | Meaning |
 |---|---|
-| `RECOMP_ENHANCE_CONFIG` | path of the one file to read, or `none` |
+| `RECOMP_CONFIG` | path of the player's file, which replaces both `config.toml` files, or `none` for no file at all (the defaults included). `RECOMP_ENHANCE_CONFIG` is its earlier name, read with a deprecation line |
 | `RECOMP_RENDER_SCALE` | overrides `render.scale` |
 | `RECOMP_DISPLAY_ASPECT` | overrides `display.aspect` |
 | `RECOMP_PRESENT_FILTER` | overrides `present.filter` |
@@ -298,7 +343,7 @@ There are two layers. Both are C11 and need only libc.
 
 ```c
 char err[256];
-recomp_cfg *c = recomp_cfg_load_file("enhance.toml", err, sizeof err);  /* NULL + "file:line: msg" */
+recomp_cfg *c = recomp_cfg_load_file("config.toml", err, sizeof err);   /* NULL + "file:line: msg" */
 long long s = recomp_cfg_int(c, "render.scale", 1);      /* default when missing or wrong type */
 double    f = recomp_cfg_float(c, "render.sharpness", 0); /* an int is accepted too */
 const char *a = recomp_cfg_string(c, "display.aspect", "4:3");
@@ -315,14 +360,21 @@ Every getter accepts a NULL config and then returns its default.
 `enhance_cfg.h` is the layering that modules use:
 
 ```c
-xbox_enhance_init(recomp_exe_dir(), NULL);      /* the toolkit's keys: enhance.h */
+xbox_enhance_init(".", NULL);                   /* the toolkit's keys: enhance.h */
 enhance_cfg_init(data_root, title_dir);          /* the reader alone; logs the files */
+const char *u = enhance_cfg_user_path();         /* the player's file, for a writer; NULL under none */
+const recomp_cfg *d = enhance_cfg_defaults();    /* config.default.toml as loaded, or NULL */
 enhance_cfg_bind_env("game.mode", RENV_GAME_MODE); /* a game key with an env override */
 int scale = (int)enhance_cfg_int("render.scale", 1);
 int mode  = enhance_cfg_choice("game.mode", modes, 0);
 const recomp_cfg *c = enhance_cfg_lookup("render.sizes");   /* arrays: no env tier */
 enhance_cfg_report_unused();                     /* after the modules' init */
 ```
+
+A settings writer (the in-game menu) writes only the keys whose value
+differs from `enhance_cfg_defaults()` to `enhance_cfg_user_path()`, so the
+player's file stays a list of changes. `enhance_cfg_source_of(key)` says
+`ENHANCE_SRC_DEFAULTS` for a value from the defaults file.
 
 `xbox_enhance_init` does not report unused keys itself: the title calls
 `enhance_cfg_report_unused()` once, after it has read its own keys, so a

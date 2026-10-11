@@ -1,8 +1,8 @@
 /*
  * recomp_exe_dir.h - the directory that holds the running executable.
  *
- * Runtime configuration that belongs to an installed game (enhance.toml)
- * sits beside the executable, not in the working directory, so a launcher
+ * Files that belong to an installed game (config.default.toml, a texture
+ * pack) sit beside the executable, not in the working directory, so a launcher
  * or a shortcut that starts the game from elsewhere still finds it.
  */
 #ifndef RECOMP_EXE_DIR_H

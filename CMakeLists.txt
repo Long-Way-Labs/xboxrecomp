@@ -37,7 +37,8 @@ add_compile_definitions(
 add_subdirectory(src/platform)
 
 # Enhancements (render scale, aspect, frame pacing, mods) and their config
-# file, enhance.toml. Opt-in: off by default; a title turns it on and calls it.
+# files, config.toml over config.default.toml. Opt-in: off by default; a
+# title turns it on and calls it.
 # ON adds the xbox_enhance library and the layer's RECOMP_* config keys
 # (recomp_env.h, RECOMP_ENV_HAVE_ENHANCE_KEYS).
 option(XBOXRECOMP_ENHANCE "Build the opt-in enhancements layer (src/enhance)" OFF)

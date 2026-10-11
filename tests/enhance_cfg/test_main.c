@@ -1,9 +1,13 @@
 /*
  * enhance_cfg test: the TOML subset (recomp_cfg.c), its errors with line
- * numbers, and the env > title file > root file > default layering
- * (enhance_cfg.c), xbox_enhance_init (enhance.c) and recomp_exe_dir. Runs in its working directory, where it writes small
- * files under ecfg_root/. The textures.pack cases pin the [ENHANCE] lines
- * the golden check reads (xboxrecomp-cli golden.py, ENHANCE_PACK_RE).
+ * numbers, the env > title file > user file > config.default.toml > default
+ * layering with the enhance.toml migration and the header (enhance_cfg.c),
+ * xbox_enhance_init (enhance.c) and recomp_exe_dir. Runs in its working
+ * directory, where it writes small files under ecfg_*; config.default.toml
+ * and the pack go beside the test's executable, where the layer looks for
+ * them, and are removed afterwards. The textures.pack cases pin the
+ * [ENHANCE] lines the golden check reads (xboxrecomp-cli golden.py,
+ * ENHANCE_PACK_RE).
  */
 #include "enhance.h"
 #include "enhance_cfg.h"
@@ -24,6 +28,7 @@
 #include <direct.h>
 #include <io.h>
 #define MKDIR(p) _mkdir(p)
+#define RMDIR(p) _rmdir(p)
 #define GETCWD(b, n) _getcwd(b, (int)(n))
 #define DUP _dup
 #define DUP2 _dup2
@@ -33,6 +38,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #define MKDIR(p) mkdir(p, 0755)
+#define RMDIR(p) rmdir(p)
 #define GETCWD(b, n) getcwd(b, n)
 #define DUP dup
 #define DUP2 dup2
@@ -62,6 +68,84 @@ static void write_file(const char *path, const char *text)
     if (!f) { fprintf(stderr, "cannot write %s\n", path); exit(2); }
     fputs(text, f);
     fclose(f);
+}
+
+
+/* config.default.toml beside this executable, where the layer reads it. */
+static const char *defaults_file(void)
+{
+    static char p[4096];
+    snprintf(p, sizeof p, "%s/config.default.toml", recomp_exe_dir());
+    return p;
+}
+
+static void remove_defaults(void)
+{
+    remove(defaults_file());
+}
+
+static int exists(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return 0;
+    fclose(f);
+    return 1;
+}
+
+/* A whole small file, or "" when absent. */
+static const char *read_file(const char *path)
+{
+    static char buf[4096];
+    size_t n = 0;
+    FILE *f = fopen(path, "rb");
+    buf[0] = 0;
+    if (f) {
+        n = fread(buf, 1, sizeof buf - 1, f);
+        fclose(f);
+    }
+    buf[n] = 0;
+    return buf;
+}
+
+/* stderr to a file while a call runs, then its text. */
+static int s_saved_fd = -1;
+static char s_cap[4096];
+
+static void capture_begin(void)
+{
+    int fd;
+    fflush(stderr);
+    s_saved_fd = DUP(2);
+    fd = OPEN_TRUNC("ecfg_stderr.txt");
+    if (s_saved_fd < 0 || fd < 0) { fprintf(stderr, "cannot capture stderr\n"); exit(2); }
+    DUP2(fd, 2);
+    CLOSE(fd);
+}
+
+static const char *capture_end(void)
+{
+    FILE *f;
+    size_t n = 0;
+    fflush(stderr);
+    DUP2(s_saved_fd, 2);
+    CLOSE(s_saved_fd);
+    s_cap[0] = 0;
+    f = fopen("ecfg_stderr.txt", "rb");
+    if (f) {
+        n = fread(s_cap, 1, sizeof s_cap - 1, f);
+        fclose(f);
+    }
+    s_cap[n] = 0;
+    {
+        /* Windows' text-mode stderr writes "\r\n"; the lines compare as "\n". */
+        char *r = s_cap, *w = s_cap;
+        for (; *r; r++)
+            if (*r != '\r')
+                *w++ = *r;
+        *w = 0;
+    }
+    return s_cap;
 }
 
 /* ── the subset ────────────────────────────────────────────────────── */
@@ -335,26 +419,28 @@ static void test_locale(void)
     setlocale(LC_NUMERIC, "C");
 }
 
-/* ── env > title file > root file > default ────────────────────────── */
+/* ── env > title file > user file > default ────────────────────────── */
 
 static void test_layers(void)
 {
     static const char *const modes[] = { "stock", "fast", "free", NULL };
     static const char *const aspect[] = { "4:3", "16:9", "16:10", "21:9", NULL };
 
+    remove_defaults();
     MKDIR("ecfg_root");
+    MKDIR("ecfg_root/config");
     MKDIR("ecfg_root/TITLE");
-    write_file("ecfg_root/enhance.toml",
+    write_file("ecfg_root/config/config.toml",
                "[render]\nscale = 3\nfilter = \"nearest\"\n"
                "[display]\naspect = \"16:10\"\n"
                "[game]\nmode = \"free\"\n"
                "[extra]\nunread = 1\n");
-    write_file("ecfg_root/TITLE/enhance.toml",
+    write_file("ecfg_root/TITLE/config.toml",
                "[render]\nscale = 2\nsharp = 0.25\nvsync = true\nmodes = [1, 2]\n"
                "[game]\nmode = \"fast\"\n"
                "[display]\nbadtype = 5\n");
 
-    recomp_env_set(RENV_ENHANCE_CONFIG, NULL);
+    recomp_env_set(RENV_CONFIG, NULL);
     recomp_env_set(RENV_RENDER_SCALE, NULL);
     recomp_env_set(RENV_DISPLAY_ASPECT, NULL);
 
@@ -428,30 +514,397 @@ static void test_layers(void)
     recomp_env_reload();
     CHECK(enhance_cfg_int("render.scale", 1) == 2);
 
-    /* RECOMP_ENHANCE_CONFIG: one file, or none */
-    recomp_env_set(RENV_ENHANCE_CONFIG, "ecfg_root/enhance.toml");
+    /* RECOMP_CONFIG: one file, or none */
+    recomp_env_set(RENV_CONFIG, "ecfg_root/config/config.toml");
     CHECK(enhance_cfg_init("ecfg_root", "TITLE") == 1);
     CHECK(enhance_cfg_int("render.scale", 1) == 3);
-    recomp_env_set(RENV_ENHANCE_CONFIG, "none");
+    recomp_env_set(RENV_CONFIG, "none");
     CHECK(enhance_cfg_init("ecfg_root", "TITLE") == 0);
     CHECK(enhance_cfg_int("render.scale", 1) == 1);
     CHECK(enhance_cfg_file(0) == NULL && enhance_cfg_file(1) == NULL);
     recomp_env_set(RENV_RENDER_SCALE, "2");                     /* env with no file */
     CHECK(enhance_cfg_int("render.scale", 1) == 2);
     recomp_env_set(RENV_RENDER_SCALE, NULL);
-    recomp_env_set(RENV_ENHANCE_CONFIG, "ecfg_root/missing.toml");
+    recomp_env_set(RENV_CONFIG, "ecfg_no_such_dir/missing.toml");     /* no dir: no header */
     CHECK(enhance_cfg_init("ecfg_root", "TITLE") == -1);
-    recomp_env_set(RENV_ENHANCE_CONFIG, NULL);
+    recomp_env_set(RENV_CONFIG, NULL);
 
     /* no title file: root only; a broken title file is skipped whole */
     CHECK(enhance_cfg_init("ecfg_root", "OTHER") == 1);
     CHECK(enhance_cfg_int("render.scale", 1) == 3);
-    write_file("ecfg_root/TITLE/enhance.toml", "[render]\nscale = 2\nscale = 3\n");
+    write_file("ecfg_root/TITLE/config.toml", "[render]\nscale = 2\nscale = 3\n");
     CHECK(enhance_cfg_init("ecfg_root", "TITLE") == -1);
     CHECK(enhance_cfg_file(0) == NULL);
     CHECK(enhance_cfg_int("render.scale", 1) == 3);
     enhance_cfg_shutdown();
     CHECK(enhance_cfg_int("render.scale", 1) == 1);
+}
+
+/* ── config.default.toml, config.toml, migration and the header ────── */
+
+/* Is `path` an existing directory? */
+static int is_dir(const char *path)
+{
+    struct stat st;
+    return stat(path, &st) == 0 && (st.st_mode & S_IFDIR);
+}
+
+static void config_reset_env(void)
+{
+    recomp_env_set(RENV_CONFIG, NULL);
+    recomp_env_set(RENV_RENDER_SCALE, NULL);
+    recomp_env_set(RENV_PRESENT_FILTER, NULL);
+}
+
+static void test_config_files(void)
+{
+    static const char defaults[] =
+        "[render]\nscale = 2\n[present]\nfilter = \"integer\"\n[extra]\nunread = 1\n";
+    static const char *const filters[] = { "nearest", "linear", "integer", NULL };
+    char want[4400];
+    const char *out;
+    const recomp_cfg *d;
+
+    config_reset_env();
+    remove_defaults();
+    /* A rerun starts from no user directory. */
+    remove("ecfg_lay/config/config.toml");
+    RMDIR("ecfg_lay/config");
+
+    /* The defaults file alone: no user directory, so nothing is created
+     * and the save path is where the file would be. */
+    MKDIR("ecfg_lay");
+    write_file(defaults_file(), defaults);
+    capture_begin();
+    CHECK(enhance_cfg_init("ecfg_lay", NULL) == 1);
+    out = capture_end();
+    snprintf(want, sizeof want, "[ENHANCE] config: %s (3 keys)\n", defaults_file());
+    CHECK(strstr(out, want) != NULL);
+    CHECK(enhance_cfg_int("render.scale", 1) == 2);
+    CHECK(enhance_cfg_source_of("render.scale") == ENHANCE_SRC_DEFAULTS);
+    CHECK(enhance_cfg_file(2) != NULL && enhance_cfg_file(2) == enhance_cfg_defaults());
+    CHECK(enhance_cfg_file(0) == NULL && enhance_cfg_file(1) == NULL);
+    CHECK(!is_dir("ecfg_lay/config") && !exists("ecfg_lay/config.toml"));
+    CHECK(enhance_cfg_user_path() && !strcmp(enhance_cfg_user_path(), "ecfg_lay/config/config.toml"));
+    /* What a writer compares against. */
+    d = enhance_cfg_defaults();
+    CHECK(recomp_cfg_int(d, "render.scale", 0) == 2);
+    CHECK(!strcmp(recomp_cfg_string(d, "present.filter", ""), "integer"));
+    CHECK(recomp_cfg_find(d, "render.missing") < 0);
+
+    /* config/ exists: the user file is created as the header, 0 keys. */
+    MKDIR("ecfg_lay/config");
+    capture_begin();
+    CHECK(enhance_cfg_init("ecfg_lay", NULL) == 2);
+    out = capture_end();
+    snprintf(want, sizeof want, "[ENHANCE] config: %s (3 keys), ecfg_lay/config/config.toml (0 keys)\n",
+             defaults_file());
+    CHECK(strstr(out, want) != NULL);
+    CHECK(!strncmp(read_file("ecfg_lay/config/config.toml"), "# Your settings: only the keys", 30));
+    CHECK(strstr(read_file("ecfg_lay/config/config.toml"), "config.default.toml") != NULL);
+    CHECK(enhance_cfg_file(1) && recomp_cfg_count(enhance_cfg_file(1)) == 0);
+    CHECK(enhance_cfg_int("render.scale", 1) == 2);
+    CHECK(!strcmp(enhance_cfg_user_path(), "ecfg_lay/config/config.toml"));
+
+    /* The user file over the defaults; a defaults key it does not name
+     * still answers. One key, so "1 key". */
+    write_file("ecfg_lay/config/config.toml", "[render]\nscale = 3\n");
+    capture_begin();
+    CHECK(enhance_cfg_init("ecfg_lay", NULL) == 2);
+    out = capture_end();
+    CHECK(strstr(out, "ecfg_lay/config/config.toml (1 key)\n") != NULL);
+    CHECK(enhance_cfg_int("render.scale", 1) == 3);
+    CHECK(enhance_cfg_source_of("render.scale") == ENHANCE_SRC_FILE);
+    /* Unused: the defaults' extra.unread and present.filter, not the
+     * render.scale the user file overrides. */
+    capture_begin();
+    CHECK(enhance_cfg_report_unused() == 2);
+    out = capture_end();
+    snprintf(want, sizeof want, "[ENHANCE] unused key extra.unread, %s:6\n", defaults_file());
+    CHECK(strstr(out, want) != NULL);
+    CHECK(strstr(out, "unused key render.scale") == NULL);
+    CHECK(enhance_cfg_choice("present.filter", filters, 0) == 2);
+    CHECK(enhance_cfg_source_of("present.filter") == ENHANCE_SRC_DEFAULTS);
+
+    /* The writer's comparison: the user file holds the defaults' value for
+     * one key; it is read as any other (no equality judged on read). */
+    write_file("ecfg_lay/config/config.toml", "[render]\nscale = 2\n");
+    CHECK(enhance_cfg_init("ecfg_lay", NULL) == 2);
+    CHECK(enhance_cfg_int("render.scale", 1) == 2);
+    CHECK(enhance_cfg_source_of("render.scale") == ENHANCE_SRC_FILE);
+    write_file("ecfg_lay/config/config.toml", "[render]\nscale = 3\n");
+
+    /* Title over user over defaults; the save path is the title file. */
+    MKDIR("ecfg_lay/T");
+    write_file("ecfg_lay/T/config.toml", "[render]\nscale = 4\n");
+    CHECK(enhance_cfg_init("ecfg_lay", "T") == 3);
+    CHECK(enhance_cfg_int("render.scale", 1) == 4);
+    CHECK(enhance_cfg_source_of("render.scale") == ENHANCE_SRC_FILE);
+    CHECK(!strcmp(enhance_cfg_user_path(), "ecfg_lay/T/config.toml"));
+    CHECK(enhance_cfg_lookup("render.scale") == enhance_cfg_file(0));
+    /* An absent title file in an existing title directory gets the header
+     * (the file Save targets), and the user file answers. */
+    remove("ecfg_lay/T/config.toml");
+    CHECK(enhance_cfg_init("ecfg_lay", "T") == 3);
+    CHECK(!strncmp(read_file("ecfg_lay/T/config.toml"), "# T settings: only the keys", 27));
+    CHECK(enhance_cfg_int("render.scale", 1) == 3);
+    CHECK(!strcmp(enhance_cfg_user_path(), "ecfg_lay/T/config.toml"));
+    /* A title with no directory: the user file is the save path. */
+    CHECK(enhance_cfg_init("ecfg_lay", "NODIR") == 2);
+    CHECK(!is_dir("ecfg_lay/NODIR"));
+    CHECK(!strcmp(enhance_cfg_user_path(), "ecfg_lay/config/config.toml"));
+
+    /* The environment over every file, with no deprecation line. */
+    recomp_env_set(RENV_RENDER_SCALE, "1");
+    capture_begin();
+    CHECK(enhance_cfg_init("ecfg_lay", "T") == 3);
+    out = capture_end();
+    CHECK(strstr(out, "[ENHANCE] render.scale = 1 from RECOMP_RENDER_SCALE\n") != NULL);
+    CHECK(strstr(out, "deprecated") == NULL);
+    CHECK(enhance_cfg_int("render.scale", 4) == 1);
+    CHECK(enhance_cfg_source_of("render.scale") == ENHANCE_SRC_ENV);
+    recomp_env_set(RENV_RENDER_SCALE, NULL);
+
+    /* RECOMP_CONFIG=<path>: that file replaces the title and user files,
+     * the defaults stay under it. */
+    write_file("ecfg_lay/mine.toml", "[render]\nscale = 4\n");
+    recomp_env_set(RENV_CONFIG, "ecfg_lay/mine.toml");
+    CHECK(enhance_cfg_init("ecfg_lay", "T") == 2);
+    CHECK(enhance_cfg_file(0) == NULL);
+    CHECK(enhance_cfg_int("render.scale", 1) == 4);
+    CHECK(enhance_cfg_choice("present.filter", filters, 0) == 2);
+    CHECK(enhance_cfg_source_of("present.filter") == ENHANCE_SRC_DEFAULTS);
+    CHECK(!strcmp(enhance_cfg_user_path(), "ecfg_lay/mine.toml"));
+    /* ... and is created as the header when absent in an existing
+     * directory, as a launcher's <data>/config/config.toml is. */
+    MKDIR("ecfg_fresh");
+    MKDIR("ecfg_fresh/config");
+    remove("ecfg_fresh/config/config.toml");
+    remove("ecfg_fresh/config/enhance.toml");
+    recomp_env_set(RENV_CONFIG, "ecfg_fresh/config/config.toml");
+    capture_begin();
+    CHECK(enhance_cfg_init("ecfg_lay", NULL) == 2);
+    out = capture_end();
+    CHECK(strstr(out, "ecfg_fresh/config/config.toml (0 keys)\n") != NULL);
+    CHECK(exists("ecfg_fresh/config/config.toml"));
+    CHECK(!strcmp(enhance_cfg_user_path(), "ecfg_fresh/config/config.toml"));
+
+    /* none: no file at all, whatever exists, and nothing written. */
+    remove("ecfg_fresh/config/config.toml");
+    write_file("ecfg_fresh/config/enhance.toml", "[render]\nscale = 2\n");
+    recomp_env_set(RENV_CONFIG, "none");
+    capture_begin();
+    CHECK(enhance_cfg_init("ecfg_fresh", NULL) == 0);
+    out = capture_end();
+    CHECK(strstr(out, "[ENHANCE] config: none (RECOMP_CONFIG)\n") != NULL);
+    CHECK(strstr(out, "renamed") == NULL);
+    CHECK(enhance_cfg_int("render.scale", 1) == 1);
+    CHECK(enhance_cfg_source_of("render.scale") == ENHANCE_SRC_DEFAULT);
+    CHECK(enhance_cfg_file(0) == NULL && enhance_cfg_file(1) == NULL && enhance_cfg_file(2) == NULL);
+    CHECK(enhance_cfg_user_path() == NULL && enhance_cfg_defaults() == NULL);
+    CHECK(!exists("ecfg_fresh/config/config.toml") && exists("ecfg_fresh/config/enhance.toml"));
+
+    /* The legacy name, through the table: one deprecation line, then the
+     * same as RECOMP_CONFIG=none. */
+    set_env("RECOMP_CONFIG", NULL);
+    set_env("RECOMP_ENHANCE_CONFIG", "none");
+    capture_begin();
+    recomp_env_reload();
+    recomp_env_flush_notes();
+    CHECK(enhance_cfg_init("ecfg_lay", NULL) == 0);
+    out = capture_end();
+    CHECK(strstr(out, "[ENV] RECOMP_ENHANCE_CONFIG is deprecated; use RECOMP_CONFIG\n") != NULL);
+    CHECK(strstr(out, "[ENHANCE] config: none (RECOMP_CONFIG)\n") != NULL);
+    CHECK(enhance_cfg_int("render.scale", 1) == 1);
+    set_env("RECOMP_ENHANCE_CONFIG", NULL);
+    recomp_env_reload();
+    recomp_env_flush_notes();
+    config_reset_env();
+
+    /* A broken defaults file: said with its line, skipped whole; the user
+     * file still applies. */
+    write_file(defaults_file(), "[render]\nscale = 2\nscale = 3\n");
+    capture_begin();
+    CHECK(enhance_cfg_init("ecfg_lay", NULL) == -1);
+    out = capture_end();
+    snprintf(want, sizeof want, "[ENHANCE] config error: %s:3: duplicate key", defaults_file());
+    CHECK(strstr(out, want) != NULL && strstr(out, "(file ignored)") != NULL);
+    CHECK(enhance_cfg_defaults() == NULL);
+    CHECK(strstr(out, "[ENHANCE] config: ecfg_lay/config/config.toml (1 key)\n") != NULL);
+    CHECK(enhance_cfg_int("render.scale", 1) == 3);
+    remove_defaults();
+
+    /* No file anywhere: "none" alone. */
+    MKDIR("ecfg_empty");
+    capture_begin();
+    CHECK(enhance_cfg_init("ecfg_empty", NULL) == 0);
+    out = capture_end();
+    CHECK(strstr(out, "[ENHANCE] config: none\n") != NULL);
+
+#ifdef __APPLE__
+    /* An app bundle: Contents/MacOS/<exe> reads Contents/Resources/. Only
+     * when that directory is ours to make and remove. */
+    {
+        char res[4200], file[4300];
+        snprintf(res, sizeof res, "%s/../Resources", recomp_exe_dir());
+        if (!is_dir(res) && MKDIR(res) == 0) {
+            snprintf(file, sizeof file, "%s/config.default.toml", res);
+            write_file(file, "[render]\nscale = 3\n");
+            CHECK(enhance_cfg_init("ecfg_empty", NULL) == 1);
+            CHECK(enhance_cfg_int("render.scale", 1) == 3);
+            CHECK(enhance_cfg_source_of("render.scale") == ENHANCE_SRC_DEFAULTS);
+            /* Beside the executable wins. */
+            write_file(defaults_file(), "[render]\nscale = 2\n");
+            CHECK(enhance_cfg_init("ecfg_empty", NULL) == 1);
+            CHECK(enhance_cfg_int("render.scale", 1) == 2);
+            remove_defaults();
+            remove(file);
+            RMDIR(res);
+        } else {
+            printf("enhance_cfg: %s exists; Resources check skipped\n", res);
+        }
+    }
+#endif
+    enhance_cfg_shutdown();
+}
+
+/* ── the one-time enhance.toml rename ──────────────────────────────── */
+
+static void test_migration(void)
+{
+    static const char old[] = "# mine\n[render]\nscale = 2\n";
+    const char *out;
+
+    config_reset_env();
+    remove_defaults();
+
+    /* Under RECOMP_CONFIG=<dir>/config.toml, as every launcher sets it. */
+    MKDIR("ecfg_mig");
+    MKDIR("ecfg_mig/config");
+    remove("ecfg_mig/config/config.toml");
+    write_file("ecfg_mig/config/enhance.toml", old);
+    recomp_env_set(RENV_CONFIG, "ecfg_mig/config/config.toml");
+    capture_begin();
+    CHECK(enhance_cfg_init("ecfg_mig", NULL) == 1);
+    out = capture_end();
+    CHECK(strstr(out, "[ENHANCE] config: renamed ecfg_mig/config/enhance.toml to config.toml"
+                      " (one-time migration)\n") != NULL);
+    CHECK(!exists("ecfg_mig/config/enhance.toml"));
+    CHECK(!strcmp(read_file("ecfg_mig/config/config.toml"), old));      /* same bytes */
+    CHECK(enhance_cfg_int("render.scale", 1) == 2);
+    capture_begin();
+    CHECK(enhance_cfg_init("ecfg_mig", NULL) == 1);
+    out = capture_end();
+    CHECK(strstr(out, "renamed") == NULL);
+    CHECK(enhance_cfg_int("render.scale", 1) == 2);
+
+    /* At the default locations, the title's and the user's. */
+    MKDIR("ecfg_mig2");
+    MKDIR("ecfg_mig2/config");
+    MKDIR("ecfg_mig2/T");
+    remove("ecfg_mig2/config/config.toml");
+    remove("ecfg_mig2/T/config.toml");
+    write_file("ecfg_mig2/config/enhance.toml", "[render]\nscale = 3\n");
+    write_file("ecfg_mig2/T/enhance.toml", "[present]\nfullscreen = true\n");
+    recomp_env_set(RENV_CONFIG, NULL);
+    capture_begin();
+    CHECK(enhance_cfg_init("ecfg_mig2", "T") == 2);
+    out = capture_end();
+    CHECK(strstr(out, "renamed ecfg_mig2/config/enhance.toml to config.toml") != NULL);
+    CHECK(strstr(out, "renamed ecfg_mig2/T/enhance.toml to config.toml") != NULL);
+    CHECK(enhance_cfg_int("render.scale", 1) == 3 && enhance_cfg_bool("present.fullscreen", 0) == 1);
+
+    /* Not candidates: another basename under RECOMP_CONFIG, the old root
+     * location, anything under none. */
+    MKDIR("ecfg_mig3");
+    remove("ecfg_mig3/ecfg_init.toml");
+    write_file("ecfg_mig3/enhance.toml", old);
+    recomp_env_set(RENV_CONFIG, "ecfg_mig3/ecfg_init.toml");
+    capture_begin();
+    enhance_cfg_init("ecfg_mig3", NULL);
+    out = capture_end();
+    CHECK(strstr(out, "renamed") == NULL);
+    CHECK(!strcmp(read_file("ecfg_mig3/enhance.toml"), old));
+    CHECK(enhance_cfg_int("render.scale", 1) == 1);
+    recomp_env_set(RENV_CONFIG, NULL);
+    capture_begin();
+    CHECK(enhance_cfg_init("ecfg_mig3", NULL) == 0);       /* no config/: nothing */
+    out = capture_end();
+    CHECK(strstr(out, "renamed") == NULL);
+    CHECK(exists("ecfg_mig3/enhance.toml") && !exists("ecfg_mig3/config.toml"));
+    CHECK(!is_dir("ecfg_mig3/config"));
+    CHECK(enhance_cfg_int("render.scale", 1) == 1);
+
+    /* Both files present: config.toml wins, enhance.toml is not touched. */
+    MKDIR("ecfg_mig4");
+    MKDIR("ecfg_mig4/config");
+    write_file("ecfg_mig4/config/config.toml", "[render]\nscale = 3\n");
+    write_file("ecfg_mig4/config/enhance.toml", old);
+    recomp_env_set(RENV_CONFIG, "ecfg_mig4/config/config.toml");
+    capture_begin();
+    CHECK(enhance_cfg_init("ecfg_mig4", NULL) == 1);
+    out = capture_end();
+    CHECK(strstr(out, "renamed") == NULL);
+    CHECK(enhance_cfg_int("render.scale", 1) == 3);
+    CHECK(!strcmp(read_file("ecfg_mig4/config/config.toml"), "[render]\nscale = 3\n"));
+    CHECK(!strcmp(read_file("ecfg_mig4/config/enhance.toml"), old));
+
+#ifndef _WIN32
+    if (geteuid() != 0) {
+        int n = 0;
+        const char *p;
+
+        /* An existing config.toml the player cannot read is not absent:
+         * the header never truncates it and no rename replaces it. */
+        write_file("ecfg_mig4/config/config.toml", "[render]\nscale = 4\n");
+        chmod("ecfg_mig4/config/config.toml", 0);
+        recomp_env_set(RENV_CONFIG, NULL);
+        capture_begin();
+        enhance_cfg_init("ecfg_mig4", NULL);
+        out = capture_end();
+        chmod("ecfg_mig4/config/config.toml", 0644);
+        CHECK(strstr(out, "renamed") == NULL);
+        CHECK(strstr(out, "[ENHANCE] config error:") != NULL);
+        CHECK(!strcmp(read_file("ecfg_mig4/config/config.toml"), "[render]\nscale = 4\n"));
+        CHECK(!strcmp(read_file("ecfg_mig4/config/enhance.toml"), old));
+
+        /* A rename that fails (a read-only directory): one line, the old
+         * file left as is, no header in its place. */
+        MKDIR("ecfg_mig5");
+        MKDIR("ecfg_mig5/config");
+        chmod("ecfg_mig5/config", 0755);
+        remove("ecfg_mig5/config/config.toml");
+        write_file("ecfg_mig5/config/enhance.toml", old);
+        chmod("ecfg_mig5/config", 0555);
+        capture_begin();
+        enhance_cfg_init("ecfg_mig5", NULL);
+        out = capture_end();
+        chmod("ecfg_mig5/config", 0755);
+        for (p = out; (p = strstr(p, "cannot rename")) != NULL; p++)
+            n++;
+        CHECK(n == 1);
+        CHECK(strstr(out, "ecfg_mig5/config/enhance.toml to config.toml (") != NULL);
+        CHECK(strstr(out, "; left as is\n") != NULL);
+        CHECK(strstr(out, "cannot create") == NULL);
+        CHECK(!exists("ecfg_mig5/config/config.toml"));
+        CHECK(!strcmp(read_file("ecfg_mig5/config/enhance.toml"), old));
+    }
+#endif
+
+    /* The header never truncates: an existing user file keeps its bytes
+     * through repeated runs. */
+    write_file("ecfg_mig4/config/config.toml", "# kept\n[render]\nscale = 2\n");
+    recomp_env_set(RENV_CONFIG, NULL);
+    capture_begin();
+    enhance_cfg_init("ecfg_mig4", NULL);
+    enhance_cfg_init("ecfg_mig4", NULL);
+    out = capture_end();
+    CHECK(strstr(out, "cannot create") == NULL);
+    CHECK(!strcmp(read_file("ecfg_mig4/config/config.toml"), "# kept\n[render]\nscale = 2\n"));
+    CHECK(enhance_cfg_int("render.scale", 1) == 2);
+
+    config_reset_env();
+    enhance_cfg_shutdown();
 }
 
 /* ── xbox_enhance_init: the toolkit's keys into nv2a_host_opts ─────── */
@@ -464,7 +917,7 @@ void xbox_PacingSetMode(int mode) { s_pacing_mode = mode; }
 
 static void enhance_reset_env(void)
 {
-    recomp_env_set(RENV_ENHANCE_CONFIG, "none");
+    recomp_env_set(RENV_CONFIG, "none");
     recomp_env_set(RENV_RENDER_SCALE, NULL);
     recomp_env_set(RENV_DISPLAY_ASPECT, NULL);
     recomp_env_set(RENV_PRESENT_FILTER, NULL);
@@ -487,7 +940,7 @@ static void test_enhance_init(void)
     /* The file answers. */
     write_file("ecfg_init.toml",
                "[render]\nscale = 2\n[present]\nfilter = \"integer\"\nfullscreen = true\n");
-    recomp_env_set(RENV_ENHANCE_CONFIG, "ecfg_init.toml");
+    recomp_env_set(RENV_CONFIG, "ecfg_init.toml");
     CHECK(xbox_enhance_init(".", NULL) == 0);
     CHECK(o->render_scale == 2 && o->present_filter == NV2A_PRESENT_INTEGER && o->fullscreen == 1);
 
@@ -504,15 +957,15 @@ static void test_enhance_init(void)
      * no file, nearest. */
     recomp_env_set(RENV_PRESENT_FILTER, "bicubic");
     CHECK(xbox_enhance_init(".", NULL) == 0 && o->present_filter == NV2A_PRESENT_INTEGER);
-    recomp_env_set(RENV_ENHANCE_CONFIG, "none");
+    recomp_env_set(RENV_CONFIG, "none");
     CHECK(xbox_enhance_init(".", NULL) == 0 && o->present_filter == NV2A_PRESENT_NEAREST);
     write_file("ecfg_bad.toml", "[present]\nfilter = \"sharp\"\n");
     recomp_env_set(RENV_PRESENT_FILTER, NULL);
-    recomp_env_set(RENV_ENHANCE_CONFIG, "ecfg_bad.toml");
+    recomp_env_set(RENV_CONFIG, "ecfg_bad.toml");
     CHECK(xbox_enhance_init(".", NULL) == 0 && o->present_filter == NV2A_PRESENT_NEAREST);
 
     /* Scale out of range clamps to 1..4. */
-    recomp_env_set(RENV_ENHANCE_CONFIG, "none");
+    recomp_env_set(RENV_CONFIG, "none");
     recomp_env_set(RENV_RENDER_SCALE, "9");
     CHECK(xbox_enhance_init(".", NULL) == 0 && o->render_scale == 4);
     recomp_env_set(RENV_RENDER_SCALE, "0");
@@ -528,11 +981,11 @@ static void test_enhance_init(void)
     /* present.pacing: spin by default, from the file, env over file, and a
      * bad value reported with the file answering. */
     recomp_env_set(RENV_DISPLAY_ASPECT, NULL);
-    recomp_env_set(RENV_ENHANCE_CONFIG, "none");
+    recomp_env_set(RENV_CONFIG, "none");
     s_pacing_mode = -1;
     CHECK(xbox_enhance_init(".", NULL) == 0 && s_pacing_mode == 0);
     write_file("ecfg_pacing.toml", "[present]\npacing = \"sleep\"\n");
-    recomp_env_set(RENV_ENHANCE_CONFIG, "ecfg_pacing.toml");
+    recomp_env_set(RENV_CONFIG, "ecfg_pacing.toml");
     CHECK(xbox_enhance_init(".", NULL) == 0 && s_pacing_mode == 1);
     recomp_env_set(RENV_PRESENT_PACING, "spin");
     CHECK(xbox_enhance_init(".", NULL) == 0 && s_pacing_mode == 0);
@@ -540,62 +993,22 @@ static void test_enhance_init(void)
     recomp_env_set(RENV_PRESENT_PACING, "nap");
     CHECK(xbox_enhance_init(".", NULL) == 0 && s_pacing_mode == 1);
     recomp_env_set(RENV_PRESENT_PACING, NULL);
-    recomp_env_set(RENV_ENHANCE_CONFIG, "none");
+    recomp_env_set(RENV_CONFIG, "none");
     recomp_env_set(RENV_PRESENT_PACING, "sleep");
     CHECK(xbox_enhance_init(".", NULL) == 0 && s_pacing_mode == 1);
     recomp_env_set(RENV_PRESENT_PACING, NULL);
 
     /* A file that does not parse: -1, stock. */
     write_file("ecfg_broken.toml", "[render]\nscale = \n");
-    recomp_env_set(RENV_ENHANCE_CONFIG, "ecfg_broken.toml");
+    recomp_env_set(RENV_CONFIG, "ecfg_broken.toml");
     CHECK(xbox_enhance_init(".", NULL) == -1 && o->render_scale == 1);
 
     enhance_reset_env();
-    recomp_env_set(RENV_ENHANCE_CONFIG, NULL);
+    recomp_env_set(RENV_CONFIG, NULL);
     enhance_cfg_shutdown();
 }
 
 /* ── textures.pack: path resolution and the lines golden reads ────── */
-
-/* stderr to a file while a call runs, then its text. */
-static int s_saved_fd = -1;
-static char s_cap[4096];
-
-static void capture_begin(void)
-{
-    int fd;
-    fflush(stderr);
-    s_saved_fd = DUP(2);
-    fd = OPEN_TRUNC("ecfg_stderr.txt");
-    if (s_saved_fd < 0 || fd < 0) { fprintf(stderr, "cannot capture stderr\n"); exit(2); }
-    DUP2(fd, 2);
-    CLOSE(fd);
-}
-
-static const char *capture_end(void)
-{
-    FILE *f;
-    size_t n = 0;
-    fflush(stderr);
-    DUP2(s_saved_fd, 2);
-    CLOSE(s_saved_fd);
-    s_cap[0] = 0;
-    f = fopen("ecfg_stderr.txt", "rb");
-    if (f) {
-        n = fread(s_cap, 1, sizeof s_cap - 1, f);
-        fclose(f);
-    }
-    s_cap[n] = 0;
-    {
-        /* Windows' text-mode stderr writes "\r\n"; the lines compare as "\n". */
-        char *r = s_cap, *w = s_cap;
-        for (; *r; r++)
-            if (*r != '\r')
-                *w++ = *r;
-        *w = 0;
-    }
-    return s_cap;
-}
 
 /* A one-entry pack: a 1x1 texel at scale 2. */
 static void write_pack(const char *path)
@@ -620,13 +1033,17 @@ static void write_pack(const char *path)
 
 static void test_tex_pack_key(void)
 {
-    char abs[1200], cwd[1024], want[1400];
+    char abs[4200], dir[4200], want[4400];
     const char *out;
 
+    /* The pack sits beside the executable, as a bundle's enhance/hud.pack
+     * does; the user root (ecfg_root) is not where it is looked for. */
     enhance_reset_env();
     MKDIR("ecfg_root");
-    MKDIR("ecfg_root/enhance");
-    write_pack("ecfg_root/enhance/t.pack");
+    snprintf(dir, sizeof dir, "%s/ecfg_enhance", recomp_exe_dir());
+    MKDIR(dir);
+    snprintf(abs, sizeof abs, "%s/t.pack", dir);
+    write_pack(abs);
 
     /* Unset and "none": the none line, no pack. */
     recomp_env_set(RENV_TEXTURES_PACK, NULL);
@@ -642,12 +1059,13 @@ static void test_tex_pack_key(void)
     CHECK(strstr(out, "[ENHANCE] textures.pack=none\n") != NULL);
     CHECK(nv2a_tex_pack_count() == 0);
 
-    /* Relative: against the root. The line names the key's value. */
-    recomp_env_set(RENV_TEXTURES_PACK, "enhance/t.pack");
+    /* Relative: against the executable's directory. The line names the
+     * key's value. */
+    recomp_env_set(RENV_TEXTURES_PACK, "ecfg_enhance/t.pack");
     capture_begin();
     CHECK(xbox_enhance_init("ecfg_root", NULL) == 0);
     out = capture_end();
-    CHECK(strstr(out, "[ENHANCE] textures.pack=enhance/t.pack (1 entries: 1 art, 0 font, 0 text;"
+    CHECK(strstr(out, "[ENHANCE] textures.pack=ecfg_enhance/t.pack (1 entries: 1 art, 0 font, 0 text;"
                       " scale 2, text 2; 0 bc3) textures.font=on textures.text=on\n") != NULL);
     CHECK(nv2a_tex_pack_count() == 1 && nv2a_tex_pack_scale() == 2);
     CHECK(nv2a_host_opts()->pack_off == 0);
@@ -675,9 +1093,7 @@ static void test_tex_pack_key(void)
     capture_end();
     CHECK(nv2a_tex_pack_count() == 0);
 
-    /* Absolute: taken as is, never joined to the root. */
-    CHECK(GETCWD(cwd, sizeof cwd) != NULL);
-    snprintf(abs, sizeof abs, "%s/ecfg_root/enhance/t.pack", cwd);
+    /* Absolute: taken as is, never joined to a directory. */
     recomp_env_set(RENV_TEXTURES_PACK, abs);
     capture_begin();
     CHECK(xbox_enhance_init("ecfg_no_such_root", NULL) == 0);
@@ -689,17 +1105,40 @@ static void test_tex_pack_key(void)
 
     /* Refused: the reason and the resolved path, "; no pack", stock. The
      * golden check skips this line, so a refused pack reads as none. */
-    recomp_env_set(RENV_TEXTURES_PACK, "enhance/missing.pack");
+    recomp_env_set(RENV_TEXTURES_PACK, "ecfg_enhance/missing.pack");
     capture_begin();
     CHECK(xbox_enhance_init("ecfg_root", NULL) == 0);
     out = capture_end();
-    CHECK(strstr(out, "[ENHANCE] textures.pack=enhance/missing.pack: cannot open"
-                      " (ecfg_root/enhance/missing.pack); no pack\n") != NULL);
+    snprintf(want, sizeof want, "[ENHANCE] textures.pack=ecfg_enhance/missing.pack: cannot open"
+             " (%s/missing.pack); no pack\n", dir);
+    CHECK(strstr(out, want) != NULL);
     CHECK(nv2a_tex_pack_count() == 0);
+
+    /* The key from config.default.toml, as --hud-pack writes it: the pack
+     * resolves against the same directory the file is read from. */
+    recomp_env_set(RENV_TEXTURES_PACK, NULL);
+    recomp_env_set(RENV_CONFIG, "ecfg_root/ecfg_pack_user.toml");
+    write_file("ecfg_root/ecfg_pack_user.toml", "");
+    write_file(defaults_file(), "[textures]\npack = \"ecfg_enhance/t.pack\"\n");
+    capture_begin();
+    CHECK(xbox_enhance_init("ecfg_root", NULL) == 0);
+    out = capture_end();
+    CHECK(strstr(out, "[ENHANCE] textures.pack=ecfg_enhance/t.pack (1 entries") != NULL);
+    CHECK(nv2a_tex_pack_count() == 1);
+    CHECK(enhance_cfg_source_of("textures.pack") == ENHANCE_SRC_DEFAULTS);
+    /* "none" in the user file turns a shipped pack off. */
+    write_file("ecfg_root/ecfg_pack_user.toml", "[textures]\npack = \"none\"\n");
+    capture_begin();
+    CHECK(xbox_enhance_init("ecfg_root", NULL) == 0);
+    out = capture_end();
+    CHECK(strstr(out, "[ENHANCE] textures.pack=none\n") != NULL);
+    CHECK(nv2a_tex_pack_count() == 0);
+    remove_defaults();
+    remove(abs);
 
     enhance_reset_env();
     recomp_env_set(RENV_TEXTURES_PACK, NULL);
-    recomp_env_set(RENV_ENHANCE_CONFIG, NULL);
+    recomp_env_set(RENV_CONFIG, NULL);
     enhance_cfg_shutdown();
     nv2a_tex_pack_unload();
 }
@@ -736,6 +1175,8 @@ int main(void)
     test_strict_valid();
     test_locale();
     test_layers();
+    test_config_files();
+    test_migration();
     test_enhance_init();
     test_tex_pack_key();
     test_exe_dir();

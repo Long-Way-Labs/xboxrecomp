@@ -53,12 +53,13 @@ extern "C" {
 
 /* The opt-in enhancements layer (src/enhance/, XBOXRECOMP_ENHANCE=ON) adds
  * its config-tier keys by defining RECOMP_ENV_HAVE_ENHANCE_KEYS on this
- * target. They mirror keys of the enhancements file (enhance.toml) and win
- * over it: the variable is RECOMP_ + the dotted key, upper case, '.' -> '_'.
+ * target. They mirror keys of the configuration files (config.toml over
+ * config.default.toml) and win over them: the variable is RECOMP_ + the
+ * dotted key, upper case, '.' -> '_'.
  * Without the layer they do not exist, so the table is what it always was. */
 #ifdef RECOMP_ENV_HAVE_ENHANCE_KEYS
 #define RECOMP_ENV_ENHANCE_KEYS(X) \
-    X(ENHANCE_CONFIG,    CONFIG, "RECOMP_ENHANCE_CONFIG",    NULL, "enhancements file: a path, or none (default: <root>/<title>/enhance.toml, <root>/enhance.toml)") \
+    X(CONFIG,            CONFIG, "RECOMP_CONFIG",            "RECOMP_ENHANCE_CONFIG", "configuration: the user's config.toml (a path), or none for no file at all; default <root>/<title>/config.toml, <root>/config/config.toml; config.default.toml beside the executable is read under it") \
     X(RENDER_SCALE,      CONFIG, "RECOMP_RENDER_SCALE",      NULL, "enhancements: render.scale, internal resolution factor (1 = stock)") \
     X(DISPLAY_ASPECT,    CONFIG, "RECOMP_DISPLAY_ASPECT",    NULL, "enhancements: display.aspect, 4:3 (stock), 16:9, 16:10, 21:9") \
     X(PRESENT_FILTER,    CONFIG, "RECOMP_PRESENT_FILTER",    NULL, "enhancements: present.filter, nearest (stock), linear, integer") \

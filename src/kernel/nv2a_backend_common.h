@@ -944,8 +944,11 @@ uint32_t nv2a_occ_scale_count(uint64_t samples, unsigned scale);
 /* ---- Host options: enhancements the backends and the presenter honour ----
  *
  * Filled once by the opt-in enhancements layer (src/enhance, xbox_enhance_init)
- * before the guest starts, read-only afterwards. All zero is stock: guest-size
- * targets, nearest letterbox, windowed. Without the layer nothing sets them. */
+ * before the guest starts. All zero is stock: guest-size targets, nearest
+ * letterbox, windowed. Without the layer nothing sets them. After init the
+ * struct is written only on the walker thread, by nv2a_host_opts_apply() at a
+ * flip: the backends read it in many places, and a change between a target's
+ * size and its scale mid-frame would be a torn frame. */
 enum nv2a_present_filter {
     NV2A_PRESENT_NEAREST = 0,   /* stock: letterbox, nearest */
     NV2A_PRESENT_LINEAR,        /* letterbox, bilinear */
@@ -956,10 +959,34 @@ struct nv2a_host_opts {
     unsigned render_scale;      /* 0 or 1 = guest size; 2..4 */
     int      present_filter;    /* enum nv2a_present_filter */
     int      fullscreen;        /* borderless desktop fullscreen at start */
+    unsigned pack_off;          /* NV2A_PACK_OFF_* bits: 0 = every kind on */
 };
+
+/* pack_off bits: the whole pack, or one kind of entry (nv2a_tex_pack.h). */
+#define NV2A_PACK_OFF_ALL   0x1u
+#define NV2A_PACK_OFF_FONT  0x2u
+#define NV2A_PACK_OFF_TEXT  0x4u
+#define NV2A_PACK_OFF_ART   0x8u
+
+/* Field masks for nv2a_host_opts_request / _apply. */
+#define NV2A_OPT_SCALE      0x1u
+#define NV2A_OPT_FILTER     0x2u
+#define NV2A_OPT_FULLSCREEN 0x4u
+#define NV2A_OPT_PACK       0x8u
 
 void nv2a_host_opts_set(const struct nv2a_host_opts *o);
 const struct nv2a_host_opts *nv2a_host_opts(void);
+/* Queue a change of the fields in `mask` (any thread); the backend applies it
+ * at its next flip. A second request before that flip merges into the first,
+ * the later value winning per field. */
+void nv2a_host_opts_request(const struct nv2a_host_opts *o, unsigned mask);
+/* At the flip, on the walker thread: apply the pending request. Returns the
+ * mask of fields whose value changed (0 when nothing was pending, which costs
+ * one atomic load). A PACK change also sets the pack's enable mask and bumps
+ * nv2a_tex_pack_gen(), so every backend's texture cache re-uploads. */
+unsigned nv2a_host_opts_apply(void);
+/* Bumped by every apply that changed a field. */
+uint32_t nv2a_host_opts_gen(void);
 /* render_scale as a factor: 1 when unset. */
 unsigned nv2a_host_render_scale(void);
 

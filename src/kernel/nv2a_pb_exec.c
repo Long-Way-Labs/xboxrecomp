@@ -6065,6 +6065,17 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * clear yet), the old answer: the last surface drawn, else the
          * current one. */
         present_pick();
+        /* The GPU backends apply live options (nv2a_host_opts_request) in
+         * their on_flip, after the present; these two have none that does,
+         * so it is done here and a request never stays pending. Scale still does not
+         * apply to them, said again as at startup. */
+        if (s_backend == &s_cpu_backend || s_backend == &s_null_backend) {
+            unsigned changed = nv2a_host_opts_apply();
+            if ((changed & NV2A_OPT_SCALE) && nv2a_host_render_scale() > 1)
+                fprintf(stderr, "[ENHANCE] render.scale=%u ignored: the CPU rasteriser"
+                        " draws into guest memory at the guest size\n",
+                        nv2a_host_render_scale());
+        }
         if (s_backend->on_flip) {
             uint64_t t0 = rt_now();
             if (s_present.offset)

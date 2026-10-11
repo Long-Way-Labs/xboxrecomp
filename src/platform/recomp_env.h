@@ -64,7 +64,9 @@ extern "C" {
     X(PRESENT_FILTER,    CONFIG, "RECOMP_PRESENT_FILTER",    NULL, "enhancements: present.filter, nearest (stock), linear, integer") \
     X(PRESENT_FULLSCREEN, CONFIG, "RECOMP_PRESENT_FULLSCREEN", NULL, "enhancements: present.fullscreen, borderless desktop fullscreen at start (1/0)") \
     X(PRESENT_PACING,    CONFIG, "RECOMP_PRESENT_PACING",    NULL, "enhancements: present.pacing, spin (stock busy-wait) or sleep (lowered spin waits sleep)") \
-    X(TEXTURES_PACK,     CONFIG, "RECOMP_TEXTURES_PACK",     NULL, "enhancements: textures.pack, a texture pack file (host-side texture replacements; unset = stock)")
+    X(TEXTURES_PACK,     CONFIG, "RECOMP_TEXTURES_PACK",     NULL, "enhancements: textures.pack, a texture pack file (host-side texture replacements; unset = stock)") \
+    X(TEXTURES_FONT,     CONFIG, "RECOMP_TEXTURES_FONT",     NULL, "enhancements: textures.font, the pack's font-atlas entries, on (default) or off") \
+    X(TEXTURES_TEXT,     CONFIG, "RECOMP_TEXTURES_TEXT",     NULL, "enhancements: textures.text, the pack's baked-text entries, on (default) or off")
 #else
 #define RECOMP_ENV_ENHANCE_KEYS(X)
 #endif
@@ -108,6 +110,7 @@ extern "C" {
     X(VSH_ZLOG,          TRACE, "zlog",            "RECOMP_VSH_ZLOG",          "depth clears and z-buffer use") \
     X(TEX_LOG,           TRACE, "tex",             "RECOMP_TEX_LOG",           "texture format survey; =2 also every texture") \
     X(TEX_STATE,         TRACE, "tex_state",       "RECOMP_TEX_STATE",         "texture-state methods seen, in the report") \
+    X(TEX_PACK_TRACE,    TRACE, "tex_pack",        NULL,                       "texture pack misses every 600 flips: hash, size, format, count, candidate") \
     X(CLIP_TRACE,        TRACE, "clip",            "RECOMP_CLIP_TRACE",        "near-plane clipping, per triangle") \
     X(ZPASS_TRACE,       TRACE, "zpass",           "RECOMP_ZPASS_TRACE",       "occlusion report writes") \
     X(PB_EXEC_VERBOSE,   TRACE, "pb_verbose",      "RECOMP_PB_EXEC_VERBOSE",   "executor bring-up detail") \

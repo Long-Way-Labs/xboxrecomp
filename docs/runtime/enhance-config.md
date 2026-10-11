@@ -114,6 +114,8 @@ the stock settings.
 | `present.fullscreen` | bool | borderless fullscreen at start | `false` | `RECOMP_PRESENT_FULLSCREEN` |
 | `present.pacing` | string | `"spin"` (stock), `"sleep"`: how a lowered guest busy-wait waits | `"spin"` | `RECOMP_PRESENT_PACING` |
 | `textures.pack` | string | a texture pack file ([texture-pack.md](../formats/texture-pack.md)); relative to the executable's directory | none | `RECOMP_TEXTURES_PACK` |
+| `textures.font` | string | `"on"`, `"off"`: the pack's font-atlas entries | `"on"` | `RECOMP_TEXTURES_FONT` |
+| `textures.text` | string | `"on"`, `"off"`: the pack's baked-text entries | `"on"` | `RECOMP_TEXTURES_TEXT` |
 | `aspect.program.<hash>` | string | `"hud"`, `"stretch"`, `"3d"`: a per-shader override of the aspect classifier | none | none |
 
 A title adds its own tables (`[fps]`, `[fx]`, ...) in the same file. The
@@ -138,6 +140,21 @@ is stock. One line shows the values in force:
 ```
 [ENHANCE] render.scale=2 present.filter=integer present.fullscreen=0 present.pacing=spin (display.aspect=4:3)
 ```
+
+A change while the game runs (the in-game menu) goes through
+`nv2a_host_opts_request(o, mask)`, from any thread: it is queued, and the
+Metal and D3D11 backends apply it with `nv2a_host_opts_apply()` at the
+next flip, right after its present: the one point where no target is bound
+and no upload is in flight, and the frame shown is still sized by the scale
+it was drawn at. A new `render.scale` then drains the pending occlusion
+queries at the old scale and drops every render target, depth
+buffer and texture (Metal writes a target back
+first, so the next one seeds from it), with one line
+(`render.scale=N from this flip: targets and textures dropped`); a pack
+change makes every texture upload again. The CPU and null backends apply
+too and repeat their "ignored" line on a scale change. `present.filter`
+and `present.fullscreen` change only the stored value so far; the
+presenters read them at start.
 
 - **`render.scale = N`** (1..4; outside that it is clamped, with a line).
   Metal and D3D11 allocate every colour and depth target at N times its
@@ -196,11 +213,13 @@ is stock. One line shows the values in force:
   itself is read from, so a bundle names `enhance/hud.pack`. The layer
   loads the pack's index at startup and logs one line after the settings
   line: `[ENHANCE] textures.pack=none` when unset, or
-  `[ENHANCE] textures.pack=enhance/hud.pack (41 entries, scale 4)`. A
-  file that is missing, has another magic or version, non-zero reserved
-  or flags fields, an entry outside the file, an entry with more levels
-  than its size allows (`1 + floor(log2(max(w, h)))`) or an unsorted index
-  is refused whole
+  `[ENHANCE] textures.pack=enhance/hud.pack (41 entries: 30 art, 1 font, 10 text; scale 4, text 2; 10 bc3) textures.font=on textures.text=on`
+  (the path ends at the first space). A
+  file that is missing, has another magic or version, a non-zero reserved
+  field, flags the version does not define, an entry outside the file, an
+  entry with more levels than its size allows
+  (`1 + floor(log2(max(w, h)))`), a BC3 entry whose size is not a multiple
+  of 4, or an unsorted index is refused whole
   (`[ENHANCE] textures.pack=<path>: <reason> (<resolved>); no pack`) and
   the run stays stock. On an upload (a cache miss or a texture whose
   bytes changed since the last flip) a backend looks the texel hash up
@@ -213,7 +232,23 @@ is stock. One line shows the values in force:
   a pack the only added work per upload is the entry-count test. The CPU
   rasteriser samples guest memory and ignores the key with one line
   (`[ENHANCE] textures.pack ignored: ...`). Every 600 flips a backend
-  with a pack logs its hit count. A golden run must show
+  with a pack logs its hit count; under `RECOMP_TRACE=tex_pack` it also
+  prints the uploads the pack did not replace, one
+  `[TEXPACK] miss <hash> <w>x<h> <format> x<count> candidate|linear/mip`
+  line each (texture-pack.md, "Misses"), which says what a pack still
+  lacks. A texture the pack holds but did not use carries a tag:
+  ` (text off)` (or art, font), ` (pack off)`, or ` (entry refused)` when
+  the backend could not take the entry (a GPU without BC3, such as an
+  older iPad, says so once; a texture too large; a failed read).
+- **`textures.font = "on" | "off"`, `textures.text = "on" | "off"`.** A
+  version 2 pack marks each entry as art, the font atlas or baked text.
+  `off` makes the pack skip that kind, so the game's own glyphs or text
+  images are drawn, for a player who prefers them or a language the pack
+  does not cover. Both are read whether or not a pack is set; with one
+  loaded they are in its log line. A change made at run time (the
+  in-game menu, through `nv2a_host_opts_request`) takes effect at the next
+  flip: the backends upload again every texture made under the old
+  setting. A golden run must show
   `textures.pack=none`: the golden check fails any other value.
 
 ### Naming rule
@@ -239,6 +274,8 @@ exist only when the layer is built (`RECOMP_ENV_HAVE_ENHANCE_KEYS`):
 | `RECOMP_PRESENT_FULLSCREEN` | overrides `present.fullscreen` |
 | `RECOMP_PRESENT_PACING` | overrides `present.pacing` |
 | `RECOMP_TEXTURES_PACK` | overrides `textures.pack` |
+| `RECOMP_TEXTURES_FONT` | overrides `textures.font` |
+| `RECOMP_TEXTURES_TEXT` | overrides `textures.text` |
 
 The layer converts an environment value to the type of the key:
 

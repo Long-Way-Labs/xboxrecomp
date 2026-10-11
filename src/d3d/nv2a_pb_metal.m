@@ -240,6 +240,7 @@ static id<MTLCommandBuffer>        s_cmd;      /* the frame's, begun lazily */
 static id<MTLRenderCommandEncoder> s_enc;      /* open pass, or nil */
 static int                         s_failed;
 static int                         s_unified;  /* shared textures readable */
+static int                         s_bc;       /* BC3 textures sample (pack entries) */
 
 /* Vertex and index rings, reset after every wait (flip or overflow). */
 static id<MTLBuffer> s_vb, s_ib;
@@ -479,6 +480,13 @@ static int init(void)
             return 0;
         }
         s_unified = [s_dev hasUnifiedMemory] ? 1 : 0;
+        /* Every Mac GPU samples BC; an iPad before the A-series GPUs that
+         * report it does not, and its pack BC3 entries go up from the guest. */
+#if TARGET_OS_OSX
+        s_bc = 1;
+#endif
+        if (@available(macOS 11.0, iOS 16.4, *))
+            s_bc = [s_dev supportsBCTextureCompression] ? 1 : 0;
 
         opts = [[MTLCompileOptions alloc] init];
         /* Fast math off: the CPU path is IEEE; reassociation and flushed
@@ -1200,6 +1208,7 @@ static Stage s_stage[4];
 typedef struct {
     uint32_t       offset, color, width, height, pitch, palette, levels;
     uint32_t       gen, used;
+    uint32_t       pack_gen;    /* nv2a_tex_pack_gen() it was uploaded under */
     uint64_t       hash;
     int            live;
     id<MTLTexture> tex;
@@ -1270,14 +1279,18 @@ static uint64_t tex_hash_pal(const uint8_t *mem, const Stage *t, uint32_t bytes)
     return h;
 }
 
-/* A BGRA8 texture of `levels` levels from src (level 0 first), or nil. */
+/* A texture of `levels` levels from src (level 0 first), or nil. `bc3`: src
+ * is BC3 blocks (a pack entry's payload, XRTP_FLAG_BC3), uploaded as they
+ * are with a block-row pitch; otherwise A8R8G8B8 texels into BGRA8. */
 static id<MTLTexture> tex_make(uint32_t width, uint32_t height, uint32_t levels,
-                               const uint32_t *src)
+                               const uint32_t *src, int bc3)
 {
     MTLTextureDescriptor *td;
     id<MTLTexture> tex;
+    const uint8_t *p = (const uint8_t *)src;
     uint32_t l;
-    td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+    td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:bc3 ? MTLPixelFormatBC3_RGBA
+                                                                     : MTLPixelFormatBGRA8Unorm
                                                             width:width
                                                            height:height
                                                         mipmapped:levels > 1];
@@ -1289,9 +1302,11 @@ static id<MTLTexture> tex_make(uint32_t width, uint32_t height, uint32_t levels,
         return nil;
     for (l = 0; l < levels; l++) {
         uint32_t w = nv2a_tex_level_dim(width, l), h = nv2a_tex_level_dim(height, l);
-        [tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:l withBytes:src
-               bytesPerRow:w * 4];
-        src += (size_t)w * h;
+        uint32_t row = bc3 ? (w + 3u) / 4u * 16u : w * 4u;
+        uint32_t rows = bc3 ? (h + 3u) / 4u : h;
+        [tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:l withBytes:p
+               bytesPerRow:row];
+        p += (size_t)row * rows;
     }
     return tex;
 }
@@ -1310,9 +1325,20 @@ static id<MTLTexture> tex_upload(const Stage *t, uint64_t hash)
 
     if (nv2a_tex_pack_count()) {
         struct nv2a_tex_pack_entry *pe = nv2a_tex_pack_find(hash, t->width, t->height);
-        const uint32_t *src = pe ? nv2a_tex_pack_texels(pe) : NULL;
+        const uint32_t *src = NULL;
+        if (pe && pe->bc3 && !s_bc) {
+            static int said;
+            if (!said++)
+                fprintf(stderr, LOGP "textures.pack: this GPU has no BC3; BC3 entries "
+                                     "go up from the guest\n");
+        } else if (pe) {
+            src = nv2a_tex_pack_texels(pe);
+        }
         if (src)
-            tex = tex_make(pe->width, pe->height, pe->levels, src);
+            tex = tex_make(pe->width, pe->height, pe->levels, src, pe->bc3);
+        /* A refused entry is a miss too, tagged so in the trace. */
+        if (!tex)
+            nv2a_tex_pack_miss(hash, t->width, t->height, t->color, t->levels);
     }
     if (!tex) {
         if (n > s_texels_cap) {
@@ -1326,7 +1352,7 @@ static id<MTLTexture> tex_upload(const Stage *t, uint64_t hash)
             pal = (const uint32_t *)(mem + t->palette);
         nv2a_tex_decode(mem + t->offset, t->color, t->width, t->height, t->pitch,
                         t->levels, pal, pal ? t->pal_len : 0, s_texels);
-        tex = tex_make(t->width, t->height, t->levels, s_texels);
+        tex = tex_make(t->width, t->height, t->levels, s_texels, 0);
         if (!tex)
             return nil;
     }
@@ -1393,11 +1419,14 @@ static id<MTLTexture> tex_bind(const Stage *t)
             victim = c;
     }
     if (e) {
-        if (e->gen != g->flips) {
+        /* A pack toggle (nv2a_tex_pack_gen) changes what the same texels
+         * upload as: re-upload as if the hash had moved. */
+        uint32_t pg = nv2a_tex_pack_gen();
+        if (e->gen != g->flips || e->pack_gen != pg) {
             uint64_t h = tex_hash_pal(mem, t, bytes);
             s_tex_rehash++;
             e->gen = g->flips;
-            if (h != e->hash) {
+            if (h != e->hash || e->pack_gen != pg) {
                 id<MTLTexture> nt = tex_upload(t, h);
                 s_tex_changed++;
                 /* The hash moves only with the texels: a failed upload keeps
@@ -1405,6 +1434,7 @@ static id<MTLTexture> tex_bind(const Stage *t)
                 if (!nt)
                     return s_black;
                 e->hash = h;
+                e->pack_gen = pg;
                 [e->tex release];
                 e->tex = nt;
             }
@@ -1428,6 +1458,7 @@ static id<MTLTexture> tex_bind(const Stage *t)
         e->levels = t->levels;
         e->gen = g->flips;
         e->hash = h;
+        e->pack_gen = nv2a_tex_pack_gen();
         e->tex = nt;
         e->live = 1;
     }
@@ -2699,9 +2730,12 @@ static void flip_log(uint32_t surface_offset, RenderTarget *rt)
     static uint64_t p_draws, p_prog, p_skip, p_cull, p_clears, p_tex, p_up,
                     p_chg, p_re, p_fl, p_occ, p_vis, p_late, p_super, p_sync, p_ovf;
     /* With a pack, its hit count every 600 flips, flip trace or not. */
-    if (nv2a_tex_pack_count() && s_presents % 600 == 0)
+    if (nv2a_tex_pack_count() && s_presents % 600 == 0) {
         fprintf(stderr, LOGP "textures.pack: %llu hits so far\n",
                 (unsigned long long)nv2a_tex_pack_hits());
+        if (recomp_env(RENV_TEX_PACK_TRACE))
+            nv2a_tex_pack_print_misses();
+    }
     if (on < 0)
         on = recomp_env(RENV_FLIP_LOG) != NULL;
     if (!on)
@@ -2772,7 +2806,7 @@ static void prof_flip_end(uint64_t t_flip0)
     }
 }
 
-static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
+static void metal_flip(uint32_t surface_offset, uint32_t pitch)
 {
     RenderTarget *rt = NULL;
     uint32_t addr = surface_offset ? nv2a_pb_dma_resolve(surface_offset) : 0;
@@ -2927,6 +2961,62 @@ static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
         guard_open();
     xbox_FramebufferWindowPresent(addr, pitch);
     prof_flip_end(t_flip0);
+}
+
+/* render.scale changed at this flip: every target, depth buffer and texture
+ * was made at the old factor. Targets go with the eviction's write-back, so
+ * the next one at that surface seeds from what was drawn at the new scale;
+ * textures because a render-to-texture input is sized by scale. After the
+ * present, so the frame being shown keeps the targets it was drawn in. */
+static void scale_drop(void)
+{
+    int i;
+    @autoreleasepool {
+        for (i = 0; i < RT_MAX; i++) {
+            RenderTarget *rt = &s_rt[i];
+            if (!rt->tex)
+                continue;
+            if (!rt_drop_if_stale(rt, "scale")) {
+                rt_sync(rt, rt->pitch);
+                rt_free(rt);
+            }
+        }
+        for (i = 0; i < DT_MAX; i++) {
+            DepthTarget *d = &s_dt[i];
+            if (!d->tex)
+                continue;
+            if (s_enc_dt == d)
+                end_encoder();
+            [d->tex release];
+            memset(d, 0, sizeof *d);
+        }
+        for (i = 0; i < TEX_CACHE; i++) {
+            [s_tc[i].tex release];
+            memset(&s_tc[i], 0, sizeof s_tc[i]);
+        }
+    }
+    /* Queries issued at the old scale are read at it: a count taken at 2x
+     * divided by 1 would report four times the samples. */
+    if (s_occ.ops) {
+        nv2a_occ_poll(&s_occ, 1);
+        nv2a_occ_set_scale(&s_occ, nv2a_host_render_scale());
+    }
+    fprintf(stderr, LOGP "render.scale=%u from this flip: targets and textures dropped\n",
+            nv2a_host_render_scale());
+}
+
+/* Live options (nv2a_host_opts_request) are applied after the present:
+ * the one point where no target is bound and no upload is in flight, and
+ * the frame shown was drawn at the old render.scale, which the present
+ * sizes its source by (applied first, a 2x frame lowered to 1x would show
+ * its top-left quarter for one flip). */
+static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
+{
+    unsigned changed;
+    metal_flip(surface_offset, pitch);
+    changed = nv2a_host_opts_apply();
+    if (changed & NV2A_OPT_SCALE)
+        scale_drop();
 }
 
 /* ---- registration ---------------------------------------------------------- */

@@ -8,7 +8,8 @@ cmake_minimum_required(VERSION 3.20)
 project(rt_alias_test C)
 set(CMAKE_C_STANDARD 11)
 add_executable(rt_alias_test test_main.c
-    ../../src/kernel/nv2a_backend_common.c)
+    ../../src/kernel/nv2a_backend_common.c
+    ../../src/kernel/nv2a_tex_pack.c)
 target_include_directories(rt_alias_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src/kernel
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d)

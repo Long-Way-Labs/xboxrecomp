@@ -140,7 +140,7 @@ int main(void)
 
     /* ---- the options round-trip; init picks the scale up ---- */
     {
-        struct nv2a_host_opts o = { 3, NV2A_PRESENT_INTEGER, 1 };
+        struct nv2a_host_opts o = { 3, NV2A_PRESENT_INTEGER, 1, 0 };
         nv2a_host_opts_set(&o);
         CHECK(nv2a_host_render_scale() == 3);
         CHECK(nv2a_host_opts()->present_filter == NV2A_PRESENT_INTEGER && nv2a_host_opts()->fullscreen == 1);

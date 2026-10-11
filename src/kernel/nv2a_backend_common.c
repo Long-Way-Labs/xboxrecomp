@@ -3,6 +3,7 @@
  * of nv2a_backend_common.h. No OS or graphics headers.
  */
 #include "nv2a_backend_common.h"
+#include "nv2a_tex_pack.h"
 
 #include <stdatomic.h>
 
@@ -582,9 +583,102 @@ void nv2a_occ_report(struct nv2a_occ *o, uint32_t va, int sync)
 
 static struct nv2a_host_opts s_host_opts;   /* zero: stock */
 
+/* The request queue: one pending struct and mask, guarded by a spinlock (this
+ * file has no OS headers, and the critical sections are a struct copy). The
+ * flag is what the flip reads, so the stock cost is one atomic load. */
+static struct nv2a_host_opts s_req_opts;
+static unsigned s_req_mask;
+static atomic_flag s_req_lock = ATOMIC_FLAG_INIT;
+static atomic_uint s_req_pending;
+static atomic_uint s_opts_gen;
+
+/* The pack's enable bits from pack_off. A change of what the pack matches
+ * bumps nv2a_tex_pack_gen() (in nv2a_tex_pack), which every backend's
+ * tex_bind compares: one place, so the backends cannot disagree. */
+static void pack_apply_off(unsigned off)
+{
+    nv2a_tex_pack_set_enabled(!(off & NV2A_PACK_OFF_ALL));
+    nv2a_tex_pack_set_kind_enabled(XRTP_KIND_ART, !(off & NV2A_PACK_OFF_ART));
+    nv2a_tex_pack_set_kind_enabled(XRTP_KIND_FONT, !(off & NV2A_PACK_OFF_FONT));
+    nv2a_tex_pack_set_kind_enabled(XRTP_KIND_TEXT, !(off & NV2A_PACK_OFF_TEXT));
+}
+
 void nv2a_host_opts_set(const struct nv2a_host_opts *o)
 {
     s_host_opts = *o;
+    pack_apply_off(o->pack_off);
+}
+
+static void req_lock(void)
+{
+    while (atomic_flag_test_and_set_explicit(&s_req_lock, memory_order_acquire))
+        ;
+}
+
+static void req_unlock(void)
+{
+    atomic_flag_clear_explicit(&s_req_lock, memory_order_release);
+}
+
+void nv2a_host_opts_request(const struct nv2a_host_opts *o, unsigned mask)
+{
+    if (!o || !mask)
+        return;
+    req_lock();
+    if (mask & NV2A_OPT_SCALE)
+        s_req_opts.render_scale = o->render_scale;
+    if (mask & NV2A_OPT_FILTER)
+        s_req_opts.present_filter = o->present_filter;
+    if (mask & NV2A_OPT_FULLSCREEN)
+        s_req_opts.fullscreen = o->fullscreen;
+    if (mask & NV2A_OPT_PACK)
+        s_req_opts.pack_off = o->pack_off;
+    s_req_mask |= mask;
+    req_unlock();
+    atomic_store_explicit(&s_req_pending, 1u, memory_order_release);
+}
+
+unsigned nv2a_host_opts_apply(void)
+{
+    struct nv2a_host_opts r;
+    unsigned mask, changed = 0;
+
+    if (!atomic_load_explicit(&s_req_pending, memory_order_acquire))
+        return 0;
+    req_lock();
+    atomic_store_explicit(&s_req_pending, 0u, memory_order_relaxed);
+    r = s_req_opts;
+    mask = s_req_mask;
+    s_req_mask = 0;
+    req_unlock();
+
+    /* Scale 0 and 1 both mean guest size: not a change. */
+    if ((mask & NV2A_OPT_SCALE)
+        && (r.render_scale > 1 ? r.render_scale : 1) != nv2a_host_render_scale()) {
+        s_host_opts.render_scale = r.render_scale;
+        changed |= NV2A_OPT_SCALE;
+    }
+    if ((mask & NV2A_OPT_FILTER) && r.present_filter != s_host_opts.present_filter) {
+        s_host_opts.present_filter = r.present_filter;
+        changed |= NV2A_OPT_FILTER;
+    }
+    if ((mask & NV2A_OPT_FULLSCREEN) && r.fullscreen != s_host_opts.fullscreen) {
+        s_host_opts.fullscreen = r.fullscreen;
+        changed |= NV2A_OPT_FULLSCREEN;
+    }
+    if ((mask & NV2A_OPT_PACK) && r.pack_off != s_host_opts.pack_off) {
+        s_host_opts.pack_off = r.pack_off;
+        pack_apply_off(r.pack_off);
+        changed |= NV2A_OPT_PACK;
+    }
+    if (changed)
+        atomic_fetch_add_explicit(&s_opts_gen, 1u, memory_order_relaxed);
+    return changed;
+}
+
+uint32_t nv2a_host_opts_gen(void)
+{
+    return atomic_load_explicit(&s_opts_gen, memory_order_relaxed);
 }
 
 const struct nv2a_host_opts *nv2a_host_opts(void)

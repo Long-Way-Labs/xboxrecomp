@@ -25,7 +25,7 @@ static int path_is_absolute(const char *p)
  * read from (the executable's directory), so a bundle names
  * enhance/hud.pack. A bad or missing pack is said and the run stays
  * stock; nothing in the backends runs until nv2a_tex_pack_count() > 0. */
-static void load_tex_pack(const char *root)
+static void load_tex_pack(const char *root, const struct nv2a_host_opts *o)
 {
     const char *pack = enhance_cfg_string("textures.pack", "");
     char path[1024], err[128];
@@ -44,13 +44,21 @@ static void load_tex_pack(const char *root)
     if (n < 0)
         fprintf(stderr, LOGP "textures.pack=%s: %s (%s); no pack\n", pack, err, path);
     else
-        fprintf(stderr, LOGP "textures.pack=%s (%d entries, scale %u)\n", pack, n,
-                nv2a_tex_pack_scale());
+        fprintf(stderr, LOGP "textures.pack=%s (%d entries: %u art, %u font, %u text;"
+                " scale %u, text %u; %u bc3) textures.font=%s textures.text=%s\n",
+                pack, n, nv2a_tex_pack_kind_count(XRTP_KIND_ART),
+                nv2a_tex_pack_kind_count(XRTP_KIND_FONT),
+                nv2a_tex_pack_kind_count(XRTP_KIND_TEXT), nv2a_tex_pack_scale(),
+                nv2a_tex_pack_text_scale(), nv2a_tex_pack_bc3_count(),
+                (o->pack_off & NV2A_PACK_OFF_FONT) ? "off" : "on",
+                (o->pack_off & NV2A_PACK_OFF_TEXT) ? "off" : "on");
 }
 
 static const char *const s_filters[] = { "nearest", "linear", "integer", NULL };
 /* Indexes match XBOX_PACING_SPIN / XBOX_PACING_SLEEP. */
 static const char *const s_pacing[] = { "spin", "sleep", NULL };
+/* textures.font / textures.text: words, as the menu shows them. */
+static const char *const s_onoff[] = { "off", "on", NULL };
 
 int xbox_enhance_init(const char *root, const char *title)
 {
@@ -87,11 +95,18 @@ int xbox_enhance_init(const char *root, const char *title)
         aspect = "4:3";
     }
 
+    /* The pack's kinds a player can turn off; read whether or not a pack
+     * is configured, so the keys are never reported unused. */
+    if (!enhance_cfg_choice("textures.font", s_onoff, 1))
+        o.pack_off |= NV2A_PACK_OFF_FONT;
+    if (!enhance_cfg_choice("textures.text", s_onoff, 1))
+        o.pack_off |= NV2A_PACK_OFF_TEXT;
+
     nv2a_host_opts_set(&o);
     fprintf(stderr, LOGP "render.scale=%u present.filter=%s present.fullscreen=%d"
             " present.pacing=%s (display.aspect=%s)\n", o.render_scale,
             s_filters[o.present_filter], o.fullscreen, s_pacing[pacing], aspect);
-    load_tex_pack(root);
+    load_tex_pack(root, &o);
     /* No enhance_cfg_report_unused() here: the title reads its own keys
      * (game.mode, say) after this, and calls it then. */
     return rc;

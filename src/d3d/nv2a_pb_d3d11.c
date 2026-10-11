@@ -1459,11 +1459,13 @@ static RenderTarget *s_stage_rt[4];
 typedef struct {
     uint32_t offset, color, width, height, pitch, palette, levels;
     uint32_t gen, used;
+    uint32_t pack_gen;      /* nv2a_tex_pack_gen() it was uploaded under */
     uint64_t hash;
     int      live;
     /* What tex holds: the guest size, or a pack entry's (textures.pack);
-     * a re-upload of another size makes a new texture. */
+     * a re-upload of another size or format makes a new texture. */
     uint32_t tex_w, tex_h, tex_levels;
+    int      tex_bc3;
     ID3D11Texture2D          *tex;
     ID3D11ShaderResourceView *srv;
 } TexEntry;
@@ -1583,20 +1585,23 @@ static int decode_texture(const Stage *t)
 }
 
 /* e's texture at this size: a new one is made before the old one is
- * released, so a refusal leaves e as it was. */
-static int tex_alloc(TexEntry *e, uint32_t width, uint32_t height, uint32_t levels)
+ * released, so a refusal leaves e as it was. `bc3`: BC3 blocks (a pack
+ * entry's payload, XRTP_FLAG_BC3) rather than A8R8G8B8 texels. */
+static int tex_alloc(TexEntry *e, uint32_t width, uint32_t height, uint32_t levels,
+                     int bc3)
 {
     D3D11_TEXTURE2D_DESC td;
     ID3D11Texture2D *tex = NULL;
     ID3D11ShaderResourceView *srv = NULL;
-    if (e->tex && e->tex_w == width && e->tex_h == height && e->tex_levels == levels)
+    if (e->tex && e->tex_w == width && e->tex_h == height && e->tex_levels == levels
+            && e->tex_bc3 == bc3)
         return 1;
     memset(&td, 0, sizeof td);
     td.Width = width;
     td.Height = height;
     td.MipLevels = levels;
     td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.Format = bc3 ? DXGI_FORMAT_BC3_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -1615,6 +1620,7 @@ static int tex_alloc(TexEntry *e, uint32_t width, uint32_t height, uint32_t leve
     e->tex_w = width;
     e->tex_h = height;
     e->tex_levels = levels;
+    e->tex_bc3 = bc3;
     return 1;
 }
 
@@ -1626,32 +1632,44 @@ static int tex_alloc(TexEntry *e, uint32_t width, uint32_t height, uint32_t leve
 static int tex_upload(TexEntry *e, const Stage *t, uint64_t hash)
 {
     const uint32_t *src = NULL;
+    const uint8_t *p;
     uint32_t width = t->width, height = t->height, levels = t->levels;
     uint32_t l;
+    int bc3 = 0;
     if (nv2a_tex_pack_count()) {
         struct nv2a_tex_pack_entry *pe = nv2a_tex_pack_find(hash, t->width, t->height);
         if (pe && (src = nv2a_tex_pack_texels(pe)) != NULL) {
             width = pe->width;
             height = pe->height;
             levels = pe->levels;
+            bc3 = pe->bc3;
+        } else {
+            nv2a_tex_pack_miss(hash, t->width, t->height, t->color, t->levels);
         }
     }
-    if (src && !tex_alloc(e, width, height, levels)) {
+    if (src && !tex_alloc(e, width, height, levels, bc3)) {
+        /* A refused entry is a miss too, tagged so in the trace. */
+        nv2a_tex_pack_miss(hash, t->width, t->height, t->color, t->levels);
         src = NULL;
         width = t->width;
         height = t->height;
         levels = t->levels;
+        bc3 = 0;
     }
     if (!src) {
-        if (!decode_texture(t) || !tex_alloc(e, width, height, levels))
+        if (!decode_texture(t) || !tex_alloc(e, width, height, levels, 0))
             return 0;
         src = s_texels;
     }
+    /* BC3 levels go up as they are, one row of 4x4 blocks per pitch. */
+    p = (const uint8_t *)src;
     for (l = 0; l < levels; l++) {
         uint32_t w = nv2a_tex_level_dim(width, l), h = nv2a_tex_level_dim(height, l);
+        uint32_t row = bc3 ? (w + 3u) / 4u * 16u : w * 4u;
+        uint32_t rows = bc3 ? (h + 3u) / 4u : h;
         ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)e->tex,
-                                              l, NULL, src, w * 4, 0);
-        src += (size_t)w * h;
+                                              l, NULL, p, row, 0);
+        p += (size_t)row * rows;
     }
     s_tex_uploads++;
     if (levels > 1)
@@ -1723,17 +1741,21 @@ static ID3D11ShaderResourceView *tex_bind(const Stage *t)
             victim = c;
     }
     if (e) {
-        if (e->gen != g->flips) {
+        /* A pack toggle (nv2a_tex_pack_gen) changes what the same texels
+         * upload as: re-upload as if the hash had moved. */
+        uint32_t pg = nv2a_tex_pack_gen();
+        if (e->gen != g->flips || e->pack_gen != pg) {
             uint64_t h = tex_hash_pal(mem, t, bytes);
             s_tex_rehash++;
             e->gen = g->flips;
-            if (h != e->hash) {
+            if (h != e->hash || e->pack_gen != pg) {
                 s_tex_changed++;
                 /* The hash moves only with the texels: a failed upload keeps
                  * the old texture and is tried again next flip. */
                 if (!tex_upload(e, t, h))
                     return s_black_srv;
                 e->hash = h;
+                e->pack_gen = pg;
             }
         }
     } else {
@@ -1748,6 +1770,7 @@ static ID3D11ShaderResourceView *tex_bind(const Stage *t)
         e->levels = t->levels;
         e->gen = g->flips;
         e->hash = tex_hash_pal(mem, t, bytes);
+        e->pack_gen = nv2a_tex_pack_gen();
         if (!tex_upload(e, t, e->hash)) {
             tex_free(e);
             return s_black_srv;
@@ -3244,9 +3267,12 @@ static void flip_log(uint32_t surface_offset)
                     p_re, p_vn, p_ve, p_skip, p_cull, p_self, p_mip,
                     p_occ, p_occ_vis, p_occ_us, p_occ_late, p_occ_super;
     /* With a pack, its hit count every 600 flips, flip trace or not. */
-    if (nv2a_tex_pack_count() && s_presents % 600 == 0)
+    if (nv2a_tex_pack_count() && s_presents % 600 == 0) {
         fprintf(stderr, LOGP "textures.pack: %llu hits so far\n",
                 (unsigned long long)nv2a_tex_pack_hits());
+        if (recomp_env(RENV_TEX_PACK_TRACE))
+            nv2a_tex_pack_print_misses();
+    }
     if (on < 0)
         on = recomp_env(RENV_FLIP_LOG) != NULL;
     if (!on)
@@ -3461,7 +3487,7 @@ static UINT s_shown_w, s_shown_h;   /* the last flip's present extent */
 static int s_probe_x = -1, s_probe_y;
 static uint32_t s_probe_px = 0xDEADBEEFu;
 
-static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
+static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
 {
     HRESULT hr;
 
@@ -3569,6 +3595,56 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
                 (unsigned long long)s_draws_bconst,
                 nv2a_pb_gpu_state()->blend_color_writes,
                 nv2a_pb_gpu_state()->blend_color);
+}
+
+/* render.scale changed at this flip: every target, depth buffer and texture
+ * was made at the old factor. Targets are released, their pixels lost as on
+ * any eviction here (the title redraws its post chain every frame);
+ * textures because a render-to-texture input is sized by scale. After the
+ * present, so the frame being shown keeps the targets it was drawn in. */
+static void scale_drop(void)
+{
+    int i;
+    for (i = 0; i < RT_MAX; i++)
+        if (s_rt[i].tex)
+            rt_release(&s_rt[i]);
+    for (i = 0; i < DT_MAX; i++) {
+        DepthTarget *d = &s_dt[i];
+        if (!d->tex)
+            continue;
+        ID3D11DepthStencilView_Release(d->dsv);
+        ID3D11Texture2D_Release(d->tex);
+        memset(d, 0, sizeof *d);
+    }
+    for (i = 0; i < TEX_CACHE; i++)
+        tex_free(&s_tc[i]);
+    memset(s_tc_hint, 0, sizeof s_tc_hint);
+    /* Both point into s_rt, now zeroed; the stage list is only rebuilt by
+     * the next textured batch, and the white-draw log reads it. */
+    s_cur = NULL;
+    memset(s_stage_rt, 0, sizeof s_stage_rt);
+    /* Queries issued at the old scale are read at it: a count taken at 2x
+     * divided by 1 would report four times the samples. */
+    if (s_occ.ops) {
+        nv2a_occ_poll(&s_occ, 1);
+        nv2a_occ_set_scale(&s_occ, nv2a_host_render_scale());
+    }
+    fprintf(stderr, LOGP "render.scale=%u from this flip: targets and textures dropped\n",
+            nv2a_host_render_scale());
+}
+
+/* Live options (nv2a_host_opts_request) are applied after the present:
+ * the one point where no target is bound and no upload is in flight, and
+ * the frame shown was drawn at the old render.scale, which the present
+ * sizes its source by (applied first, a 2x frame lowered to 1x would show
+ * its top-left quarter for one flip). */
+static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
+{
+    unsigned changed;
+    d3d11_flip(surface_offset, pitch);
+    changed = nv2a_host_opts_apply();
+    if ((changed & NV2A_OPT_SCALE) && s_dev)
+        scale_drop();
 }
 
 /* ---- registration ---------------------------------------------------------- */

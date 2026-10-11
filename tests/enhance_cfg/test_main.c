@@ -470,6 +470,8 @@ static void enhance_reset_env(void)
     recomp_env_set(RENV_PRESENT_FILTER, NULL);
     recomp_env_set(RENV_PRESENT_FULLSCREEN, NULL);
     recomp_env_set(RENV_PRESENT_PACING, NULL);
+    recomp_env_set(RENV_TEXTURES_FONT, NULL);
+    recomp_env_set(RENV_TEXTURES_TEXT, NULL);
 }
 
 static void test_enhance_init(void)
@@ -645,8 +647,26 @@ static void test_tex_pack_key(void)
     capture_begin();
     CHECK(xbox_enhance_init("ecfg_root", NULL) == 0);
     out = capture_end();
-    CHECK(strstr(out, "[ENHANCE] textures.pack=enhance/t.pack (1 entries, scale 2)\n") != NULL);
+    CHECK(strstr(out, "[ENHANCE] textures.pack=enhance/t.pack (1 entries: 1 art, 0 font, 0 text;"
+                      " scale 2, text 2; 0 bc3) textures.font=on textures.text=on\n") != NULL);
     CHECK(nv2a_tex_pack_count() == 1 && nv2a_tex_pack_scale() == 2);
+    CHECK(nv2a_host_opts()->pack_off == 0);
+
+    /* The kinds' keys: "off" reaches pack_off and the line; stock is on. */
+    recomp_env_set(RENV_TEXTURES_TEXT, "off");
+    recomp_env_set(RENV_TEXTURES_FONT, "off");
+    capture_begin();
+    CHECK(xbox_enhance_init("ecfg_root", NULL) == 0);
+    out = capture_end();
+    CHECK(strstr(out, "textures.font=off textures.text=off\n") != NULL);
+    CHECK(nv2a_host_opts()->pack_off == (NV2A_PACK_OFF_FONT | NV2A_PACK_OFF_TEXT));
+    recomp_env_set(RENV_TEXTURES_FONT, NULL);
+    capture_begin();
+    CHECK(xbox_enhance_init("ecfg_root", NULL) == 0);
+    out = capture_end();
+    CHECK(strstr(out, "textures.font=on textures.text=off\n") != NULL);
+    CHECK(nv2a_host_opts()->pack_off == NV2A_PACK_OFF_TEXT);
+    recomp_env_set(RENV_TEXTURES_TEXT, NULL);
 
     /* A later "none" drops it. */
     recomp_env_set(RENV_TEXTURES_PACK, "none");
@@ -662,7 +682,8 @@ static void test_tex_pack_key(void)
     capture_begin();
     CHECK(xbox_enhance_init("ecfg_no_such_root", NULL) == 0);
     out = capture_end();
-    snprintf(want, sizeof want, "[ENHANCE] textures.pack=%s (1 entries, scale 2)\n", abs);
+    snprintf(want, sizeof want, "[ENHANCE] textures.pack=%s (1 entries: 1 art, 0 font, 0 text;"
+             " scale 2, text 2; 0 bc3) textures.font=on textures.text=on\n", abs);
     CHECK(strstr(out, want) != NULL);
     CHECK(nv2a_tex_pack_count() == 1);
 

@@ -285,6 +285,41 @@ static inline int nv2a_clear_box(const struct nv2a_pb_gpu *g, uint32_t w, uint32
     return 1;
 }
 
+/* What a draw may write, in guest pixels, box as nv2a_clear_box's: the
+ * surface clip, clamped to a w x h target. The GPU scissors every draw to
+ * the clip, and the CPU rasteriser bounds its spans by it. A GPU target
+ * serves every clip of its surface (rt_grow), so a backend has to scissor
+ * too: Burnout 3 draws its 640x448 frame under a clip at y 16 of a 640x480
+ * buffer, and geometry running past the clip (its HUD panels, the menu
+ * frame) otherwise lands in the 16 rows above and below, which no clear
+ * covers, and stays there frame after frame. 0 when nothing is left. */
+static inline int nv2a_draw_box(const struct nv2a_pb_gpu *g, uint32_t w, uint32_t h,
+                                uint32_t box[4])
+{
+    uint32_t ax = g->clip_x, ay = g->clip_y;
+    uint32_t bx = g->clip_x + g->clip_w, by = g->clip_y + g->clip_h;
+    if (bx > w) bx = w;
+    if (by > h) by = h;
+    if (ax >= bx || ay >= by)
+        return 0;
+    box[0] = ax;
+    box[1] = ay;
+    box[2] = bx;
+    box[3] = by;
+    return 1;
+}
+
+/* A guest-pixel box on a w x h target made hw x hh host pixels
+ * (render.scale): the host box covering the same pixels, x1/y1 exclusive. */
+static inline void nv2a_host_box(const uint32_t box[4], uint32_t w, uint32_t h,
+                                 uint32_t hw, uint32_t hh, uint32_t out[4])
+{
+    out[0] = (uint32_t)((uint64_t)box[0] * hw / w);
+    out[1] = (uint32_t)((uint64_t)box[1] * hh / h);
+    out[2] = (uint32_t)((uint64_t)box[2] * hw / w);
+    out[3] = (uint32_t)((uint64_t)box[3] * hh / h);
+}
+
 static inline uint8_t nv2a_clamp255(int x)
 {
     return (uint8_t)(x < 0 ? 0 : x > 255 ? 255 : x);

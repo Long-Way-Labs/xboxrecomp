@@ -990,16 +990,9 @@ static void metal_on_clear(uint32_t param)
                 [s_enc setVisibilityResultMode:MTLVisibilityResultModeDisabled
                                         offset:(NSUInteger)s_occ_slot * 8u];
             [s_enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-            if (s_occ_slot >= 0) {
+            /* The scissor stays: each draw sets its own (metal_on_draw). */
+            if (s_occ_slot >= 0)
                 end_encoder();
-            } else {
-                /* Draws never set a scissor: the whole target again. */
-                sr.x = 0;
-                sr.y = 0;
-                sr.width = rt->hw;
-                sr.height = rt->hh;
-                [s_enc setScissorRect:sr];
-            }
         }
         s_partial_clears++;
     }
@@ -2039,7 +2032,20 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         }
         {
             MTLViewport vp = {0.0, 0.0, (double)rt->hw, (double)rt->hh, 0.0, 1.0};
+            MTLScissorRect sr;
+            uint32_t b[4], hb[4];
             [s_enc setViewport:vp];
+            /* The surface clip, as the hardware scissors (nv2a_draw_box). */
+            if (!nv2a_draw_box(g, rt->w, rt->h, b)) {
+                s_draws_skipped++;
+                return;
+            }
+            nv2a_host_box(b, rt->w, rt->h, rt->hw, rt->hh, hb);
+            sr.x = hb[0];
+            sr.y = hb[1];
+            sr.width = hb[2] - hb[0];
+            sr.height = hb[3] - hb[1];
+            [s_enc setScissorRect:sr];
         }
         [s_enc setFrontFacingWinding:v->front_face != 0x900
                                      ? MTLWindingCounterClockwise : MTLWindingClockwise];

@@ -130,6 +130,7 @@ static struct {
     ID3D11Buffer             *vs_cb[3], *ps_cb;
     ID3D11SamplerState       *smp[4];
     D3D11_VIEWPORT            vp;
+    D3D11_RECT                sr;
 } s_sc;
 static int s_sc_init;
 
@@ -148,8 +149,10 @@ static ID3D11Buffer           *s_vb;            /* ring of float4 streams */
 static UINT                    s_vb_size, s_vb_pos;
 static ID3D11Buffer           *s_ib;
 static UINT                    s_ib_size, s_ib_pos;
-/* Rasteriser states: [cull][front CCW], cull 0 none, 1 back, 2 front. */
-static ID3D11RasterizerState  *s_rs[3][2];
+/* Rasteriser states: [cull][front CCW], cull 0 none, 1 back, 2 front.
+ * s_rs_sc are the same with the scissor on: every draw's, whose scissor is
+ * the surface clip (nv2a_draw_box). */
+static ID3D11RasterizerState  *s_rs[3][2], *s_rs_sc[3][2];
 static ID3D11DepthStencilState *s_ds_off;
 static ID3D11PixelShader      *s_ps;
 
@@ -541,7 +544,10 @@ static int init(void)
                 rd.CullMode = c == 0 ? D3D11_CULL_NONE
                             : c == 1 ? D3D11_CULL_BACK : D3D11_CULL_FRONT;
                 rd.FrontCounterClockwise = f;
+                rd.ScissorEnable = FALSE;
                 ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_rs[c][f]);
+                rd.ScissorEnable = TRUE;
+                ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_rs_sc[c][f]);
             }
     }
     {
@@ -1309,7 +1315,7 @@ static ID3D11RasterizerState *rasterizer_state(int *all)
         else if (v->cull_face == 0x404) c = 2;
         else if (v->cull_face == 0x408) *all = 1;
     }
-    return s_rs[c][f];
+    return s_rs_sc[c][f];
 }
 
 /* ---- blending -------------------------------------------------------------- */
@@ -3035,13 +3041,25 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
 
     {
         D3D11_VIEWPORT vp;
+        D3D11_RECT sr;
         ID3D11Buffer *cbs[3];
+        uint32_t cb[4], hb[4];
         vp.TopLeftX = 0;
         vp.TopLeftY = 0;
         vp.Width = (float)rt->hw;
         vp.Height = (float)rt->hh;
         vp.MinDepth = 0;
         vp.MaxDepth = 1;
+        /* The surface clip, as the hardware scissors (nv2a_draw_box). */
+        if (!nv2a_draw_box(g, rt->w, rt->h, cb)) {
+            s_draws_skipped++;
+            return;
+        }
+        nv2a_host_box(cb, rt->w, rt->h, rt->hw, rt->hh, hb);
+        sr.left = (LONG)hb[0];
+        sr.top = (LONG)hb[1];
+        sr.right = (LONG)hb[2];
+        sr.bottom = (LONG)hb[3];
         cbs[0] = NULL;
         cbs[1] = s_cb_consts;
         cbs[2] = s_cb_vp;
@@ -3074,6 +3092,10 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
             if (!sc || memcmp(&s_sc.vp, &vp, sizeof vp)) {
                 ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
                 s_sc.vp = vp;
+            }
+            if (!sc || memcmp(&s_sc.sr, &sr, sizeof sr)) {
+                ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &sr);
+                s_sc.sr = sr;
             }
             if (!sc || s_sc.rs != rs) {
                 ID3D11DeviceContext_RSSetState(s_ctx, rs);

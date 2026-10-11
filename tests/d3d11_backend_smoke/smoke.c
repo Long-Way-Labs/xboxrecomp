@@ -422,7 +422,8 @@ static int crop_flips(uint32_t buf)
 
 /* One back buffer drawn under two clip extents in a frame (Burnout 3's
  * 640x480 buffer with 159x344 and smaller clips): one target, grown to the
- * largest; a clear bounded by its clip and clear rect leaves the rest; and a
+ * largest; a clear bounded by its clip and clear rect leaves the rest, and a
+ * draw by its clip; and a
  * flip whose frame is smaller than the target shows only the frame. Returns
  * the failures. */
 static int clip_cases(const uint32_t *buf)
@@ -459,6 +460,40 @@ static int clip_cases(const uint32_t *buf)
             fprintf(stderr, "[backend-smoke] clip clear %d: 0x%08X (want 0x%08X) %s\n", k,
                     c[k], want[k], c[k] == want[k] ? "PASS" : "FAIL");
             f += c[k] != want[k];
+        }
+    }
+    /* Red again, then under the 160x120 clip a blue quad past it on every
+     * side: the clip scissors the draw, as on the hardware and the CPU path
+     * (Burnout 3's HUD past its 640x448 clip at y 16). (100,100) and
+     * (259,219) are inside, one pixel past each edge is not. */
+    {
+        static const struct { int x, y; uint32_t argb; } want[6] = {
+            {100, 100, 0xFF0000FFu}, {259, 219, 0xFF0000FFu}, {99, 150, 0xFFFF0000u},
+            {150, 99, 0xFFFF0000u},  {260, 150, 0xFFFF0000u}, {150, 220, 0xFFFF0000u},
+        };
+        int a;
+        surf_clear(buf[0], 640, 480, 0xFFFF0000u);
+        M(0x0200, (160u << 16) | 100u);
+        M(0x0204, (120u << 16) | 100u);
+        M(0x0304, 0);                          /* no blend, depth or stencil */
+        M(0x030C, 0);
+        M(0x035C, 0);
+        M(0x032C, 0);
+        for (a = 0; a < 16; a++)
+            M(0x1760 + 4 * a, a == 0 ? 0x42u : a == 3 ? 0x40u : 0x02u);
+        M(0x17FC, 8);
+        vertex(40.0f, 40.0f, 0xFF0000FFu);
+        vertex(320.0f, 40.0f, 0xFF0000FFu);
+        vertex(320.0f, 300.0f, 0xFF0000FFu);
+        vertex(40.0f, 300.0f, 0xFF0000FFu);
+        M(0x17FC, 0);
+        M(0x0200, 640u << 16);
+        M(0x0204, 480u << 16);
+        for (k = 0; k < 6; k++) {
+            uint32_t got = nv2a_pb_d3d11_pixel(buf[0], want[k].x, want[k].y);
+            fprintf(stderr, "[backend-smoke] draw clip %d: 0x%08X (want 0x%08X) %s\n", k,
+                    got, want[k].argb, got == want[k].argb ? "PASS" : "FAIL");
+            f += got != want[k].argb;
         }
     }
     /* The frame is 320x240 of that grown target: the flip shows 320x240.

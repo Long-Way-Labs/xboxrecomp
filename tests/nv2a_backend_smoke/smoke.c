@@ -23,10 +23,11 @@
  * the CPU path and on Metal, the whole frame compared: a clear bounded by its
  * clip, one bounded by SET_CLEAR_RECT, a target grown from 320x240 to
  * 640x480 (contents kept, margin seeded from the guest bytes, at scale 1 and
- * 2), and a flip of a grown target showing only the 320x240 frame. The CPU
- * halves of the first two also run before the backend check, for a Mac run
- * without the Metal backend; Proton's check is d3d11_backend_smoke's
- * cpu_clip_cases (this test builds on macOS only).
+ * 2), a draw scissored by its clip (at scale 1 and 3), and a flip of a
+ * grown target showing only the 320x240 frame. The CPU halves of the clip
+ * clear, the clear rect and the draw clip also run before the backend check,
+ * for a Mac run without the Metal backend; Proton's check is
+ * d3d11_backend_smoke's cpu_clip_cases (this test builds on macOS only).
  *
  * Then render-target ownership (rt-stale-alias, Metal): a target the title
  * rewrote from the CPU samples the new texels and is not written back; one
@@ -103,6 +104,7 @@ recomp_func_t recomp_lookup_manual(unsigned int va) { (void)va; return 0; }
 #define BUF2      0x01258000u   /* the render.scale 2 case: a new target */
 #define BUF3      0x01600000u   /* clip_cases' grow: clear of every other buffer */
 #define BUF4      0x01740000u   /* and its render.scale 2 twin */
+#define BUF5      0x01880000u   /* the draw clip at render.scale 3 */
 #define REPORT    0x00F00000u   /* occ_case's report: GET_REPORT takes 24 bits */
 #define TEX_GUEST 0x02800000u   /* 64x64 swizzled A8R8G8B8, then YUY2 64x32 */
 #define RTT0      0x01400000u   /* 64x64 render-to-texture targets, pitch 256 */
@@ -652,7 +654,7 @@ static void clear_rect(uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
     M(0x1D9C, (y1 << 16) | y0);
 }
 
-enum { CC_CLIP, CC_RECT, CC_GROW, CC_GROW2 };
+enum { CC_CLIP, CC_RECT, CC_GROW, CC_GROW2, CC_DRAW, CC_DRAW3 };
 
 static void clip_stream(int cc)
 {
@@ -670,6 +672,20 @@ static void clip_stream(int cc)
         clear_to(0xFF00FF00u);
         clear_rect(0, 0, W - 1, H - 1);
         break;
+    case CC_DRAW:   /* red, then a 160x120 clip at (100,100) and a blue quad */
+    case CC_DRAW3: {/* past it on every side: the clip scissors the quad */
+        static const uint32_t blue[4] = {0xFF0000FFu, 0xFF0000FFu, 0xFF0000FFu, 0xFF0000FFu};
+        uint32_t buf = cc == CC_DRAW3 ? BUF5 : BUF0;
+        int a;
+        surf_clip(buf, 0, 0, W, H);
+        clear_to(0xFFFF0000u);
+        surf_clip(buf, 100, 100, 160, 120);
+        for (a = 0; a < 16; a++)
+            M(0x1760 + 4 * a, a == 0 ? 0x42u : a == 3 ? 0x40u : 0x02u);
+        quad_uv(40.0f, 40.0f, 320.0f, 300.0f, blue, NULL);
+        surf_clip(buf, 0, 0, W, H);
+        break;
+    }
     default: {      /* 320x240 red, then 640x480 with its lower right green */
         uint32_t buf = cc == CC_GROW ? BUF3 : BUF4;
         surf_clip(buf, 0, 0, 320, 240);
@@ -692,14 +708,20 @@ static void fill(uint32_t buf, uint32_t argb)
 
 /* The pixels each clip case must show, on both paths. */
 /* The clear rect's (339,339) and (340,339) pin its inclusive max edge. */
-static const struct probe s_clip_probe[4][6] = {
+static const struct probe s_clip_probe[6][6] = {
     {{50, 50, 0xFFFF0000u}, {150, 150, 0xFF0000FFu}, {300, 300, 0xFFFF0000u}, {0}},
     {{320, 320, 0xFF00FF00u}, {350, 350, 0xFFFF0000u}, {299, 320, 0xFFFF0000u},
      {339, 339, 0xFF00FF00u}, {340, 339, 0xFFFF0000u}, {0}},
     {{100, 100, 0xFFFF0000u}, {400, 300, 0xFF00FF00u}, {400, 100, PATTERN}, {100, 300, PATTERN}},
     {{100, 100, 0xFFFF0000u}, {400, 300, 0xFF00FF00u}, {400, 100, PATTERN}, {100, 300, PATTERN}},
+    /* The clip's edges: (100,100) and (259,219) in, one pixel past out. */
+    {{100, 100, 0xFF0000FFu}, {259, 219, 0xFF0000FFu}, {99, 150, 0xFFFF0000u},
+     {150, 99, 0xFFFF0000u}, {260, 150, 0xFFFF0000u}, {150, 220, 0xFFFF0000u}},
+    {{100, 100, 0xFF0000FFu}, {259, 219, 0xFF0000FFu}, {99, 150, 0xFFFF0000u},
+     {150, 99, 0xFFFF0000u}, {260, 150, 0xFFFF0000u}, {150, 220, 0xFFFF0000u}},
 };
-static const char *const s_clip_name[4] = {"clip clear", "clear rect", "grow", "grow x2"};
+static const char *const s_clip_name[6] = {"clip clear", "clear rect", "grow", "grow x2",
+                                           "draw clip", "draw clip x3"};
 
 static int clip_probes(int cc, const char *path, const uint32_t *px)
 {
@@ -715,7 +737,7 @@ static int clip_probes(int cc, const char *path, const uint32_t *px)
     return ok;
 }
 
-/* The CPU halves of the clip clear and clear rect cases, before the backend
+/* The CPU halves of the clip clear, clear rect and draw clip cases, before the backend
  * check: the CPU path's clear box (nv2a_clear_box) needs no GPU, so a Mac run
  * without the Metal backend still checks it. On a Metal run clip_cases
  * repeats them. Proton never builds this test; its check is
@@ -726,7 +748,9 @@ static int clip_cpu_cases(void)
     int cc, f = 0;
 
     nv2a_pb_set_backend(nv2a_pb_cpu_backend());
-    for (cc = CC_CLIP; cc <= CC_RECT; cc++) {
+    for (cc = CC_CLIP; cc <= CC_DRAW; cc++) {
+        if (cc == CC_GROW || cc == CC_GROW2)
+            continue;   /* Metal's seeds; nothing the CPU path alone shows */
         fill(BUF0, PATTERN);
         clip_stream(cc);
         memcpy(px, guest(BUF0), W * H * 4);
@@ -748,11 +772,12 @@ static int clip_cases(const struct nv2a_pb_backend *b, uint32_t *cpu, uint32_t *
     uint32_t tw = 0, th = 0, sw = 0, sh = 0;
     int cc, f = 0, k;
 
-    for (cc = CC_CLIP; cc <= CC_GROW2; cc++) {
-        uint32_t buf = cc == CC_GROW ? BUF3 : cc == CC_GROW2 ? BUF4 : BUF0;
+    for (cc = CC_CLIP; cc <= CC_DRAW3; cc++) {
+        uint32_t buf = cc == CC_GROW ? BUF3 : cc == CC_GROW2 ? BUF4 : cc == CC_DRAW3 ? BUF5 : BUF0;
         const uint8_t *hp;
         uint32_t hw = 0, hh = 0;
-        unsigned n = cc == CC_GROW2 ? 2u : 1u;
+        /* render.scale 3 puts the draw clip's scissor on host pixels 300..780 */
+        unsigned n = cc == CC_GROW2 ? 2u : cc == CC_DRAW3 ? 3u : 1u;
         int ok;
 
         fill(buf, PATTERN);

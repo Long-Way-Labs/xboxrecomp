@@ -113,6 +113,7 @@ the stock settings.
 | `present.filter` | string | `"nearest"`, `"linear"`, `"integer"` | `"nearest"` | `RECOMP_PRESENT_FILTER` |
 | `present.fullscreen` | bool | borderless fullscreen at start | `false` | `RECOMP_PRESENT_FULLSCREEN` |
 | `present.pacing` | string | `"spin"` (stock), `"sleep"`: how a lowered guest busy-wait waits | `"spin"` | `RECOMP_PRESENT_PACING` |
+| `textures.pack` | string | a texture pack file ([texture-pack.md](../formats/texture-pack.md)); relative to the executable's directory | none | `RECOMP_TEXTURES_PACK` |
 | `aspect.program.<hash>` | string | `"hud"`, `"stretch"`, `"3d"`: a per-shader override of the aspect classifier | none | none |
 
 A title adds its own tables (`[fps]`, `[fx]`, ...) in the same file. The
@@ -186,6 +187,35 @@ is stock. One line shows the values in force:
   5% of exits) has a writer the kernel never signals; timeouts in the
   middle of a loop are normal.
 
+### Texture packs
+
+- **`textures.pack = "<file>"`.** A pack of host-side texture replacements
+  ([texture-pack.md](../formats/texture-pack.md)), keyed by the hash the
+  Metal and D3D11 backends already compute for every upload. A relative
+  path is resolved against the executable's directory, the root the file
+  itself is read from, so a bundle names `enhance/hud.pack`. The layer
+  loads the pack's index at startup and logs one line after the settings
+  line: `[ENHANCE] textures.pack=none` when unset, or
+  `[ENHANCE] textures.pack=enhance/hud.pack (41 entries, scale 4)`. A
+  file that is missing, has another magic or version, non-zero reserved
+  or flags fields, an entry outside the file, an entry with more levels
+  than its size allows (`1 + floor(log2(max(w, h)))`) or an unsorted index
+  is refused whole
+  (`[ENHANCE] textures.pack=<path>: <reason> (<resolved>); no pack`) and
+  the run stays stock. On an upload (a cache miss or a texture whose
+  bytes changed since the last flip) a backend looks the texel hash up
+  and, on a hit whose entry has the guest texture's aspect ratio, creates
+  the host texture at the pack entry's size and level count from the
+  pack's texels (if the device refuses that texture, the guest texels go
+  up instead); everything else (cache key,
+  eviction, the per-flip rehash, samplers, UVs) is as it was, so a texture
+  the game rewrites stops matching and returns to its guest bytes. Without
+  a pack the only added work per upload is the entry-count test. The CPU
+  rasteriser samples guest memory and ignores the key with one line
+  (`[ENHANCE] textures.pack ignored: ...`). Every 600 flips a backend
+  with a pack logs its hit count. A golden run must show
+  `textures.pack=none`: the golden check fails any other value.
+
 ### Naming rule
 
 - Tables group keys by feature: `[render]`, `[present]`, `[display]`, `[aspect]`, and a title's own.
@@ -208,6 +238,7 @@ exist only when the layer is built (`RECOMP_ENV_HAVE_ENHANCE_KEYS`):
 | `RECOMP_PRESENT_FILTER` | overrides `present.filter` |
 | `RECOMP_PRESENT_FULLSCREEN` | overrides `present.fullscreen` |
 | `RECOMP_PRESENT_PACING` | overrides `present.pacing` |
+| `RECOMP_TEXTURES_PACK` | overrides `textures.pack` |
 
 The layer converts an environment value to the type of the key:
 

@@ -46,6 +46,7 @@
 #include "d3d8_swizzle.h"
 #include "nv2a_pb_state.h"
 #include "nv2a_backend_common.h"
+#include "nv2a_tex_pack.h"
 #include "nv2a_vsh_cpu.h"      /* the batch trace runs the CPU interpreter */
 #include "xbox_memory_layout.h"   /* xbox_GetMemoryOffset */
 #include "video/video_player.h"   /* xbox_FramebufferWindowTitleText */
@@ -1460,6 +1461,9 @@ typedef struct {
     uint32_t gen, used;
     uint64_t hash;
     int      live;
+    /* What tex holds: the guest size, or a pack entry's (textures.pack);
+     * a re-upload of another size makes a new texture. */
+    uint32_t tex_w, tex_h, tex_levels;
     ID3D11Texture2D          *tex;
     ID3D11ShaderResourceView *srv;
 } TexEntry;
@@ -1578,40 +1582,79 @@ static int decode_texture(const Stage *t)
     return 1;
 }
 
-static int tex_upload(TexEntry *e, const Stage *t)
+/* e's texture at this size: a new one is made before the old one is
+ * released, so a refusal leaves e as it was. */
+static int tex_alloc(TexEntry *e, uint32_t width, uint32_t height, uint32_t levels)
 {
-    const uint32_t *src;
-    uint32_t l;
-    if (!decode_texture(t))
+    D3D11_TEXTURE2D_DESC td;
+    ID3D11Texture2D *tex = NULL;
+    ID3D11ShaderResourceView *srv = NULL;
+    if (e->tex && e->tex_w == width && e->tex_h == height && e->tex_levels == levels)
+        return 1;
+    memset(&td, 0, sizeof td);
+    td.Width = width;
+    td.Height = height;
+    td.MipLevels = levels;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &tex)))
         return 0;
-    if (!e->tex) {
-        D3D11_TEXTURE2D_DESC td;
-        memset(&td, 0, sizeof td);
-        td.Width = t->width;
-        td.Height = t->height;
-        td.MipLevels = t->levels;
-        td.ArraySize = 1;
-        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        td.SampleDesc.Count = 1;
-        td.Usage = D3D11_USAGE_DEFAULT;
-        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &e->tex)))
-            return 0;
-        if (FAILED(ID3D11Device_CreateShaderResourceView(
-                    s_dev, (ID3D11Resource *)e->tex, NULL, &e->srv))) {
-            ID3D11Texture2D_Release(e->tex);
-            e->tex = NULL;
-            return 0;
+    if (FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)tex, NULL, &srv))) {
+        ID3D11Texture2D_Release(tex);
+        return 0;
+    }
+    if (e->srv)
+        ID3D11ShaderResourceView_Release(e->srv);
+    if (e->tex)
+        ID3D11Texture2D_Release(e->tex);
+    e->tex = tex;
+    e->srv = srv;
+    e->tex_w = width;
+    e->tex_h = height;
+    e->tex_levels = levels;
+    return 1;
+}
+
+/* `hash` is the entry's texel hash: with a texture pack loaded
+ * (enhancements, textures.pack) an entry it holds is uploaded from the
+ * pack's texels at the pack's size instead of the guest's. If the device
+ * refuses a texture of the entry's size, the guest texels go up instead:
+ * the pack only ever adds detail, never a black texture. */
+static int tex_upload(TexEntry *e, const Stage *t, uint64_t hash)
+{
+    const uint32_t *src = NULL;
+    uint32_t width = t->width, height = t->height, levels = t->levels;
+    uint32_t l;
+    if (nv2a_tex_pack_count()) {
+        struct nv2a_tex_pack_entry *pe = nv2a_tex_pack_find(hash, t->width, t->height);
+        if (pe && (src = nv2a_tex_pack_texels(pe)) != NULL) {
+            width = pe->width;
+            height = pe->height;
+            levels = pe->levels;
         }
     }
-    for (l = 0, src = s_texels; l < t->levels; l++) {
-        uint32_t w = nv2a_tex_level_dim(t->width, l), h = nv2a_tex_level_dim(t->height, l);
+    if (src && !tex_alloc(e, width, height, levels)) {
+        src = NULL;
+        width = t->width;
+        height = t->height;
+        levels = t->levels;
+    }
+    if (!src) {
+        if (!decode_texture(t) || !tex_alloc(e, width, height, levels))
+            return 0;
+        src = s_texels;
+    }
+    for (l = 0; l < levels; l++) {
+        uint32_t w = nv2a_tex_level_dim(width, l), h = nv2a_tex_level_dim(height, l);
         ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)e->tex,
                                               l, NULL, src, w * 4, 0);
         src += (size_t)w * h;
     }
     s_tex_uploads++;
-    if (t->levels > 1)
+    if (levels > 1)
         s_tex_mip_uploads++;
     return 1;
 }
@@ -1685,10 +1728,12 @@ static ID3D11ShaderResourceView *tex_bind(const Stage *t)
             s_tex_rehash++;
             e->gen = g->flips;
             if (h != e->hash) {
-                e->hash = h;
                 s_tex_changed++;
-                if (!tex_upload(e, t))
+                /* The hash moves only with the texels: a failed upload keeps
+                 * the old texture and is tried again next flip. */
+                if (!tex_upload(e, t, h))
                     return s_black_srv;
+                e->hash = h;
             }
         }
     } else {
@@ -1703,7 +1748,7 @@ static ID3D11ShaderResourceView *tex_bind(const Stage *t)
         e->levels = t->levels;
         e->gen = g->flips;
         e->hash = tex_hash_pal(mem, t, bytes);
-        if (!tex_upload(e, t)) {
+        if (!tex_upload(e, t, e->hash)) {
             tex_free(e);
             return s_black_srv;
         }
@@ -3198,6 +3243,10 @@ static void flip_log(uint32_t surface_offset)
     static uint64_t p_draws, p_prog, p_tex, p_rtt, p_clears, p_up, p_chg,
                     p_re, p_vn, p_ve, p_skip, p_cull, p_self, p_mip,
                     p_occ, p_occ_vis, p_occ_us, p_occ_late, p_occ_super;
+    /* With a pack, its hit count every 600 flips, flip trace or not. */
+    if (nv2a_tex_pack_count() && s_presents % 600 == 0)
+        fprintf(stderr, LOGP "textures.pack: %llu hits so far\n",
+                (unsigned long long)nv2a_tex_pack_hits());
     if (on < 0)
         on = recomp_env(RENV_FLIP_LOG) != NULL;
     if (!on)

@@ -10,9 +10,43 @@
 #include "enhance_cfg.h"
 #include "kernel_pacing.h"
 #include "nv2a_backend_common.h"
+#include "nv2a_tex_pack.h"
 
 #define LOGP "[ENHANCE] "
 #define SCALE_MAX 4
+
+static int path_is_absolute(const char *p)
+{
+    return p[0] == '/' || p[0] == '\\'
+        || (((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':');
+}
+
+/* textures.pack: a pack file, relative to the root the file itself is
+ * read from (the executable's directory), so a bundle names
+ * enhance/hud.pack. A bad or missing pack is said and the run stays
+ * stock; nothing in the backends runs until nv2a_tex_pack_count() > 0. */
+static void load_tex_pack(const char *root)
+{
+    const char *pack = enhance_cfg_string("textures.pack", "");
+    char path[1024], err[128];
+    int n;
+
+    if (!pack || !*pack || !strcmp(pack, "none")) {
+        nv2a_tex_pack_unload();     /* a re-init's "none" is true too */
+        fprintf(stderr, LOGP "textures.pack=none\n");
+        return;
+    }
+    if (root && *root && !path_is_absolute(pack))
+        snprintf(path, sizeof path, "%s/%s", root, pack);
+    else
+        snprintf(path, sizeof path, "%s", pack);
+    n = nv2a_tex_pack_load(path, err, sizeof err);
+    if (n < 0)
+        fprintf(stderr, LOGP "textures.pack=%s: %s (%s); no pack\n", pack, err, path);
+    else
+        fprintf(stderr, LOGP "textures.pack=%s (%d entries, scale %u)\n", pack, n,
+                nv2a_tex_pack_scale());
+}
 
 static const char *const s_filters[] = { "nearest", "linear", "integer", NULL };
 /* Indexes match XBOX_PACING_SPIN / XBOX_PACING_SLEEP. */
@@ -57,6 +91,7 @@ int xbox_enhance_init(const char *root, const char *title)
     fprintf(stderr, LOGP "render.scale=%u present.filter=%s present.fullscreen=%d"
             " present.pacing=%s (display.aspect=%s)\n", o.render_scale,
             s_filters[o.present_filter], o.fullscreen, s_pacing[pacing], aspect);
+    load_tex_pack(root);
     /* No enhance_cfg_report_unused() here: the title reads its own keys
      * (game.mode, say) after this, and calls it then. */
     return rc;

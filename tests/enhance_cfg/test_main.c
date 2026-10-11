@@ -2,11 +2,13 @@
  * enhance_cfg test: the TOML subset (recomp_cfg.c), its errors with line
  * numbers, and the env > title file > root file > default layering
  * (enhance_cfg.c), xbox_enhance_init (enhance.c) and recomp_exe_dir. Runs in its working directory, where it writes small
- * files under ecfg_root/.
+ * files under ecfg_root/. The textures.pack cases pin the [ENHANCE] lines
+ * the golden check reads (xboxrecomp-cli golden.py, ENHANCE_PACK_RE).
  */
 #include "enhance.h"
 #include "enhance_cfg.h"
 #include "nv2a_backend_common.h"
+#include "nv2a_tex_pack.h"
 #include "recomp_cfg.h"
 #include "recomp_env.h"
 #include "recomp_exe_dir.h"
@@ -17,12 +19,25 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #ifdef _WIN32
 #include <direct.h>
+#include <io.h>
 #define MKDIR(p) _mkdir(p)
+#define GETCWD(b, n) _getcwd(b, (int)(n))
+#define DUP _dup
+#define DUP2 _dup2
+#define CLOSE _close
+#define OPEN_TRUNC(p) _open(p, _O_WRONLY | _O_CREAT | _O_TRUNC, 0644)
 #else
 #include <sys/stat.h>
+#include <unistd.h>
 #define MKDIR(p) mkdir(p, 0755)
+#define GETCWD(b, n) getcwd(b, n)
+#define DUP dup
+#define DUP2 dup2
+#define CLOSE close
+#define OPEN_TRUNC(p) open(p, O_WRONLY | O_CREAT | O_TRUNC, 0644)
 #endif
 
 static int s_fail, s_checks;
@@ -538,6 +553,136 @@ static void test_enhance_init(void)
     enhance_cfg_shutdown();
 }
 
+/* ── textures.pack: path resolution and the lines golden reads ────── */
+
+/* stderr to a file while a call runs, then its text. */
+static int s_saved_fd = -1;
+static char s_cap[4096];
+
+static void capture_begin(void)
+{
+    int fd;
+    fflush(stderr);
+    s_saved_fd = DUP(2);
+    fd = OPEN_TRUNC("ecfg_stderr.txt");
+    if (s_saved_fd < 0 || fd < 0) { fprintf(stderr, "cannot capture stderr\n"); exit(2); }
+    DUP2(fd, 2);
+    CLOSE(fd);
+}
+
+static const char *capture_end(void)
+{
+    FILE *f;
+    size_t n = 0;
+    fflush(stderr);
+    DUP2(s_saved_fd, 2);
+    CLOSE(s_saved_fd);
+    s_cap[0] = 0;
+    f = fopen("ecfg_stderr.txt", "rb");
+    if (f) {
+        n = fread(s_cap, 1, sizeof s_cap - 1, f);
+        fclose(f);
+    }
+    s_cap[n] = 0;
+    {
+        /* Windows' text-mode stderr writes "\r\n"; the lines compare as "\n". */
+        char *r = s_cap, *w = s_cap;
+        for (; *r; r++)
+            if (*r != '\r')
+                *w++ = *r;
+        *w = 0;
+    }
+    return s_cap;
+}
+
+/* A one-entry pack: a 1x1 texel at scale 2. */
+static void write_pack(const char *path)
+{
+    unsigned char b[68];
+    FILE *f;
+    memset(b, 0, sizeof b);
+    memcpy(b, NV2A_TEX_PACK_MAGIC, 4);
+    b[4] = 1;                           /* version */
+    b[8] = 1;                           /* count */
+    b[12] = 2;                          /* scale */
+    b[16] = 32;                         /* index offset */
+    b[32] = 0x5A;                       /* hash */
+    b[40] = 1; b[44] = 1; b[48] = 1;    /* 1x1, one level */
+    b[56] = 64;                         /* texel offset */
+    b[64] = 0xFF; b[67] = 0xFF;
+    f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "cannot write %s\n", path); exit(2); }
+    fwrite(b, 1, sizeof b, f);
+    fclose(f);
+}
+
+static void test_tex_pack_key(void)
+{
+    char abs[1200], cwd[1024], want[1400];
+    const char *out;
+
+    enhance_reset_env();
+    MKDIR("ecfg_root");
+    MKDIR("ecfg_root/enhance");
+    write_pack("ecfg_root/enhance/t.pack");
+
+    /* Unset and "none": the none line, no pack. */
+    recomp_env_set(RENV_TEXTURES_PACK, NULL);
+    capture_begin();
+    CHECK(xbox_enhance_init("ecfg_root", NULL) == 0);
+    out = capture_end();
+    CHECK(strstr(out, "[ENHANCE] textures.pack=none\n") != NULL);
+    CHECK(nv2a_tex_pack_count() == 0);
+    recomp_env_set(RENV_TEXTURES_PACK, "none");
+    capture_begin();
+    CHECK(xbox_enhance_init("ecfg_root", NULL) == 0);
+    out = capture_end();
+    CHECK(strstr(out, "[ENHANCE] textures.pack=none\n") != NULL);
+    CHECK(nv2a_tex_pack_count() == 0);
+
+    /* Relative: against the root. The line names the key's value. */
+    recomp_env_set(RENV_TEXTURES_PACK, "enhance/t.pack");
+    capture_begin();
+    CHECK(xbox_enhance_init("ecfg_root", NULL) == 0);
+    out = capture_end();
+    CHECK(strstr(out, "[ENHANCE] textures.pack=enhance/t.pack (1 entries, scale 2)\n") != NULL);
+    CHECK(nv2a_tex_pack_count() == 1 && nv2a_tex_pack_scale() == 2);
+
+    /* A later "none" drops it. */
+    recomp_env_set(RENV_TEXTURES_PACK, "none");
+    capture_begin();
+    CHECK(xbox_enhance_init("ecfg_root", NULL) == 0);
+    capture_end();
+    CHECK(nv2a_tex_pack_count() == 0);
+
+    /* Absolute: taken as is, never joined to the root. */
+    CHECK(GETCWD(cwd, sizeof cwd) != NULL);
+    snprintf(abs, sizeof abs, "%s/ecfg_root/enhance/t.pack", cwd);
+    recomp_env_set(RENV_TEXTURES_PACK, abs);
+    capture_begin();
+    CHECK(xbox_enhance_init("ecfg_no_such_root", NULL) == 0);
+    out = capture_end();
+    snprintf(want, sizeof want, "[ENHANCE] textures.pack=%s (1 entries, scale 2)\n", abs);
+    CHECK(strstr(out, want) != NULL);
+    CHECK(nv2a_tex_pack_count() == 1);
+
+    /* Refused: the reason and the resolved path, "; no pack", stock. The
+     * golden check skips this line, so a refused pack reads as none. */
+    recomp_env_set(RENV_TEXTURES_PACK, "enhance/missing.pack");
+    capture_begin();
+    CHECK(xbox_enhance_init("ecfg_root", NULL) == 0);
+    out = capture_end();
+    CHECK(strstr(out, "[ENHANCE] textures.pack=enhance/missing.pack: cannot open"
+                      " (ecfg_root/enhance/missing.pack); no pack\n") != NULL);
+    CHECK(nv2a_tex_pack_count() == 0);
+
+    enhance_reset_env();
+    recomp_env_set(RENV_TEXTURES_PACK, NULL);
+    recomp_env_set(RENV_ENHANCE_CONFIG, NULL);
+    enhance_cfg_shutdown();
+    nv2a_tex_pack_unload();
+}
+
 /* ── recomp_exe_dir ────────────────────────────────────────────────── */
 
 static void test_exe_dir(void)
@@ -571,6 +716,7 @@ int main(void)
     test_locale();
     test_layers();
     test_enhance_init();
+    test_tex_pack_key();
     test_exe_dir();
     printf("enhance_cfg: %d checks, %d failed\n", s_checks, s_fail);
     return s_fail ? 1 : 0;

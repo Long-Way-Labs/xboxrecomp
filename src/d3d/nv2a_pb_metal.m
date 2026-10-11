@@ -82,6 +82,7 @@
 
 #include "nv2a_pb_state.h"
 #include "nv2a_backend_common.h"
+#include "nv2a_tex_pack.h"
 #include "d3d8_msl.h"
 /* xbox_memory_layout.h pulls in the Win32 shim (BOOL, GetCurrentThread),
  * which collides with Objective-C and CoreServices: declare what is used. */
@@ -1269,41 +1270,65 @@ static uint64_t tex_hash_pal(const uint8_t *mem, const Stage *t, uint32_t bytes)
     return h;
 }
 
-static id<MTLTexture> tex_upload(const Stage *t)
+/* A BGRA8 texture of `levels` levels from src (level 0 first), or nil. */
+static id<MTLTexture> tex_make(uint32_t width, uint32_t height, uint32_t levels,
+                               const uint32_t *src)
 {
-    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
-    size_t n = nv2a_tex_texels(t->width, t->height, t->levels);
-    const uint32_t *pal = NULL, *src;
     MTLTextureDescriptor *td;
     id<MTLTexture> tex;
     uint32_t l;
-
-    if (n > s_texels_cap) {
-        uint32_t *p = (uint32_t *)realloc(s_texels, n * 4);
-        if (!p)
-            return nil;
-        s_texels = p;
-        s_texels_cap = n;
-    }
-    if (t->color == NV2A_TEX_P8)
-        pal = (const uint32_t *)(mem + t->palette);
-    nv2a_tex_decode(mem + t->offset, t->color, t->width, t->height, t->pitch,
-                    t->levels, pal, pal ? t->pal_len : 0, s_texels);
     td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                            width:t->width
-                                                           height:t->height
-                                                        mipmapped:t->levels > 1];
-    if (t->levels > 1)
-        td.mipmapLevelCount = t->levels;
+                                                            width:width
+                                                           height:height
+                                                        mipmapped:levels > 1];
+    if (levels > 1)
+        td.mipmapLevelCount = levels;
     td.usage = MTLTextureUsageShaderRead;
     tex = [s_dev newTextureWithDescriptor:td];
     if (!tex)
         return nil;
-    for (l = 0, src = s_texels; l < t->levels; l++) {
-        uint32_t w = nv2a_tex_level_dim(t->width, l), h = nv2a_tex_level_dim(t->height, l);
+    for (l = 0; l < levels; l++) {
+        uint32_t w = nv2a_tex_level_dim(width, l), h = nv2a_tex_level_dim(height, l);
         [tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:l withBytes:src
                bytesPerRow:w * 4];
         src += (size_t)w * h;
+    }
+    return tex;
+}
+
+/* `hash` is the entry's texel hash: with a texture pack loaded
+ * (enhancements, textures.pack) an entry it holds is uploaded from the
+ * pack's texels at the pack's size instead of the guest's. If the device
+ * refuses a texture of the entry's size, the guest texels go up instead:
+ * the pack only ever adds detail, never a black texture. */
+static id<MTLTexture> tex_upload(const Stage *t, uint64_t hash)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    size_t n = nv2a_tex_texels(t->width, t->height, t->levels);
+    const uint32_t *pal = NULL;
+    id<MTLTexture> tex = nil;
+
+    if (nv2a_tex_pack_count()) {
+        struct nv2a_tex_pack_entry *pe = nv2a_tex_pack_find(hash, t->width, t->height);
+        const uint32_t *src = pe ? nv2a_tex_pack_texels(pe) : NULL;
+        if (src)
+            tex = tex_make(pe->width, pe->height, pe->levels, src);
+    }
+    if (!tex) {
+        if (n > s_texels_cap) {
+            uint32_t *p = (uint32_t *)realloc(s_texels, n * 4);
+            if (!p)
+                return nil;
+            s_texels = p;
+            s_texels_cap = n;
+        }
+        if (t->color == NV2A_TEX_P8)
+            pal = (const uint32_t *)(mem + t->palette);
+        nv2a_tex_decode(mem + t->offset, t->color, t->width, t->height, t->pitch,
+                        t->levels, pal, pal ? t->pal_len : 0, s_texels);
+        tex = tex_make(t->width, t->height, t->levels, s_texels);
+        if (!tex)
+            return nil;
     }
     s_tex_uploads++;
     return tex;
@@ -1373,22 +1398,25 @@ static id<MTLTexture> tex_bind(const Stage *t)
             s_tex_rehash++;
             e->gen = g->flips;
             if (h != e->hash) {
-                id<MTLTexture> nt = tex_upload(t);
-                e->hash = h;
+                id<MTLTexture> nt = tex_upload(t, h);
                 s_tex_changed++;
+                /* The hash moves only with the texels: a failed upload keeps
+                 * the old texture and is tried again next flip. */
                 if (!nt)
                     return s_black;
+                e->hash = h;
                 [e->tex release];
                 e->tex = nt;
             }
         }
     } else {
         id<MTLTexture> nt;
+        uint64_t h = tex_hash_pal(mem, t, bytes);
         e = victim;
         [e->tex release];
         e->tex = nil;
         e->live = 0;
-        nt = tex_upload(t);
+        nt = tex_upload(t, h);
         if (!nt)
             return s_black;
         e->offset = t->offset;
@@ -1399,7 +1427,7 @@ static id<MTLTexture> tex_bind(const Stage *t)
         e->palette = t->palette;
         e->levels = t->levels;
         e->gen = g->flips;
-        e->hash = tex_hash_pal(mem, t, bytes);
+        e->hash = h;
         e->tex = nt;
         e->live = 1;
     }
@@ -2670,6 +2698,10 @@ static void flip_log(uint32_t surface_offset, RenderTarget *rt)
     static int on = -1;
     static uint64_t p_draws, p_prog, p_skip, p_cull, p_clears, p_tex, p_up,
                     p_chg, p_re, p_fl, p_occ, p_vis, p_late, p_super, p_sync, p_ovf;
+    /* With a pack, its hit count every 600 flips, flip trace or not. */
+    if (nv2a_tex_pack_count() && s_presents % 600 == 0)
+        fprintf(stderr, LOGP "textures.pack: %llu hits so far\n",
+                (unsigned long long)nv2a_tex_pack_hits());
     if (on < 0)
         on = recomp_env(RENV_FLIP_LOG) != NULL;
     if (!on)

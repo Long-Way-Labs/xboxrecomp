@@ -43,6 +43,7 @@
 #include "nv2a_combiner.h"
 #include "nv2a_pb_state.h"
 #include "nv2a_backend_common.h"
+#include "nv2a_tex_pack.h"
 #include "nv2a_zbuf_cache.h"
 #include "../video/video_player.h"   /* xbox_FramebufferWindowFrameStats */
 #if defined(_WIN32)
@@ -5724,6 +5725,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             fprintf(stderr, "[ENHANCE] render.scale=%u ignored: the CPU rasteriser"
                     " draws into guest memory at the guest size\n",
                     nv2a_host_render_scale());
+        /* A texture pack is a host-side replacement at upload; the CPU
+         * rasteriser samples guest memory and has no upload to replace. */
+        if (nv2a_tex_pack_count()
+                && (s_backend == &s_cpu_backend || s_backend == &s_null_backend))
+            fprintf(stderr, "[ENHANCE] textures.pack ignored: the CPU rasteriser"
+                    " samples guest memory\n");
     }
     s_perf.methods++;
     /* Bring-up: the first parameters each surface method carries. A wrong

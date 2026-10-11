@@ -363,6 +363,12 @@ static void short_call(void)
     XboxGuestCpuStats st;
 
     set_lock("1");
+    /* The turn starts at the join, and starting the waiter thread and
+     * seeing it queue can outlast the default 4 ms quantum on a loaded
+     * host; the call would then hand over for the quantum's sake, not for
+     * the call's. A 1 s quantum leaves only the call to decide. */
+    recomp_env_set(RENV_GUEST_QUANTUM, "1000");
+    xbox_GuestCpuReloadConfig();
     s_short_ran = 0;
     xbox_GuestCpuJoin();
     t = CreateThread(NULL, 0, short_waiter, NULL, 0, NULL);

@@ -19,6 +19,8 @@
  * and elem32: a quad list of 4800 ARRAY_ELEMENT16 indices whose quads from
  * index 4096 on have their own colour, and a triangle list whose odd last
  * index is an ARRAY_ELEMENT32; a pixel inside each must be drawn.
+ * Last, present.surface=internal: a live render.scale change resizes the
+ * swap chain to the frame's host size.
  * With RECOMP_PB_BACKEND=d3d11 that reaches ClearRenderTargetView, a draw
  * and Present in src/d3d/nv2a_pb_d3d11.c.
  *
@@ -41,6 +43,7 @@
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 uint32_t nv2a_pb_d3d11_pixel(uint32_t offset, int x, int y);
 uint32_t nv2a_pb_d3d11_back_pixel(int x, int y);
+void nv2a_pb_d3d11_back_size(uint32_t *w, uint32_t *h);
 int nv2a_pb_d3d11_shown(uint32_t offset, uint32_t *tw, uint32_t *th,
                         uint32_t *sw, uint32_t *sh);
 ptrdiff_t xbox_GetMemoryOffset(void);
@@ -618,6 +621,45 @@ static int cpu_clip_cases(uint32_t buf)
     return f;
 }
 
+/* present.surface=internal follows a live render.scale change (the
+ * in-game menu): the swap chain becomes the frame's host size, 1280x960 at
+ * 2x, instead of staying at the starting 640x480 behind a scaling blit, and
+ * returns at 1x. The request applies after the flip that follows it, so the
+ * new size shows from the flip after that. Run last: it leaves the window at
+ * whatever the last case sized it to. Returns the failures. */
+static int surface_cases(uint32_t buf)
+{
+    static const struct { unsigned scale, w, h; } want[2] = {
+        {2, 1280, 960}, {1, 640, 480},
+    };
+    struct nv2a_host_opts o = *nv2a_host_opts(), stock = o;
+    uint32_t bw, bh;
+    int f = 0, i, k;
+
+    o.present_surface = NV2A_PRESENT_SURFACE_INTERNAL;
+    nv2a_host_opts_set(&o);
+    M(0x0210, buf);
+    M(0x0200, 640u << 16);
+    M(0x0204, 480u << 16);
+    for (i = 0; i < 2; i++) {
+        o.render_scale = want[i].scale;
+        nv2a_host_opts_request(&o, NV2A_OPT_SCALE);
+        for (k = 0; k < 3; k++) {
+            M(0x1D90, 0xFF00FF00u);
+            M(0x1D94, 0xF0);
+            M(0x012C, 0);
+            M(0x0130, 0);
+        }
+        nv2a_pb_d3d11_back_size(&bw, &bh);
+        fprintf(stderr, "[backend-smoke] surface internal x%u: back buffer %ux%u (want"
+                " %ux%u) %s\n", want[i].scale, bw, bh, want[i].w, want[i].h,
+                bw == want[i].w && bh == want[i].h ? "PASS" : "FAIL");
+        f += bw != want[i].w || bh != want[i].h;
+    }
+    nv2a_host_opts_set(&stock);
+    return f;
+}
+
 int main(int argc, char **argv)
 {
     const char *log = recomp_env(RENV_STDIO_LOG);
@@ -1153,6 +1195,10 @@ int main(int argc, char **argv)
     if (edge_cases(buf)) {
         fprintf(stderr, "[backend-smoke] FAIL: 0.53125-offset edges\n");
         return 7;
+    }
+    if (surface_cases(buf[0])) {
+        fprintf(stderr, "[backend-smoke] FAIL: present.surface=internal scale change\n");
+        return 8;
     }
     fprintf(stderr, "[backend-smoke] done\n");
     return 0;

@@ -65,6 +65,8 @@ extern "C" {
     X(PRESENT_FILTER,    CONFIG, "RECOMP_PRESENT_FILTER",    NULL, "enhancements: present.filter, nearest (stock), linear, integer") \
     X(PRESENT_FULLSCREEN, CONFIG, "RECOMP_PRESENT_FULLSCREEN", NULL, "enhancements: present.fullscreen, borderless desktop fullscreen at start (1/0)") \
     X(PRESENT_PACING,    CONFIG, "RECOMP_PRESENT_PACING",    NULL, "enhancements: present.pacing, spin (stock busy-wait) or sleep (lowered spin waits sleep)") \
+    X(PRESENT_SURFACE,   CONFIG, "RECOMP_PRESENT_SURFACE",   NULL, "enhancements: present.surface, auto (default), window, internal") \
+    X(HOST_GAMESCOPE,    CONFIG, "RECOMP_HOST_GAMESCOPE",    NULL, "host: 1 when the launcher runs the game under gamescope (Steam Game Mode); present.surface=auto then means internal") \
     X(TEXTURES_PACK,     CONFIG, "RECOMP_TEXTURES_PACK",     NULL, "enhancements: textures.pack, a texture pack file (host-side texture replacements; unset = stock)") \
     X(TEXTURES_FONT,     CONFIG, "RECOMP_TEXTURES_FONT",     NULL, "enhancements: textures.font, the pack's font-atlas entries, on (default) or off") \
     X(TEXTURES_TEXT,     CONFIG, "RECOMP_TEXTURES_TEXT",     NULL, "enhancements: textures.text, the pack's baked-text entries, on (default) or off")

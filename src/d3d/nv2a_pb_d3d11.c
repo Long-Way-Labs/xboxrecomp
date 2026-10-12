@@ -372,6 +372,7 @@ static ID3D11Buffer *make_buffer(UINT size, UINT bind)
 static const char s_ps_src[] =
     VS_OUT_DECL
     PS_CB_DECL
+    D3D8_HLSL_SNAP_UV
     "Texture2D tex0 : register(t0);\n"
     "SamplerState samp0 : register(s0);\n"
     "float4 main(VS_OUT i) : SV_Target {\n"
@@ -381,6 +382,7 @@ static const char s_ps_src[] =
     "    } else if (tex_mode.x != 0u) {\n"
     "        float2 uv = i.oT0.xy;\n"
     "        if (tex_mode.x == 1u && i.oT0.w != 0.0 && i.oT0.w != 1.0) uv /= i.oT0.w;\n"
+    "        uv = nv2a_snap_uv(uv, i.oPos.xy, tex_scale[0]);\n"
     "        float4 t = tex0.Sample(samp0, uv * tex_scale[0].xy);\n"
     "        if (alpha_only.x == 2u) t.a = 1.0;\n"
     "        c *= t;\n"
@@ -432,6 +434,7 @@ static int init(void)
     wchar_t title[192];
     RECT r = {0, 0, 640, 480};
     int full = nv2a_host_opts()->fullscreen;
+    int internal = nv2a_host_opts()->present_surface == NV2A_PRESENT_SURFACE_INTERNAL;
     UINT bw = 640, bh = 480;
 
     if (tried)
@@ -455,7 +458,16 @@ static int init(void)
     RegisterClassA(&wc);
     if (!xbox_FramebufferWindowTitleText(title, 192, &s_title_clock))
         title[0] = 0;
-    if (full) {
+    if (internal) {
+        /* present.surface=internal: the surface is the frame, and a scaling
+         * compositor (gamescope) fits it to its output with its own filter.
+         * The screen size is not asked: under gamescope it is the output,
+         * and a surface that large leaves FSR nothing to upscale. */
+        bw = 640u * nv2a_host_render_scale();
+        bh = 480u * nv2a_host_render_scale();
+        r.right = (LONG)bw;
+        r.bottom = (LONG)bh;
+    } else if (full) {
         /* present.fullscreen: borderless over the primary monitor (no HWND
          * yet to ask MonitorFromWindow), no exclusive mode. */
         bw = (UINT)GetSystemMetrics(SM_CXSCREEN);
@@ -2155,19 +2167,20 @@ static ID3D11PixelShader *debug_ps(void)
         snprintf(expr, sizeof expr, "float4(i.oD1.rgb, 1)");
     else if (w[0] == 't' && w[1] >= '0' && w[1] <= '3' && !w[2])
         snprintf(expr, sizeof expr,
-                 "float4(tex%c.Sample(samp%c, i.oT%c.xy * tex_scale[%c].xy).rgb, 1)",
-                 w[1], w[1], w[1], w[1]);
+                 "float4(tex%c.Sample(samp%c, nv2a_snap_uv(i.oT%c.xy, i.oPos.xy, tex_scale[%c])"
+                 " * tex_scale[%c].xy).rgb, 1)",
+                 w[1], w[1], w[1], w[1], w[1]);
     else if (w[0] == 't' && w[1] == 'c' && w[2] >= '0' && w[2] <= '3' && !w[3])
         snprintf(expr, sizeof expr, "float4(frac(i.oT%c.xy), 0, 1)", w[2]);
     else
         snprintf(expr, sizeof expr, "float4(1, 1, 1, 1)");
-    snprintf(src, sizeof src, "%s%s"
+    snprintf(src, sizeof src, "%s%s%s"
              "Texture2D tex0 : register(t0); Texture2D tex1 : register(t1);\n"
              "Texture2D tex2 : register(t2); Texture2D tex3 : register(t3);\n"
              "SamplerState samp0 : register(s0); SamplerState samp1 : register(s1);\n"
              "SamplerState samp2 : register(s2); SamplerState samp3 : register(s3);\n"
              "float4 main(VS_OUT i) : SV_Target { return %s; }\n",
-             VS_OUT_DECL, PS_CB_DECL, expr);
+             VS_OUT_DECL, PS_CB_DECL, D3D8_HLSL_SNAP_UV, expr);
     if (compile("nv2a_ps_debug", src, "ps_5_0", &code)) {
         ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(code),
                                        ID3D10Blob_GetBufferSize(code), NULL, &ps);
@@ -2196,18 +2209,13 @@ static ID3D11PixelShader *setup_pixel(void)
     nv2a_ps_consts_fill(v, s_stage, &pc);
     for (n = 0; n < 4; n++) {
         const Stage *t = &s_stage[n];
-        int scaled = nv2a_tex_size_from_format(t->color);
         RenderTarget *src = (t->mode && t->mode != 4) ? rt_texture(t) : NULL;
         s_stage_rt[n] = src;
         s_stage_src[n] = !t->mode ? "none" : t->mode == 4 ? "passthru" : "cache";
         if (src) {
             s_stage_src[n] = src == &s_self ? "render-target(self copy)"
                                             : "render-target";
-            /* Linear coordinates are texels of the surface as drawn. */
-            if (!scaled) {
-                pc.tex_scale[n][0] = 1.0f / (float)src->w;
-                pc.tex_scale[n][1] = 1.0f / (float)src->h;
-            }
+            nv2a_ps_consts_rt(&pc, n, t, src->w, src->h);
             if (rt_no_alpha(nv2a_tex_linear_twin(t->color)))
                 pc.alpha_only[n] = 2;
             srv[n] = src->srv;
@@ -2260,13 +2268,13 @@ static ID3D11PixelShader *setup_pixel(void)
         /* The registers and modes that make the state: the same as the last
          * batch's give the same state and so the same shader. */
         static struct {
-            uint32_t r[36];
+            uint32_t r[37];
             int      key_ok, ps_ok;   /* s_last_rc is r's state; ps is its shader */
             ID3D11PixelShader *ps;
             RcEntry *e;
             uint64_t compiles;
         } memo;
-        uint32_t key[36];
+        uint32_t key[37];
         int hit;
         memcpy(key, v->rc_cicw, 32);
         memcpy(key + 8, v->rc_aicw, 32);
@@ -2276,12 +2284,15 @@ static ID3D11PixelShader *setup_pixel(void)
         key[33] = v->rc_fcw0;
         key[34] = v->rc_fcw1;
         key[35] = modes;
+        /* render.scale changes at run time: each scale class has its own text */
+        key[36] = nv2a_host_render_scale() > 1;
         hit = memo_on() && memo.key_ok && !memcmp(memo.r, key, sizeof key);
         if (!hit) {
             d3d8_combiners_from_regs(v->rc_cicw, v->rc_aicw, v->rc_cocw,
                                      v->rc_aocw, v->rc_ctl, v->rc_fcw0,
                                      v->rc_fcw1, modes, &st);
             st.fog_input = 1;   /* FOG.a is the interpolated vertex fog factor */
+            st.rect_snap = (int)key[36];   /* nv2a_snap_uv; in rc_hash via st */
             s_last_rc = st;
             memcpy(memo.r, key, sizeof key);
             memo.key_ok = 1;
@@ -2673,7 +2684,7 @@ static ID3D11PixelShader *px_shader(int pass)
     if (tried[pass])
         return ps[pass];
     tried[pass] = 1;
-    snprintf(src, sizeof src, "%s%s"
+    snprintf(src, sizeof src, "%s%s%s"
         "Texture2D tex0 : register(t0); Texture2D tex1 : register(t1);\n"
         "Texture2D tex2 : register(t2); Texture2D tex3 : register(t3);\n"
         "SamplerState samp0 : register(s0); SamplerState samp1 : register(s1);\n"
@@ -2681,23 +2692,23 @@ static ID3D11PixelShader *px_shader(int pass)
         "struct PO { float4 o0 : SV_Target0; float4 o1 : SV_Target1;\n"
         "    float4 o2 : SV_Target2; float4 o3 : SV_Target3; float4 o4 : SV_Target4;\n"
         "    float4 o5 : SV_Target5; float4 o6 : SV_Target6; float4 o7 : SV_Target7; };\n"
-        "float2 uvof(float4 t, uint n) {\n"
+        "float2 uvof(float4 t, uint n, float2 pos) {\n"
         "    float2 uv = t.xy;\n"
         "    if (tex_mode[n] == 1u && t.w != 0.0 && t.w != 1.0) uv /= t.w;\n"
-        "    return uv * tex_scale[n].xy;\n"
+        "    return nv2a_snap_uv(uv, pos, tex_scale[n]) * tex_scale[n].xy;\n"
         "}\n"
         "PO main(VS_OUT i) {\n"
         "    PO o;\n"
         "%s"
         "    return o;\n"
         "}\n",
-        VS_OUT_DECL, PS_CB_DECL,
+        VS_OUT_DECL, PS_CB_DECL, D3D8_HLSL_SNAP_UV,
         pass == 0
         ? "    o.o0 = i.oD0; o.o1 = i.oD1; o.o2 = i.oT0; o.o3 = i.oT1;\n"
           "    o.o4 = i.oT2; o.o5 = i.oT3; o.o6 = i.oPos;\n"
           "    o.o7 = float4(i.oFog, 1, 0, 0);\n"
-        : "    float2 u0 = uvof(i.oT0, 0), u1 = uvof(i.oT1, 1);\n"
-          "    float2 u2 = uvof(i.oT2, 2), u3 = uvof(i.oT3, 3);\n"
+        : "    float2 u0 = uvof(i.oT0, 0, i.oPos.xy), u1 = uvof(i.oT1, 1, i.oPos.xy);\n"
+          "    float2 u2 = uvof(i.oT2, 2, i.oPos.xy), u3 = uvof(i.oT3, 3, i.oPos.xy);\n"
           "    o.o0 = tex0.Sample(samp0, u0); o.o1 = tex1.Sample(samp1, u1);\n"
           "    o.o2 = tex2.Sample(samp2, u2); o.o3 = tex3.Sample(samp3, u3);\n"
           "    o.o4 = float4(u0, 0, 0); o.o5 = float4(u1, 0, 0);\n"
@@ -3397,15 +3408,12 @@ static int blit_init(void)
     return 1;
 }
 
-/* WM_SIZE recorded a client size the swap chain does not have: resize it
- * (FLIP_DISCARD keeps no contents worth keeping). */
-static void present_resize(void)
+/* Resize the swap chain to cw x ch (FLIP_DISCARD keeps no contents worth
+ * keeping) and re-read the back buffer's size. */
+static void swap_resize(UINT cw, UINT ch)
 {
-    UINT cw = s_client_w, ch = s_client_h;
     HRESULT hr;
 
-    if (!cw || !ch || (cw == s_back_w && ch == s_back_h))
-        return;
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
     if (s_back_rtv) {
         ID3D11RenderTargetView_Release(s_back_rtv);
@@ -3425,7 +3433,48 @@ static void present_resize(void)
         s_back_w = td.Width;
         s_back_h = td.Height;
     }
+}
+
+/* WM_SIZE recorded a client size the swap chain does not have: resize it. */
+static void present_resize(void)
+{
+    UINT cw = s_client_w, ch = s_client_h;
+
+    /* present.surface=internal: the swap chain stays the frame's size; the
+     * compositor scales it to whatever the window became. */
+    if (nv2a_host_opts()->present_surface == NV2A_PRESENT_SURFACE_INTERNAL)
+        return;
+    if (!cw || !ch || (cw == s_back_w && ch == s_back_h))
+        return;
+    swap_resize(cw, ch);
     fprintf(stderr, LOGP "window resized: swap chain %ux%u\n", s_back_w, s_back_h);
+}
+
+/* present.surface=internal after a render.scale change (the in-game menu):
+ * the swap chain and the client area follow the frame's host size, so the
+ * compositor keeps getting the whole frame rather than a scaling blit into
+ * the starting size (Metal's drawable follows the frame the same way). A
+ * frame cropped from a grown target (rt_grow) is not the frame's size, so it
+ * leaves both alone. */
+static void internal_resize(const RenderTarget *rt, UINT cw, UINT ch)
+{
+    RECT r;
+
+    if (!s_back || (rt->hw == s_back_w && rt->hh == s_back_h))
+        return;
+    if (cw != rt->w || ch != rt->h || !rt->hw || !rt->hh)
+        return;
+    r.left = 0;
+    r.top = 0;
+    r.right = (LONG)rt->hw;
+    r.bottom = (LONG)rt->hh;
+    if (!nv2a_host_opts()->fullscreen)
+        AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+    SetWindowPos(s_hwnd, NULL, 0, 0, r.right - r.left, r.bottom - r.top,
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    swap_resize(rt->hw, rt->hh);
+    fprintf(stderr, LOGP "render scale change: back buffer %ux%u (surface internal)\n",
+            s_back_w, s_back_h);
 }
 
 /* The part of rt a flip shows, in guest pixels: the walker's present extent
@@ -3541,9 +3590,15 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
         present_extent(s_drawn, &cw, &ch);
         s_shown_w = cw;
         s_shown_h = ch;
+        if (eo->present_surface == NV2A_PRESENT_SURFACE_INTERNAL)
+            internal_resize(s_drawn, cw, ch);
         same = cw == s_drawn->w && ch == s_drawn->h
             && s_drawn->hw == s_back_w && s_drawn->hh == s_back_h;
-        int blit = !stock && !(same && eo->present_filter != NV2A_PRESENT_LINEAR);
+        int internal = eo->present_surface == NV2A_PRESENT_SURFACE_INTERNAL;
+        /* Under present.surface=internal nothing is scaled here, so no
+         * filter has anything to do: the frame is copied as it is, at
+         * scale > 1 too (the compositor gets the scaled frame whole). */
+        int blit = !stock && !(same && (eo->present_filter != NV2A_PRESENT_LINEAR || internal));
         if (!s_back) {
             /* A failed ResizeBuffers/GetBuffer left no back buffer. */
             static int said_nb;
@@ -3578,9 +3633,10 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
         }
         if (s_back && !said++)
             fprintf(stderr, LOGP "first present: back buffer %ux%u, frame %ux%u"
-                    " (%ux%u host), %s\n", s_back_w, s_back_h, s_drawn->w, s_drawn->h,
+                    " (%ux%u host), %s%s\n", s_back_w, s_back_h, s_drawn->w, s_drawn->h,
                     s_drawn->hw, s_drawn->hh,
-                    blit ? "scaling blit" : same ? "copy" : "overlap copy");
+                    blit ? "scaling blit" : same ? "copy" : "overlap copy",
+                    internal ? " (surface internal)" : "");
     }
     if (s_back && s_probe_x >= 0)
         s_probe_px = (UINT)s_probe_x < s_back_w && (UINT)s_probe_y < s_back_h
@@ -3841,6 +3897,13 @@ int nv2a_pb_d3d11_shown(uint32_t offset, uint32_t *tw, uint32_t *th,
             return 1;
         }
     return 0;
+}
+
+/* For tests/d3d11_backend_smoke: the swap chain's back-buffer size. */
+void nv2a_pb_d3d11_back_size(uint32_t *w, uint32_t *h)
+{
+    *w = s_back_w;
+    *h = s_back_h;
 }
 
 /* For tests/d3d11_backend_smoke: the back-buffer pixel the last flip read,

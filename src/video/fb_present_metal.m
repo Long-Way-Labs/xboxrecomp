@@ -21,6 +21,10 @@
  *                  SDL path filters (and as D3D11's scaling blit does).
  *   shot           RECOMP_WINDOW_SHOT: the drawable read back after the pass,
  *                  framebufferOnly being off only when shots are asked for.
+ *   internal       present.surface=internal: the drawable stays the frame's
+ *                  size, the slot is drawn into it 1:1, and the layer scales
+ *                  it to the view (aspect fit, the present filter's sampler),
+ *                  as gamescope scales D3D11's frame-sized swap chain.
  *
  * Manual retain/release, like nv2a_pb_metal.m. Every entry point is wrapped in
  * an autorelease pool: the main loop and the ack thread have none of their own.
@@ -60,6 +64,8 @@ static id<MTLTexture>              s_slot[3];
 static id<MTLCommandBuffer>        s_slot_cb[3];
 static uint32_t                   *s_conv;     /* R5G6B5 -> BGRA8 rows */
 static size_t                      s_conv_cap;
+static int                         s_internal;  /* present.surface=internal */
+static int                         s_layer_filter = -1;
 
 static const char s_blit_msl[] =
     "#include <metal_stdlib>\n"
@@ -146,11 +152,34 @@ int fbm_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
         s_layer.displaySyncEnabled = vsync ? YES : NO;
         s_layer.maximumDrawableCount = 3;
         s_layer.allowsNextDrawableTimeout = YES;
-        SDL_Metal_GetDrawableSize(win, &w, &h);
+        s_internal = nv2a_host_opts()->present_surface == NV2A_PRESENT_SURFACE_INTERNAL;
+        if (s_internal) {
+            /* Letterboxed like nv2a_present_rect's fit; fbm_present keeps
+             * the drawable at the frame's size. */
+            s_layer.contentsGravity = kCAGravityResizeAspect;
+            w = 640 * (int)nv2a_host_render_scale();
+            h = 480 * (int)nv2a_host_render_scale();
+        } else {
+            SDL_Metal_GetDrawableSize(win, &w, &h);
+        }
         if (w > 0 && h > 0)
             s_layer.drawableSize = CGSizeMake(w, h);
     }
     return 1;
+}
+
+/* present.surface=internal: the layer's scaling filter follows the present
+ * filter (integer has no layer equivalent and scales linearly, as its
+ * non-whole fallback does). */
+static void layer_filter(int filter)
+{
+    NSString *f;
+    if (filter == s_layer_filter)
+        return;
+    s_layer_filter = filter;
+    f = filter == NV2A_PRESENT_NEAREST ? kCAFilterNearest : kCAFilterLinear;
+    s_layer.magnificationFilter = f;
+    s_layer.minificationFilter = f;
 }
 
 void fbm_destroy(void)
@@ -303,8 +332,21 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
         CGSize cur = s_layer.drawableSize;
 
         /* Checked every present, not only on resize events: a move between
-         * displays of another scale need not arrive as SIZE_CHANGED. */
-        SDL_Metal_GetDrawableSize(win, &dw, &dh);
+         * displays of another scale need not arrive as SIZE_CHANGED. Under
+         * present.surface=internal the drawable is the frame instead (a
+         * render.scale change from the menu resizes it). */
+        if (s_internal) {
+            layer_filter(filter);
+            if (fw && fh) {
+                dw = (int)fw;
+                dh = (int)fh;
+            } else {
+                dw = (int)cur.width;
+                dh = (int)cur.height;
+            }
+        } else {
+            SDL_Metal_GetDrawableSize(win, &dw, &dh);
+        }
         if (dw > 0 && dh > 0 && ((int)cur.width != dw || (int)cur.height != dh))
             s_layer.drawableSize = CGSizeMake(dw, dh);
         d = [s_layer nextDrawable];
@@ -321,6 +363,14 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
         enc = [cb renderCommandEncoderWithDescriptor:rp];
         if (s_slot[k] && fw && fh) {
             whole = nv2a_present_rect(fw, fh, (uint32_t)dw, (uint32_t)dh, filter, &r);
+            if (s_internal) {
+                /* 1:1: the layer does the scaling. */
+                r.x = r.y = 0;
+                r.w = dw;
+                r.h = dh;
+                whole = 1;
+                filter = NV2A_PRESENT_NEAREST;
+            }
             if (r.w > 0 && r.h > 0) {
                 MTLViewport vp = { r.x, r.y, r.w, r.h, 0.0, 1.0 };
                 int lin = filter == NV2A_PRESENT_LINEAR

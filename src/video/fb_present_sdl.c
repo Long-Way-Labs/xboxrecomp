@@ -595,6 +595,10 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
         SDL_RenderClear(ren);
         SDL_RenderPresent(ren);
+        /* The renderer scales into the window itself; present.surface is
+         * for the D3D11 swap chain and the CAMetalLayer. */
+        if (eo->present_surface == NV2A_PRESENT_SURFACE_INTERNAL)
+            fprintf(stderr, "[PRESENT] present.surface=internal ignored (SDL presenter)\n");
     }
 
     s_guest_done_event = SDL_RegisterEvents(2);

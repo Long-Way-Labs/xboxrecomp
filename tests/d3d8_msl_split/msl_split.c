@@ -132,6 +132,42 @@ static int texmode_check(void)
     return bad;
 }
 
+/* rect_snap (render scale > 1): stage 0 (2D) samples through nv2a_snap_uv,
+ * the helper is the shared text, and the same state without the flag emits
+ * neither, so the hashed cases above stay the stock text. */
+static int snap_check(void)
+{
+    static const uint32_t zero[8];
+    static char text[256 * 1024];
+    NV2ACombinerState st;
+    int bad = 0, n;
+
+    memset(&st, 0, sizeof st);
+    d3d8_combiners_from_regs(zero, zero, zero, zero, 1u, 0u, 0u, 1u, &st);
+    st.fog_input = 1;
+    st.rect_snap = 1;
+    if ((n = d3d8_combiners_generate_msl(&st, text, (int)sizeof text)) <= 0)
+        return 1;
+    if (!strstr(text, D3D8_MSL_SNAP_UV) || !strstr(text, "uv = nv2a_snap_uv(uv, i.pos.xy, pc.tex_scale[0]);")) {
+        printf("FAIL: rect_snap does not sample stage 0 through nv2a_snap_uv\n");
+        bad = 1;
+    }
+    {
+        int before = s_compile_bad;
+        compile_case("rc-snap", 0, text, n, "fs_main");
+        if (s_compile_bad != before)
+            bad = 1;
+    }
+    st.rect_snap = 0;
+    if (d3d8_combiners_generate_msl(&st, text, (int)sizeof text) <= 0)
+        return 1;
+    if (strstr(text, "nv2a_snap_uv")) {
+        printf("FAIL: nv2a_snap_uv without rect_snap\n");
+        bad = 1;
+    }
+    return bad;
+}
+
 int main(void)
 {
     static uint32_t prog[NV2A_VS_MAX_INSTRUCTIONS * 4];
@@ -202,6 +238,8 @@ int main(void)
     if (s_compile_bad)
         return 1;
     if (texmode_check())
+        return 1;
+    if (snap_check())
         return 1;
     if (s_bad) {
         printf("FAIL: %d of %d cases differ (MSL_DUMP=<file> writes the text)\n",

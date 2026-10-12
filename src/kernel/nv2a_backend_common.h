@@ -878,16 +878,33 @@ struct nv2a_ps_consts {
     uint32_t alpha_func;        /* enum nv2a_cmp + 1: 1 NEVER .. 8 ALWAYS */
     uint32_t alpha_test_enable, fog_enable;
     uint32_t alpha_only[4];     /* 1: rgb reads 1 (A8); 2: alpha reads 1 (no alpha) */
-    float    tex_scale[4][4];   /* xy: texcoord multiplier (1/size for linear) */
+    float    tex_scale[4][4];   /* xy: texcoord multiplier (1/size for linear);
+                                 * z: nv2a_rect_snap_scale, 0 for none */
     uint32_t tex_mode[4];       /* stage texture-shader mode, 0 = none */
 };
 
+/* tex_scale[n].z for stage t at render scale `scale`: the scale when the
+ * shaders' nv2a_snap_uv may move a host pixel's sample to its guest pixel's
+ * 1x sample point, else 0. Only a sampled (mode not 0 or 4), linear-format
+ * (coordinates in texels), bilinear-filtered stage at scale > 1: there the
+ * N host pixels of a guest pixel sample between texel centres and, at a
+ * rect texture's last row and column, blend in the padding past the
+ * picture. A point-filtered stage reads one texel and never bleeds. The
+ * shader still checks that the mapping is a unity blit. */
+unsigned nv2a_rect_snap_scale(const struct nv2a_stage *t, unsigned scale);
+
 /* Fill pc from the combiner registers and the four stages. A stage that
- * samples a render target instead of guest memory has its linear scale set
- * by the caller (1/target size). */
+ * samples a render target instead of guest memory is then corrected with
+ * nv2a_ps_consts_rt. */
 void nv2a_ps_consts_fill(const struct nv2a_pb_vsh *v,
                          const struct nv2a_stage st[4],
                          struct nv2a_ps_consts *pc);
+
+/* Stage n samples a w x h render target instead of guest memory: linear
+ * coordinates are texels of the surface as drawn (1/size), and no snap,
+ * since a scaled target holds host-rate detail the 1x rule would discard. */
+void nv2a_ps_consts_rt(struct nv2a_ps_consts *pc, int n,
+                       const struct nv2a_stage *t, uint32_t w, uint32_t h);
 
 /* A screen-space vertex coordinate on the NV2A rasteriser's grid: 4 fraction
  * bits, truncated (xemu's roundScreenCoords). XDK D3D adds 0.53125 to every
@@ -1008,11 +1025,19 @@ enum nv2a_present_filter {
     NV2A_PRESENT_INTEGER        /* largest whole multiple that fits, centred */
 };
 
+/* present.surface, resolved (never "auto"). Read when the window is made,
+ * so it has no NV2A_OPT_* bit: the menu cannot change it. */
+enum nv2a_present_surface {
+    NV2A_PRESENT_SURFACE_WINDOW = 0,    /* stock: the swap chain follows the window */
+    NV2A_PRESENT_SURFACE_INTERNAL       /* swap chain = the frame; the compositor scales */
+};
+
 struct nv2a_host_opts {
     unsigned render_scale;      /* 0 or 1 = guest size; 2..4 */
     int      present_filter;    /* enum nv2a_present_filter */
     int      fullscreen;        /* borderless desktop fullscreen at start */
     unsigned pack_off;          /* NV2A_PACK_OFF_* bits: 0 = every kind on */
+    int      present_surface;   /* enum nv2a_present_surface */
 };
 
 /* pack_off bits: the whole pack, or one kind of entry (nv2a_tex_pack.h). */

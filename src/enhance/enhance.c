@@ -60,6 +60,8 @@ static void load_tex_pack(const struct nv2a_host_opts *o)
 static const char *const s_filters[] = { "nearest", "linear", "integer", NULL };
 /* Indexes match XBOX_PACING_SPIN / XBOX_PACING_SLEEP. */
 static const char *const s_pacing[] = { "spin", "sleep", NULL };
+/* present.surface: "auto" (index 0) is resolved here, never stored. */
+static const char *const s_surface[] = { "auto", "window", "internal", NULL };
 /* textures.font / textures.text: words, as the menu shows them. */
 static const char *const s_onoff[] = { "off", "on", NULL };
 
@@ -68,7 +70,8 @@ int xbox_enhance_init(const char *root, const char *title)
     struct nv2a_host_opts o;
     const char *aspect;
     long long scale;
-    int rc, pacing;
+    int rc, pacing, surface;
+    char surface_txt[48];
 
     rc = enhance_cfg_init(root, title) < 0 ? -1 : 0;
     memset(&o, 0, sizeof o);
@@ -88,6 +91,22 @@ int xbox_enhance_init(const char *root, const char *title)
      * generated with --spin-waits have any. Set before the guest starts. */
     pacing = enhance_cfg_choice("present.pacing", s_pacing, XBOX_PACING_SPIN);
     xbox_PacingSetMode(pacing);
+    /* Who scales the frame to the screen. Under gamescope the compositor
+     * should: its filter (Steam's FSR) upscales only a surface smaller than
+     * its output, and a window at the screen size leaves it nothing to do.
+     * The runtime does not look for gamescope itself; the SteamOS launcher
+     * says so through RECOMP_HOST_GAMESCOPE, and auto follows it. */
+    surface = enhance_cfg_choice("present.surface", s_surface, 0);
+    if (surface == 0) {
+        int gs = recomp_env_on(RENV_HOST_GAMESCOPE);
+        o.present_surface = gs ? NV2A_PRESENT_SURFACE_INTERNAL : NV2A_PRESENT_SURFACE_WINDOW;
+        snprintf(surface_txt, sizeof surface_txt, "%s(auto%s)",
+                 gs ? "internal" : "window", gs ? ": gamescope" : "");
+    } else {
+        o.present_surface = surface == 2 ? NV2A_PRESENT_SURFACE_INTERNAL
+                                         : NV2A_PRESENT_SURFACE_WINDOW;
+        snprintf(surface_txt, sizeof surface_txt, "%s", s_surface[surface]);
+    }
 
     /* Hor+ is a later slice; a file or env that asks for it must not be
      * ignored silently. */
@@ -107,8 +126,8 @@ int xbox_enhance_init(const char *root, const char *title)
 
     nv2a_host_opts_set(&o);
     fprintf(stderr, LOGP "render.scale=%u present.filter=%s present.fullscreen=%d"
-            " present.pacing=%s (display.aspect=%s)\n", o.render_scale,
-            s_filters[o.present_filter], o.fullscreen, s_pacing[pacing], aspect);
+            " present.pacing=%s present.surface=%s (display.aspect=%s)\n", o.render_scale,
+            s_filters[o.present_filter], o.fullscreen, s_pacing[pacing], surface_txt, aspect);
     load_tex_pack(&o);
     /* No enhance_cfg_report_unused() here: the title reads its own keys
      * (game.mode, say) after this, and calls it then. */

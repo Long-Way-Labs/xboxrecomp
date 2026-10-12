@@ -107,6 +107,8 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
         EMIT("    float  fog : FOG;\n");
     EMIT("};\n");
     EMIT("%s", s_rc_helpers);
+    if (state->rect_snap)
+        EMIT("%s", D3D8_HLSL_SNAP_UV);
 
     EMIT("float4 main(PS_IN i) : SV_Target {\n");
     for (k = 0; k < 16; k++)
@@ -144,6 +146,8 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
                  * as the CPU path's stage_sample does. */
                 EMIT("        if (tex_mode[%d] == 1u && i.tc%d.w != 0.0 && i.tc%d.w != 1.0)"
                      " uv /= i.tc%d.w;\n", i, i, i, i);
+            if (state->rect_snap)
+                EMIT("        uv = nv2a_snap_uv(uv, i.pos.xy, tex_scale[%d]);\n", i);
             EMIT("        x%d = tex%d.Sample(samp%d, uv * tex_scale[%d].xy);\n",
                  8 + i, i, i, i);
             EMIT("    }\n");

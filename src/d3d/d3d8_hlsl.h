@@ -49,12 +49,37 @@ int d3d8_vsh_generate_hlsl_ex(const NV2AVshProgram *program, unsigned flags,
                                char *buf, int bufsize);
 
 /**
+ * Guest-rate sampling of a unity rect-texture stage at render scale N > 1
+ * (tex_scale[n].z = N, nv2a_rect_snap_scale). uv is the stage's coordinate
+ * in texels, pos the host pixel centre (SV_POSITION.xy). When the mapping
+ * is screen-aligned and one texel per guest pixel on both axes, uv moves to
+ * where the 1x render sampled the guest pixel this host pixel belongs to:
+ * the N x N block's centre, by affine extrapolation along the derivatives.
+ * Host-rate samples between two texel centres would otherwise blend in the
+ * padding texel past a rect texture's picture (a coloured line on the
+ * right and bottom edges at scale 2). The derivatives come first: they
+ * need uniform control flow. At .z = 0 uv comes back as it is.
+ */
+#define D3D8_HLSL_SNAP_UV \
+    "float2 nv2a_snap_uv(float2 uv, float2 pos, float4 ts) {\n" \
+    "    float2 dx = ddx(uv), dy = ddy(uv);\n" \
+    "    float n = ts.z, eps = 1.0 / 64.0;\n" \
+    "    if (n > 1.0 && abs(dx.y) <= eps && abs(dy.x) <= eps\n" \
+    "            && abs(abs(dx.x) * n - 1.0) <= eps && abs(abs(dy.y) * n - 1.0) <= eps) {\n" \
+    "        float2 d = (floor(pos / n) + 0.5) * n - pos;\n" \
+    "        uv += dx * d.x + dy * d.y;\n" \
+    "    }\n" \
+    "    return uv;\n" \
+    "}\n"
+
+/**
  * Generate HLSL pixel shader source from combiner state.
  *
  * The shader evaluates the combiners the way nv2a_combiner.c's evaluator does
  * on the CPU, operation for operation. Its input struct matches the vertex
  * shader output of d3d8_vsh_hlsl.c (SV_POSITION, COLOR0, COLOR1, TEXCOORD0-3);
  * its constants are NV2APSConstants at b0; stage n samples tN with sN.
+ * With state->rect_snap, 2D stages go through D3D8_HLSL_SNAP_UV.
  *
  * @param state   The combiner configuration
  * @param buf     Output buffer for HLSL source

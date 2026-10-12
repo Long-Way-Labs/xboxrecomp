@@ -156,6 +156,7 @@ the stock settings.
 | `present.filter` | string | `"nearest"`, `"linear"`, `"integer"` | `"nearest"` | `RECOMP_PRESENT_FILTER` |
 | `present.fullscreen` | bool | borderless fullscreen at start | `false` | `RECOMP_PRESENT_FULLSCREEN` |
 | `present.pacing` | string | `"spin"` (stock), `"sleep"`: how a lowered guest busy-wait waits | `"spin"` | `RECOMP_PRESENT_PACING` |
+| `present.surface` | string | `"auto"`, `"window"`, `"internal"`: who scales the frame to the screen, the game or the compositor | `"auto"` | `RECOMP_PRESENT_SURFACE` |
 | `textures.pack` | string | a texture pack file ([texture-pack.md](../formats/texture-pack.md)); relative to the executable's directory | none | `RECOMP_TEXTURES_PACK` |
 | `textures.font` | string | `"on"`, `"off"`: the pack's font-atlas entries | `"on"` | `RECOMP_TEXTURES_FONT` |
 | `textures.text` | string | `"on"`, `"off"`: the pack's baked-text entries | `"on"` | `RECOMP_TEXTURES_TEXT` |
@@ -182,7 +183,7 @@ libraries never link the layer: without it the options are all zero, which
 is stock. One line shows the values in force:
 
 ```
-[ENHANCE] render.scale=2 present.filter=integer present.fullscreen=0 present.pacing=spin (display.aspect=4:3)
+[ENHANCE] render.scale=2 present.filter=integer present.fullscreen=0 present.pacing=spin present.surface=window(auto) (display.aspect=4:3)
 ```
 
 A change while the game runs (the in-game menu) goes through
@@ -205,7 +206,11 @@ presenters read them at start.
   guest size and draw with an N-times viewport. The pixel-to-NDC mapping
   stays on the guest size, so every vertex program, the pre-transformed
   HUD ones included, lands where it did, at N times the pixels.
-  Render-to-texture samples the scaled target (supersampled). The frame the
+  Render-to-texture samples the scaled target (supersampled). A bilinear
+  linear-format (rect) texture drawn 1:1 to guest pixels, such as a movie
+  frame, is sampled where the 1x render samples it: each N x N block of
+  host pixels reads its guest pixel's 1x sample point, so the padding past
+  the picture does not bleed into the last row and column. The frame the
   guest sees is still guest-sized: Metal box-filters its write-back to
   guest memory, so `RECOMP_FB_DUMP` and `fb_dump_at` frames stay 640x480.
   The box filter averages the stored (gamma-encoded) values, not linear
@@ -233,6 +238,38 @@ presenters read them at start.
 - **`present.fullscreen`.** A borderless window covering the display at
   start, with no mode change (SDL `FULLSCREEN_DESKTOP`; D3D11 a `WS_POPUP`
   the primary monitor's size). There is no hotkey yet.
+- **`present.surface`.** Who scales the frame to the screen. `window` is
+  the stock behaviour: the swap chain follows the window, and the game
+  scales the frame into it as `present.filter` says. `internal` makes the
+  surface the frame itself, 640x480 times `render.scale` (1280x960 at 2x):
+  D3D11 creates the window's client area and the swap chain at that size
+  (a `WS_POPUP` at the top-left corner under `present.fullscreen`, without
+  asking the screen size), resizes the window and the swap chain only when
+  the menu changes `render.scale`, and copies the frame into it under every
+  filter. Dragging the edge of a desktop window stretches the swap chain to
+  the window without keeping the aspect (DXGI's stretch), where Metal
+  letterboxes. A scaling compositor then fits it to
+  the output with its own filter. That is the point under gamescope (Steam
+  Game Mode): Steam's *Scaling filter* (FSR, linear, nearest, ...) applies
+  to the surface gamescope receives, and FSR upscales only a surface
+  smaller than its output, so with `window` (a surface the screen's size)
+  it has nothing to do. On the Steam Deck use `render.scale = 1` for FSR:
+  at 2x the 1280x960 surface is taller than the 800-line output and is
+  downsampled instead (a sharp picture, but not FSR). On a desktop without
+  a scaling compositor `internal` shows the frame unscaled. `auto` (the
+  default) means `internal` when the launcher sets `RECOMP_HOST_GAMESCOPE`
+  (the SteamOS bundle's `launch.sh` does under gamescope) and `window`
+  otherwise; the runtime does not look for gamescope itself. A bare `.exe`
+  started under gamescope without the launcher sets
+  `RECOMP_PRESENT_SURFACE=internal` (or `surface = "internal"`) by hand.
+  The `[ENHANCE]` line names the result and its reason:
+  `present.surface=internal(auto: gamescope)`, `window(auto)`, `internal`.
+  The key is read once, when the window is made; the menu cannot change it.
+  The Metal window (macOS) keeps its drawable at the frame's size under
+  `internal` and lets the layer scale it, letterboxed, nearest for
+  `nearest` and linear otherwise; the macOS launcher sets no hint, so
+  `auto` gives `window` there unless `RECOMP_HOST_GAMESCOPE` is set by hand. The
+  SDL renderer window (the CPU backend) ignores the key with one line.
 - **`present.pacing`.** Only for a title generated with
   `tools.recomp --spin-waits` ([lifting](../pipeline/04-lifting.md#spin-waits)),
   whose busy-wait loops call `RECOMP_SPIN_WAIT` on their back edge. `spin`
@@ -318,6 +355,8 @@ exist only when the layer is built (`RECOMP_ENV_HAVE_ENHANCE_KEYS`):
 | `RECOMP_PRESENT_FILTER` | overrides `present.filter` |
 | `RECOMP_PRESENT_FULLSCREEN` | overrides `present.fullscreen` |
 | `RECOMP_PRESENT_PACING` | overrides `present.pacing` |
+| `RECOMP_PRESENT_SURFACE` | overrides `present.surface` |
+| `RECOMP_HOST_GAMESCOPE` | set by the SteamOS launcher (`1`) when it runs under gamescope; `present.surface = "auto"` then means `internal`. No file key binds it; a line in the bundle's `config/launch.env` overrides it |
 | `RECOMP_TEXTURES_PACK` | overrides `textures.pack` |
 | `RECOMP_TEXTURES_FONT` | overrides `textures.font` |
 | `RECOMP_TEXTURES_TEXT` | overrides `textures.text` |

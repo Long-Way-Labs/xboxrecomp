@@ -48,6 +48,19 @@ extern "C" {
     "    float4 tex_bias;\n" \
     "};\n"
 
+/** D3D8_HLSL_SNAP_UV (d3d8_hlsl.h) in MSL; pos is [[position]].xy. */
+#define D3D8_MSL_SNAP_UV \
+    "float2 nv2a_snap_uv(float2 uv, float2 pos, float4 ts) {\n" \
+    "    float2 dx = dfdx(uv), dy = dfdy(uv);\n" \
+    "    float n = ts.z, eps = 1.0 / 64.0;\n" \
+    "    if (n > 1.0 && abs(dx.y) <= eps && abs(dy.x) <= eps\n" \
+    "            && abs(abs(dx.x) * n - 1.0) <= eps && abs(abs(dy.y) * n - 1.0) <= eps) {\n" \
+    "        float2 d = (floor(pos / n) + 0.5) * n - pos;\n" \
+    "        uv += dx * d.x + dy * d.y;\n" \
+    "    }\n" \
+    "    return uv;\n" \
+    "}\n"
+
 /**
  * The vertex function `vs_main`:
  *
@@ -79,7 +92,8 @@ int d3d8_vsh_generate_msl(const NV2AVshProgram *program, unsigned flags,
  *                           texture2d<float> tex0 [[texture(0)]], sampler samp0 [[sampler(0)]],
  *                           ...one pair for each stage the state samples)
  *
- * A 3D stage gets texture3d and a cube-map stage texturecube.
+ * A 3D stage gets texture3d and a cube-map stage texturecube. With
+ * state->rect_snap, 2D stages go through D3D8_MSL_SNAP_UV.
  */
 int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
                                 char *buf, int bufsize);

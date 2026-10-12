@@ -1,8 +1,12 @@
 /* The render-scale and present helpers (nv2a_backend_common.h), and the
  * guarantee they give at stock: every one is the identity at scale 1. */
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "nv2a_backend_common.h"
+#include "d3d8_hlsl.h"
+#include "d3d8_msl.h"
 
 #define CHECK(x) do { if (!(x)) { printf("FAIL line %d: %s\n", __LINE__, #x); return 1; } } while (0)
 
@@ -33,6 +37,45 @@ static uint32_t occ_run(unsigned scale, uint64_t samples)
     nv2a_occ_zpass(&o, 0);
     nv2a_occ_report(&o, 16, 1);
     return mem[4 + 2];       /* the report's count word */
+}
+
+/* nv2a_snap_uv (D3D8_HLSL_SNAP_UV, D3D8_MSL_SNAP_UV) in C, expression for
+ * expression: the reference the shader text is checked against below. */
+static void snap_uv(float uv[2], const float pos[2], const float dx[2],
+                    const float dy[2], float n)
+{
+    const float eps = 1.0f / 64.0f;
+    if (n > 1.0f && fabsf(dx[1]) <= eps && fabsf(dy[0]) <= eps
+            && fabsf(fabsf(dx[0]) * n - 1.0f) <= eps && fabsf(fabsf(dy[1]) * n - 1.0f) <= eps) {
+        float d0 = (floorf(pos[0] / n) + 0.5f) * n - pos[0];
+        float d1 = (floorf(pos[1] / n) + 0.5f) * n - pos[1];
+        uv[0] += dx[0] * d0 + dy[0] * d1;
+        uv[1] += dx[1] * d0 + dy[1] * d1;
+    }
+}
+
+/* The texel coordinate host pixel (px, py) gets for the affine mapping
+ * uv = o + dx * px + dy * py, after the snap. */
+static int snap_at(float px, float py, float ou, float ov, float dxu, float dxv,
+                   float dyu, float dyv, float n, float eu, float ev)
+{
+    float uv[2], pos[2] = {px, py}, dx[2] = {dxu, dxv}, dy[2] = {dyu, dyv};
+    uv[0] = ou + dxu * px + dyu * py;
+    uv[1] = ov + dxv * px + dyv * py;
+    snap_uv(uv, pos, dx, dy, n);
+    return fabsf(uv[0] - eu) < 1e-3f && fabsf(uv[1] - ev) < 1e-3f;
+}
+
+static struct nv2a_stage stage(int mode, uint32_t color, uint32_t filter)
+{
+    struct nv2a_stage t;
+    memset(&t, 0, sizeof t);
+    t.mode = mode;
+    t.color = color;
+    t.filter = filter;
+    t.width = 1024;
+    t.height = 512;
+    return t;
 }
 
 int main(void)
@@ -138,9 +181,110 @@ int main(void)
     CHECK(occ_run(2, 1) == 1);
     CHECK(occ_run(2, 0) == 0);
 
+    /* ---- rect snap: which stages (tex_scale[n].z) ---- */
+    {
+        enum { LIN = 0x12, SWZ = 0x06, DXT = 0x0C };      /* A8R8G8B8 linear, swizzled; DXT1 */
+        const uint32_t bil = 2u << 16 | 2u << 24, pnt = 1u << 16 | 1u << 24;
+        const uint32_t mag_only = 1u << 16 | 2u << 24, min_only = 2u << 16 | 1u << 24;
+        struct nv2a_stage t = stage(1, LIN, bil);
+        CHECK(nv2a_rect_snap_scale(&t, 2) == 2);
+        CHECK(nv2a_rect_snap_scale(&t, 3) == 3);
+        CHECK(nv2a_rect_snap_scale(&t, 1) == 0);          /* stock: never */
+        CHECK(nv2a_rect_snap_scale(&t, 0) == 0);
+        t = stage(1, LIN, mag_only);
+        CHECK(nv2a_rect_snap_scale(&t, 2) == 2);
+        t = stage(1, LIN, min_only);
+        CHECK(nv2a_rect_snap_scale(&t, 2) == 2);
+        t = stage(1, LIN, pnt);                             /* one texel, no bleed */
+        CHECK(nv2a_rect_snap_scale(&t, 2) == 0);
+        t = stage(1, SWZ, bil);                             /* normalised coordinates */
+        CHECK(nv2a_rect_snap_scale(&t, 2) == 0);
+        t = stage(1, DXT, bil);
+        CHECK(nv2a_rect_snap_scale(&t, 2) == 0);
+        t = stage(0, LIN, bil);                             /* stage off */
+        CHECK(nv2a_rect_snap_scale(&t, 2) == 0);
+        t = stage(4, LIN, bil);                             /* pass-through */
+        CHECK(nv2a_rect_snap_scale(&t, 2) == 0);
+        t = stage(2, LIN, bil);                             /* other modes sample as 2D */
+        CHECK(nv2a_rect_snap_scale(&t, 2) == 2);
+    }
+    {
+        /* Through the fill: .z follows the host scale; a render-target
+         * stage gets 1/size and .z = 0; .w stays 0. */
+        static struct nv2a_pb_vsh v;
+        struct nv2a_stage st[4];
+        struct nv2a_ps_consts pc;
+        struct nv2a_host_opts o = { 2, NV2A_PRESENT_NEAREST, 0, 0, 0 };
+        st[0] = stage(1, 0x12, 2u << 16 | 2u << 24);
+        st[1] = stage(1, 0x06, 2u << 16 | 2u << 24);
+        st[2] = stage(4, 0x12, 2u << 16 | 2u << 24);
+        st[3] = stage(1, 0x12, 1u << 16 | 1u << 24);
+        nv2a_ps_consts_fill(&v, st, &pc);
+        CHECK(pc.tex_scale[0][2] == 0.0f && pc.tex_scale[1][2] == 0.0f);   /* scale 1 */
+        nv2a_host_opts_set(&o);
+        nv2a_ps_consts_fill(&v, st, &pc);
+        CHECK(pc.tex_scale[0][0] == 1.0f / 1024.0f && pc.tex_scale[0][1] == 1.0f / 512.0f);
+        CHECK(pc.tex_scale[0][2] == 2.0f && pc.tex_scale[0][3] == 0.0f);
+        CHECK(pc.tex_scale[1][2] == 0.0f && pc.tex_scale[2][2] == 0.0f && pc.tex_scale[3][2] == 0.0f);
+        nv2a_ps_consts_rt(&pc, 0, &st[0], 640, 480);
+        CHECK(pc.tex_scale[0][0] == 1.0f / 640.0f && pc.tex_scale[0][1] == 1.0f / 480.0f);
+        CHECK(pc.tex_scale[0][2] == 0.0f);
+        nv2a_ps_consts_rt(&pc, 1, &st[1], 640, 480);   /* swizzled: normalised, kept */
+        CHECK(pc.tex_scale[1][0] == 1.0f && pc.tex_scale[1][2] == 0.0f);
+        o.render_scale = 0;
+        nv2a_host_opts_set(&o);
+        CHECK(nv2a_host_render_scale() == 1);
+    }
+
+    /* ---- rect snap: the shader arithmetic ---- */
+    /* The movie at scale 2: guest column 639 is host 1278.5 and 1279.5,
+     * sampled at 639.25 and 639.75 before; both read 639.5, the 1x point. */
+    CHECK(snap_at(1279.5f, 600.5f, 0, 0, 0.5f, 0, 0, 0.5f, 2, 639.5f, 300.5f));
+    CHECK(snap_at(1278.5f, 600.5f, 0, 0, 0.5f, 0, 0, 0.5f, 2, 639.5f, 300.5f));
+    CHECK(snap_at(1278.5f, 601.5f, 0, 0, 0.5f, 0, 0, 0.5f, 2, 639.5f, 300.5f));
+    CHECK(snap_at(0.5f, 0.5f, 0, 0, 0.5f, 0, 0, 0.5f, 2, 0.5f, 0.5f));
+    /* Scale 3: the three host pixels of guest column 639 (639.1667,
+     * 639.5, 639.8333) all read 639.5. */
+    CHECK(snap_at(1917.5f, 1.5f, 0, 0, 1.0f / 3, 0, 0, 1.0f / 3, 3, 639.5f, 0.5f));
+    CHECK(snap_at(1918.5f, 1.5f, 0, 0, 1.0f / 3, 0, 0, 1.0f / 3, 3, 639.5f, 0.5f));
+    CHECK(snap_at(1919.5f, 1.5f, 0, 0, 1.0f / 3, 0, 0, 1.0f / 3, 3, 639.5f, 0.5f));
+    /* A flipped V (dy.y < 0) is still a unity blit. */
+    CHECK(snap_at(10.5f, 959.5f, 0, 480.0f, 0.5f, 0, 0, -0.5f, 2, 5.5f, 0.5f));
+    /* Within the 1/64 tolerance: a mapping 1/128 off unity still snaps. */
+    CHECK(snap_at(1279.5f, 0.5f, 0, 0, 0.5f + 1.0f / 256, 0, 0, 0.5f, 2,
+                  (0.5f + 1.0f / 256) * 1279.5f - (0.5f + 1.0f / 256) * 0.5f, 0.5f));
+    /* Not a unity blit: a stretch (dx.x * N = 0.933) or a cross term of
+     * 1/32 keeps the host-rate sample. */
+    CHECK(snap_at(1279.5f, 600.5f, 0, 0, 0.933f / 2, 0, 0, 0.5f, 2, 0.933f / 2 * 1279.5f, 300.25f));
+    CHECK(snap_at(1279.5f, 600.5f, 0, 0, 0.5f, 1.0f / 32, 0, 0.5f, 2, 639.75f, 300.25f + 1279.5f / 32));
+    CHECK(snap_at(1279.5f, 600.5f, 0, 0, 0.5f, 0, 1.0f / 32, 0.5f, 2, 639.75f + 600.5f / 32, 300.25f));
+    /* Magnified 2x at scale 2 (one texel per host pixel): not snapped. */
+    CHECK(snap_at(1279.5f, 600.5f, 0, 0, 0.25f, 0, 0, 0.25f, 2, 319.875f, 150.125f));
+    /* .z = 0 (stock, or not eligible) and .z = 1: the input as it is. */
+    CHECK(snap_at(1279.5f, 600.5f, 0, 0, 0.5f, 0, 0, 0.5f, 0, 639.75f, 300.25f));
+    CHECK(snap_at(639.5f, 300.5f, 0, 0, 1, 0, 0, 1, 1, 639.5f, 300.5f));
+    /* The shader text is the reference's, in both languages. */
+    {
+        static const char *const text[2] = { D3D8_HLSL_SNAP_UV, D3D8_MSL_SNAP_UV };
+        int k;
+        for (k = 0; k < 2; k++) {
+            CHECK(strstr(text[k], "float n = ts.z, eps = 1.0 / 64.0;"));
+            CHECK(strstr(text[k], "if (n > 1.0 && abs(dx.y) <= eps && abs(dy.x) <= eps\n"
+                                  "            && abs(abs(dx.x) * n - 1.0) <= eps"
+                                  " && abs(abs(dy.y) * n - 1.0) <= eps) {"));
+            CHECK(strstr(text[k], "float2 d = (floor(pos / n) + 0.5) * n - pos;"));
+            CHECK(strstr(text[k], "uv += dx * d.x + dy * d.y;"));
+        }
+        CHECK(strstr(text[0], "float2 dx = ddx(uv), dy = ddy(uv);"));
+        CHECK(strstr(text[1], "float2 dx = dfdx(uv), dy = dfdy(uv);"));
+        /* derivatives before the branch */
+        CHECK(strstr(text[0], "ddx(uv)") < strstr(text[0], "if (n > 1.0"));
+        CHECK(strstr(text[1], "dfdx(uv)") < strstr(text[1], "if (n > 1.0"));
+    }
+
     /* ---- the options round-trip; init picks the scale up ---- */
     {
-        struct nv2a_host_opts o = { 3, NV2A_PRESENT_INTEGER, 1, 0 };
+        struct nv2a_host_opts o = { 3, NV2A_PRESENT_INTEGER, 1, 0, 0 };
         nv2a_host_opts_set(&o);
         CHECK(nv2a_host_render_scale() == 3);
         CHECK(nv2a_host_opts()->present_filter == NV2A_PRESENT_INTEGER && nv2a_host_opts()->fullscreen == 1);

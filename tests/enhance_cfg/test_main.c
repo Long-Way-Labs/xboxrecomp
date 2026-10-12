@@ -923,6 +923,8 @@ static void enhance_reset_env(void)
     recomp_env_set(RENV_PRESENT_FILTER, NULL);
     recomp_env_set(RENV_PRESENT_FULLSCREEN, NULL);
     recomp_env_set(RENV_PRESENT_PACING, NULL);
+    recomp_env_set(RENV_PRESENT_SURFACE, NULL);
+    recomp_env_set(RENV_HOST_GAMESCOPE, NULL);
     recomp_env_set(RENV_TEXTURES_FONT, NULL);
     recomp_env_set(RENV_TEXTURES_TEXT, NULL);
 }
@@ -1002,6 +1004,77 @@ static void test_enhance_init(void)
     write_file("ecfg_broken.toml", "[render]\nscale = \n");
     recomp_env_set(RENV_CONFIG, "ecfg_broken.toml");
     CHECK(xbox_enhance_init(".", NULL) == -1 && o->render_scale == 1);
+
+    enhance_reset_env();
+    recomp_env_set(RENV_CONFIG, NULL);
+    enhance_cfg_shutdown();
+}
+
+/* ── present.surface: the key and the launcher's gamescope hint ────── */
+
+/* One init with key `key` and hint `hint` (NULL = unset): the resolved
+ * surface, and the [ENHANCE] line's present.surface= fragment. */
+static void check_surface(const char *key, const char *hint, int want,
+                          const char *frag, int line)
+{
+    const struct nv2a_host_opts *o = nv2a_host_opts();
+    char needle[96];
+    const char *out;
+    int ok;
+
+    recomp_env_set(RENV_PRESENT_SURFACE, key);
+    recomp_env_set(RENV_HOST_GAMESCOPE, hint);
+    capture_begin();
+    ok = xbox_enhance_init(".", NULL) == 0;
+    out = capture_end();
+    snprintf(needle, sizeof needle, " present.surface=%s (display.aspect=", frag);
+    s_checks++;
+    if (!ok || o->present_surface != want || !strstr(out, needle)) {
+        s_fail++;
+        fprintf(stderr, "FAIL %s:%d: surface key=%s hint=%s: got %d, want %d (%s)\n%s",
+                __FILE__, line, key ? key : "unset", hint ? hint : "unset",
+                o->present_surface, want, frag, out);
+    }
+}
+
+static void test_present_surface(void)
+{
+    enum { W = NV2A_PRESENT_SURFACE_WINDOW, I = NV2A_PRESENT_SURFACE_INTERNAL };
+    const char *out;
+
+    enhance_reset_env();
+    /* Unset and auto: the hint decides; only a true hint means internal. */
+    check_surface(NULL, NULL, W, "window(auto)", __LINE__);
+    check_surface(NULL, "0", W, "window(auto)", __LINE__);
+    check_surface(NULL, "1", I, "internal(auto: gamescope)", __LINE__);
+    check_surface("auto", NULL, W, "window(auto)", __LINE__);
+    check_surface("auto", "0", W, "window(auto)", __LINE__);
+    check_surface("auto", "1", I, "internal(auto: gamescope)", __LINE__);
+    /* An explicit value ignores the hint. */
+    check_surface("window", NULL, W, "window", __LINE__);
+    check_surface("window", "0", W, "window", __LINE__);
+    check_surface("window", "1", W, "window", __LINE__);
+    check_surface("internal", NULL, I, "internal", __LINE__);
+    check_surface("internal", "0", I, "internal", __LINE__);
+    check_surface("internal", "1", I, "internal", __LINE__);
+    /* An invalid value is reported (once) and read as auto. */
+    recomp_env_set(RENV_PRESENT_SURFACE, "compositor");
+    recomp_env_set(RENV_HOST_GAMESCOPE, NULL);
+    capture_begin();
+    CHECK(xbox_enhance_init(".", NULL) == 0);
+    out = capture_end();
+    CHECK(strstr(out, "[ENHANCE] RECOMP_PRESENT_SURFACE=compositor is not one of"
+                      " auto|window|internal; ignored\n") != NULL);
+    check_surface("compositor", NULL, W, "window(auto)", __LINE__);
+    check_surface("compositor", "0", W, "window(auto)", __LINE__);
+    check_surface("compositor", "1", I, "internal(auto: gamescope)", __LINE__);
+
+    /* The file's key, and the environment over it. */
+    write_file("ecfg_surface.toml", "[present]\nsurface = \"window\"\n");
+    recomp_env_set(RENV_CONFIG, "ecfg_surface.toml");
+    check_surface(NULL, "1", W, "window", __LINE__);
+    check_surface("internal", NULL, I, "internal", __LINE__);
+    CHECK(enhance_cfg_report_unused() == 0);    /* overridden, not unused */
 
     enhance_reset_env();
     recomp_env_set(RENV_CONFIG, NULL);
@@ -1178,6 +1251,7 @@ int main(void)
     test_config_files();
     test_migration();
     test_enhance_init();
+    test_present_surface();
     test_tex_pack_key();
     test_exe_dir();
     printf("enhance_cfg: %d checks, %d failed\n", s_checks, s_fail);

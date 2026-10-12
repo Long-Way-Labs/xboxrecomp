@@ -236,6 +236,11 @@ typedef struct NV2ACombinerState {
      * alpha is that factor (xemu psh.c: vec4(fogColor.rgb, clamp(vtxFog))).
      * 0: FOG is the constant fog colour, as before. */
     int fog_input;
+
+    /* 1: 2D stages sample through nv2a_snap_uv (D3D8_HLSL_SNAP_UV), which
+     * acts where tex_scale[n].z > 1. A backend flag, set at render scale
+     * > 1 so the stock shader text is unchanged; part of the cache key. */
+    int rect_snap;
 } NV2ACombinerState;
 
 /**

@@ -323,6 +323,16 @@ int nv2a_blend_constant(int enable, uint32_t sfactor, uint32_t dfactor,
     return 1;
 }
 
+unsigned nv2a_rect_snap_scale(const struct nv2a_stage *t, unsigned scale)
+{
+    if (scale <= 1 || !t->mode || t->mode == 4
+            || nv2a_tex_size_from_format(t->color)
+            || !(nv2a_tex_filter_linear(t->filter, 0)
+                 || nv2a_tex_filter_linear(t->filter, 1)))
+        return 0;
+    return scale;
+}
+
 void nv2a_ps_consts_fill(const struct nv2a_pb_vsh *v,
                          const struct nv2a_stage st[4],
                          struct nv2a_ps_consts *pc)
@@ -336,6 +346,7 @@ void nv2a_ps_consts_fill(const struct nv2a_pb_vsh *v,
         pc->tex_mode[n] = (uint32_t)t->mode;
         pc->tex_scale[n][0] = scaled || !t->width ? 1.0f : 1.0f / (float)t->width;
         pc->tex_scale[n][1] = scaled || !t->height ? 1.0f : 1.0f / (float)t->height;
+        pc->tex_scale[n][2] = (float)nv2a_rect_snap_scale(t, nv2a_host_render_scale());
     }
     for (n = 0; n < 8; n++) {
         nv2a_argb_to_float4(v->rc_f0[n], pc->c0[n]);
@@ -353,6 +364,16 @@ void nv2a_ps_consts_fill(const struct nv2a_pb_vsh *v,
     pc->alpha_ref = (float)v->atest_ref / 255.0f;
     pc->alpha_test_enable = v->atest_enable ? 1u : 0u;
     pc->alpha_func = nv2a_cmp_from_gl(v->atest_func) + 1;
+}
+
+void nv2a_ps_consts_rt(struct nv2a_ps_consts *pc, int n,
+                       const struct nv2a_stage *t, uint32_t w, uint32_t h)
+{
+    if (!nv2a_tex_size_from_format(t->color)) {
+        pc->tex_scale[n][0] = 1.0f / (float)w;
+        pc->tex_scale[n][1] = 1.0f / (float)h;
+    }
+    pc->tex_scale[n][2] = 0.0f;
 }
 
 void nv2a_vp_consts_fill(const struct nv2a_pb_vsh *v, uint32_t surface_format,

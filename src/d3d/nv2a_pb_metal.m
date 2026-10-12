@@ -190,6 +190,7 @@ static const char s_msl[] =
      * path's MODULATE, oD0 * T0 when stage 0 is on, then the alpha test
      * (D3DCMP numbering, on the 8-bit values the way the CPU compares them).
      * Line for line the D3D11 backend's s_ps_src. */
+    D3D8_MSL_SNAP_UV
     "fragment float4 fs_basic(VOut i [[stage_in]],\n"
     "                         constant PsConsts &pc [[buffer(0)]],\n"
     "                         texture2d<float> tex0 [[texture(0)]],\n"
@@ -200,6 +201,7 @@ static const char s_msl[] =
     "    } else if (pc.tex_mode.x != 0u) {\n"
     "        float2 uv = i.t0.xy;\n"
     "        if (pc.tex_mode.x == 1u && i.t0.w != 0.0 && i.t0.w != 1.0) uv /= i.t0.w;\n"
+    "        uv = nv2a_snap_uv(uv, i.pos.xy, pc.tex_scale[0]);\n"
     "        c *= tex0.sample(samp0, uv * pc.tex_scale[0].xy, bias(pc.tex_bias.x));\n"
     "    }\n"
     "    if (pc.atest.z != 0u) {\n"
@@ -1670,9 +1672,9 @@ static uint32_t fnv(const void *p, size_t n)
 static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v)
 {
     static char msl[65536];
-    static struct { int valid; uint32_t r[36]; id<MTLFunction> fn; } memo;
+    static struct { int valid; uint32_t r[37]; id<MTLFunction> fn; } memo;
     NV2ACombinerState st;
-    uint32_t key[36], modes = 0, hash;
+    uint32_t key[37], modes = 0, hash;
     FsEntry *e = NULL;
     char what[32];
     int n;
@@ -1694,6 +1696,8 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v)
     key[33] = v->rc_fcw0;
     key[34] = v->rc_fcw1;
     key[35] = modes;
+    /* render.scale changes at run time: each scale class has its own text */
+    key[36] = nv2a_host_render_scale() > 1;
     if (memo.valid && !memcmp(memo.r, key, sizeof key))
         return memo.fn;
 
@@ -1701,6 +1705,7 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v)
     d3d8_combiners_from_regs(v->rc_cicw, v->rc_aicw, v->rc_cocw, v->rc_aocw,
                              v->rc_ctl, v->rc_fcw0, v->rc_fcw1, modes, &st);
     st.fog_input = 1;   /* FOG.a is the interpolated vertex fog factor */
+    st.rect_snap = (int)key[36];   /* nv2a_snap_uv; in the hash via st */
     hash = fnv(&st, sizeof st);
     if (!s_fs && !(s_fs = (FsEntry *)calloc(FS_MAX, sizeof *s_fs)))
         return s_fs_basic;
@@ -2021,11 +2026,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                 textured = 1;
                 if ((src = rt_texture(t, rt)) != NULL) {
                     stex[k] = src->tex;
-                    /* Linear coordinates are texels of the surface as drawn. */
-                    if (!nv2a_tex_size_from_format(t->color)) {
-                        mpc.b.tex_scale[k][0] = 1.0f / (float)src->w;
-                        mpc.b.tex_scale[k][1] = 1.0f / (float)src->h;
-                    }
+                    nv2a_ps_consts_rt(&mpc.b, k, t, src->w, src->h);
                     s_rtt_binds++;
                 } else {
                     stex[k] = tex_bind(t);

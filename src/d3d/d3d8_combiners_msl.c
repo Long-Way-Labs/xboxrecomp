@@ -83,6 +83,8 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
     EMIT("%s", D3D8_MSL_PSCONSTS);
     EMIT("%s", D3D8_MSL_VOUT);
     EMIT("%s", s_rc_helpers);
+    if (state->rect_snap)
+        EMIT("%s", D3D8_MSL_SNAP_UV);
 
     EMIT("fragment float4 fs_main(VOut i [[stage_in]],\n"
          "                        constant PsConsts &pc [[buffer(0)]]");
@@ -130,6 +132,8 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
                 /* As the HLSL: only true 2D stages divide by q. */
                 EMIT("        if (pc.tex_mode[%d] == 1u && i.t%d.w != 0.0 && i.t%d.w != 1.0)"
                      " uv /= i.t%d.w;\n", i, i, i, i);
+            if (state->rect_snap)
+                EMIT("        uv = nv2a_snap_uv(uv, i.pos.xy, pc.tex_scale[%d]);\n", i);
             EMIT("        x%d = tex%d.sample(samp%d, uv * pc.tex_scale[%d].xy,"
                  " bias(pc.tex_bias[%d]));\n", 8 + i, i, i, i, i);
             EMIT("    }\n");

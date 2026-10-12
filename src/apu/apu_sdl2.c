@@ -9,10 +9,13 @@
  * why the pacing marks keep at least one device buffer queued.
  *
  * Headless runs (RECOMP_HEADLESS=1) use SDL's "dummy" driver unless
- * SDL_AUDIODRIVER is already set: it drains the queue in real time without
- * a device, so pacing and the WAV tap behave as on a real device and nothing
- * reaches the speakers. SDL_AUDIODRIVER=coreaudio (or pulseaudio, pipewire)
- * with RECOMP_HEADLESS=1 is the way to hear a headless run.
+ * SDL_AUDIODRIVER is already set, so nothing reaches the speakers.
+ * SDL_AUDIODRIVER=coreaudio (or pulseaudio, pipewire) with RECOMP_HEADLESS=1
+ * is the way to hear a headless run. The dummy driver's own drain is a sleep
+ * loop that runs 1-7% off 48 kHz and moves with load, and the
+ * pacing would make that the guest's audio clock; on it the queue is a
+ * virtual device clocked by CLOCK_MONOTONIC instead (apu_vclock.h), and the
+ * SDL device stays paused and empty.
  */
 
 #include <stdint.h>
@@ -20,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "apu_xaudio2.h"
+#include "apu_vclock.h"
 #include "recomp_env.h"
 
 #if !defined(_WIN32)
@@ -49,6 +53,10 @@ static uint64_t  g_samples_queued;  /* samples handed to the queue, ever */
 static unsigned  g_underruns;
 static int       g_dry;
 static int64_t   g_underrun_logged_ms;
+/* The dummy driver: the virtual device replaces SDL's queue. Only the APU
+ * frame thread submits and queries, so it needs no lock. */
+static int        g_virtual;
+static apu_vclock g_vclock;
 
 static int env_int(recomp_env_id id, int def, int lo, int hi)
 {
@@ -58,11 +66,24 @@ static int env_int(recomp_env_id id, int def, int lo, int hi)
     return v;
 }
 
-static int64_t now_ms(void)
+static int64_t now_ns(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+
+static int64_t now_ms(void)
+{
+    return now_ns() / 1000000;
+}
+
+/* Frames queued and not yet played, from SDL or the virtual device. */
+static uint64_t queued_frames(void)
+{
+    if (!g_virtual)
+        return SDL_GetQueuedAudioSize(g_dev) / (SDLA_CHANNELS * sizeof(int16_t));
+    return apu_vclock_queued(&g_vclock, now_ns());
 }
 
 int xa2_init(void)
@@ -118,14 +139,18 @@ int xa2_init(void)
 
     g_frames_written = 0;
     g_dry = 0;
-    g_initialized = 1;
-    SDL_PauseAudioDevice(g_dev, 0);
-
     driver = SDL_GetCurrentAudioDriver();
+    g_virtual = driver && !strcmp(driver, "dummy");
+    if (g_virtual)
+        apu_vclock_init(&g_vclock, SDLA_SAMPLE_RATE);
+    g_initialized = 1;
+    /* The dummy device stays paused: the virtual one plays instead. */
+    SDL_PauseAudioDevice(g_dev, g_virtual);
+
     fprintf(stderr, "[SDL2] audio initialized: driver %s (%d Hz stereo 16-bit, %d x %d-sample buffers, %.1f ms queued max)%s\n",
             driver ? driver : "?", SDLA_SAMPLE_RATE, g_num_bufs, g_buf_samples,
             1000.0 * g_num_bufs * g_buf_samples / SDLA_SAMPLE_RATE,
-            driver && !strcmp(driver, "dummy") ? " [silent: no device output]" : "");
+            g_virtual ? " [silent: no device output, virtual 48 kHz clock]" : "");
     return 1;
 }
 
@@ -158,7 +183,9 @@ int xa2_is_active(void)
 int xa2_submit_samples(const int16_t *samples, int num_samples)
 {
     if (!g_initialized || !g_dev || num_samples <= 0) return 0;
-    if (SDL_QueueAudio(g_dev, samples,
+    if (g_virtual)
+        apu_vclock_submit(&g_vclock, (uint32_t)num_samples, now_ns());
+    else if (SDL_QueueAudio(g_dev, samples,
                        (Uint32)num_samples * SDLA_CHANNELS * sizeof(int16_t)) != 0) {
         fprintf(stderr, "[SDL2] SDL_QueueAudio failed: %s\n", SDL_GetError());
         return 0;
@@ -180,18 +207,20 @@ int xa2_get_buffer_count(void)
 
 /* Samples queued and not yet pulled by the device thread. The device holds
  * up to one more buffer in flight, which this does not count, the same way
- * XAudio2's BuffersQueued does not count the one playing. Also the underrun
+ * XAudio2's BuffersQueued does not count the one playing. On the dummy
+ * driver the virtual clock drains continuously instead, so nothing is in
+ * flight and this is exactly what is left to play. Also the underrun
  * detector: an empty queue after audio has started means the device's last
  * pull was short and padded with silence; counted once per dry spell and
  * reported at most once a second. A drain announced by xa2_expect_drain
  * (the frame thread pausing) is not one. */
 int xa2_queued_samples(void)
 {
-    Uint32 bytes;
+    uint64_t frames;
 
     if (!g_initialized || !g_dev) return 0;
-    bytes = SDL_GetQueuedAudioSize(g_dev);
-    if (bytes == 0 && g_frames_written > 0) {
+    frames = queued_frames();
+    if (frames == 0 && g_frames_written > 0) {
         if (!g_dry) {
             int64_t now = now_ms();
             g_dry = 1;
@@ -204,7 +233,7 @@ int xa2_queued_samples(void)
     } else {
         g_dry = 0;
     }
-    return (int)(bytes / (SDLA_CHANNELS * sizeof(int16_t)));
+    return (int)frames;
 }
 
 void xa2_expect_drain(void)
@@ -218,13 +247,15 @@ unsigned xa2_underruns(void)
 }
 
 /* What the device thread has pulled off the queue; it pulls one device
- * buffer per callback, so this leads the speaker by up to one buffer. */
+ * buffer per callback, so this leads the speaker by up to one buffer. On
+ * the dummy driver it is the virtual clock's play position, which drains
+ * continuously and so has no such lead. */
 uint64_t xa2_samples_played(void)
 {
     uint64_t queued;
 
     if (!g_initialized || !g_dev) return 0;
-    queued = SDL_GetQueuedAudioSize(g_dev) / (SDLA_CHANNELS * sizeof(int16_t));
+    queued = queued_frames();
     return g_samples_queued > queued ? g_samples_queued - queued : 0;
 }
 

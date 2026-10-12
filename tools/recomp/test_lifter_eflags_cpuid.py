@@ -180,10 +180,13 @@ class TextTest(unittest.TestCase):
         self.assertIn("if (_cf)", out)
 
     def test_pushfd_marks_flags_its_setter_cannot_rebuild(self):
-        add = _insn("add", [_reg("eax"), _reg("ebx")])
-        lifter, out, _ = _lift_block([add, _insn("pushfd")], needs_cf=True)
-        self.assertIn('RECOMP_UNIMPL("pushfd: PF,OF not rebuilt from add, '
+        # cmp/sub/add/and/or/xor rebuild every flag
+        # (test_lifter_pushfd_arith.py); adc does not have OF or PF yet.
+        adc = _insn("adc", [_reg("eax"), _reg("ebx")])
+        lifter, out, _ = _lift_block([adc, _insn("pushfd")], needs_cf=True)
+        self.assertIn('RECOMP_UNIMPL("pushfd: PF,OF not rebuilt from adc, '
                       'read as 0"', out)
+        self.assertIn("pushfd (flags)", lifter.unimplemented)
         cmp_ = _insn("cmp", [_reg("eax"), _reg("ebx")])
         lifter, out, _ = _lift_block([cmp_, _insn("pushfd")])
         # cmp answers jo/jno exactly (the AND of a test is a cmp against

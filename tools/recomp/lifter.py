@@ -722,13 +722,20 @@ def _make_condition(jcc, flag_setter, flag_ops):
         return (f"(({_sf_utype})(({_sf_utype})({a}) - ({_sf_utype})({b}))"
                 f" >> {_sf_top})")
 
-    # OF of a - b: the operands differ in sign and the result's sign differs
-    # from a's. Unsigned at the operand's width, for the same reason as SF.
-    def _of_of_difference(a, b):
+    # OF is set when the operands' signs make the result's sign impossible:
+    # for a - b, a and b differ in sign and the result's sign is not a's
+    # (-128 - 1 wraps to 127 at 8 bits); for a + b, a and b agree and the
+    # result's does not. Like SF, it is the top bit at the operand's width,
+    # done in the unsigned type so nothing overflows in C. r is the result,
+    # given separately because sub and add only kept the result and the
+    # source, and recover a from them.
+    def _of_of(a, b, r, is_add=False):
         t = _sf_utype
-        return (f"(({t})((({t})({a}) ^ ({t})({b}))"
-                f" & (({t})({a}) ^ ({t})(({t})({a}) - ({t})({b}))))"
-                f" >> {_sf_top})")
+        signs = f"(({t})({a}) ^ ({t})({b}))"
+        if is_add:
+            signs = f"(({t})~{signs})"
+        return (f"((({t})({signs} & (({t})({a}) ^ ({t})({r})))) "
+                f">> {_sf_top})")
 
     # ── bsf/bsr: ZF is the only flag they define ──
     #
@@ -757,10 +764,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
             return f"(!RECOMP_PARITY8(({lhs}) - ({rhs})))", desc
         # Every test is a cmp against zero now (normalise_zero_test), so this
         # arm also answers `test; jo`, which reads 0 here as it must.
-        if jcc == "jo":
-            return f"({_of_of_difference(lhs, rhs)} != 0)", desc
-        if jcc == "jno":
-            return f"({_of_of_difference(lhs, rhs)} == 0)", desc
+        if jcc in ("jo", "jno"):
+            of = _of_of(lhs, rhs, f"({lhs}) - ({rhs})")
+            return (f"({of} != 0)" if jcc == "jo" else f"({of} == 0)"), desc
         return None
 
     # ── test: flags from (a & b), operands unchanged ──
@@ -831,6 +837,14 @@ def _make_condition(jcc, flag_setter, flag_ops):
             return f"({slhs} <= 0)", desc
         if jcc in ("jg", "jnle"):
             return f"({slhs} > 0)", desc
+        # OF from the original a = result + b; PF from the result's low byte.
+        if jcc in ("jo", "jno") and rhs:
+            of = _of_of(f"({lhs}) + ({rhs})", rhs, lhs)
+            return (f"({of} != 0)" if jcc == "jo" else f"({of} == 0)"), desc
+        if jcc in ("jp", "jpe"):
+            return f"RECOMP_PARITY8({lhs})", desc
+        if jcc in ("jnp", "jpo"):
+            return f"(!RECOMP_PARITY8({lhs}))", desc
         return None
 
     # ── add: a = a + b, flags from result ──
@@ -855,6 +869,14 @@ def _make_condition(jcc, flag_setter, flag_ops):
             return f"({slhs} <= 0)", desc
         if jcc in ("jg", "jnle"):
             return f"({slhs} > 0)", desc
+        # OF from the original a = result - b; PF from the result's low byte.
+        if jcc in ("jo", "jno") and rhs:
+            of = _of_of(f"({lhs}) - ({rhs})", rhs, lhs, is_add=True)
+            return (f"({of} != 0)" if jcc == "jo" else f"({of} == 0)"), desc
+        if jcc in ("jp", "jpe"):
+            return f"RECOMP_PARITY8({lhs})", desc
+        if jcc in ("jnp", "jpo"):
+            return f"(!RECOMP_PARITY8({lhs}))", desc
         return None
 
     # ── adc/sbb: result-based (like add/sub but with carry) ──
@@ -897,6 +919,14 @@ def _make_condition(jcc, flag_setter, flag_ops):
             return f"({lhs} == 0)", desc
         if jcc in ("ja", "jnbe"):
             return f"({lhs} != 0)", desc
+        if jcc == "jo":
+            return "0", desc  # OF=0 after and/or/xor
+        if jcc == "jno":
+            return "1", desc
+        if jcc in ("jp", "jpe"):
+            return f"RECOMP_PARITY8({lhs})", desc
+        if jcc in ("jnp", "jpo"):
+            return f"(!RECOMP_PARITY8({lhs}))", desc
         return None
 
     # ── dec/inc: result-based, CF unchanged ──

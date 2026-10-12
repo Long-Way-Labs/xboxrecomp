@@ -138,6 +138,7 @@ int xa2_init(void)
     }
 
     g_frames_written = 0;
+    g_samples_queued = 0;
     g_dry = 0;
     driver = SDL_GetCurrentAudioDriver();
     g_virtual = driver && !strcmp(driver, "dummy");

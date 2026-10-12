@@ -161,7 +161,7 @@ static DWORD WINAPI apu_trace_reporter(LPVOID unused)
 static int apu_trace_on(void)
 {
     if (s_trace < 0) {
-        s_trace = recomp_env(RENV_APU_TRACE) != NULL;
+        s_trace = recomp_env_on(RENV_APU_TRACE);
         QueryPerformanceFrequency(&s_qpf);
     }
     return s_trace;

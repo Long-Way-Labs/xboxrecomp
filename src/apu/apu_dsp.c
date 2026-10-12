@@ -166,6 +166,15 @@ void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
 
 void mcpx_apu_dsp_init(MCPXAPUState *d)
 {
+    /* The doorbell ack's state is file-static, so it outlives an instance:
+     * the =auto slot is a host pointer into the last instance's RAM, and a
+     * title that programs the same GPSADDR again would have its doorbell
+     * acked there, never in its own. Start from what a fresh process has. */
+    s_dsp_ack_count = -1;                  /* re-read on the first poll */
+    s_dsp_ack_auto = 0;
+    s_dsp_ack_auto_sge = 0;
+    s_dsp_ack_auto_slot = NULL;
+
     /* Allocate minimal DSP state for GP and EP.
      * We need these to exist so reset doesn't crash,
      * but they won't actually run DSP programs. */
@@ -179,6 +188,17 @@ void mcpx_apu_dsp_init(MCPXAPUState *d)
     d->ep.realtime = false;
 
     fprintf(stderr, "[APU] DSP GP/EP initialized (STUBBED - passthrough mode)\n");
+}
+
+/* Called after the frame thread is joined. Only mcpx_apu_reset_locked
+ * (currently uncalled) reads this state, and it would run on that thread.
+ * Safe to call twice. */
+void mcpx_apu_dsp_finalize(MCPXAPUState *d)
+{
+    free(d->gp.dsp);
+    free(d->ep.dsp);
+    d->gp.dsp = NULL;
+    d->ep.dsp = NULL;
 }
 
 void mcpx_apu_update_dsp_preference(MCPXAPUState *d)

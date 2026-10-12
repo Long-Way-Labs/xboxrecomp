@@ -313,7 +313,10 @@ static void apu_isr_on_holder(void)
 
 static void apu_deliver_irq(MCPXAPUState *d)
 {
-    static int tib_ready;
+    /* Per thread, like the g_fs_base it guards: a new instance's frame
+     * thread is a new OS thread and needs its own TIB. g_fs_base itself
+     * cannot tell, as every thread starts at the main thread's TIB. */
+    static APU_TLS int tib_ready;
     static unsigned held_off;
     uint32_t kint, routine;
     int slot, how;
@@ -1122,6 +1125,9 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     g_apu_ram_ptr = ram_ptr;
     g_state = d;
     d->ram_ptr = ram_ptr;
+    /* A line left up by a previous instance would call the guest ISR
+     * against this one's empty ISTS. */
+    InterlockedExchange(&s_irq_line, 0);
 
     /* RECOMP_DEBUG=apu_solo=<voice>: mute every other voice in the mix, for
      * telling which voice a sound (or a noise) comes from. */
@@ -1189,12 +1195,20 @@ void mcpx_apu_shutdown(MCPXAPUState *d)
     qemu_cond_signal(&d->cond);
     qemu_mutex_unlock(&d->lock);
 
+    /* Everything below is freed only once the frame thread has returned.
+     * g_state is cleared before the teardown, so a mixer start that begins
+     * after this point finds no instance; a play already in flight is not
+     * serialised against shutdown. */
     qemu_thread_join(&d->apu_thread);
+    g_state = NULL;
     mcpx_apu_vp_finalize(d);
+    mcpx_apu_dsp_finalize(d);
     mcpx_apu_monitor_finalize(d);
 
+    qemu_cond_destroy(&d->idle_cond);
+    qemu_cond_destroy(&d->cond);
+    qemu_mutex_destroy(&d->lock);
     free(d);
-    g_state = NULL;
     fprintf(stderr, "[APU] Shutdown complete\n");
 }
 

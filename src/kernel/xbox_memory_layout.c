@@ -774,8 +774,13 @@ static void ac97_arm_write_trap(void)
 
 #define MMIO_APU_BASE 0xFE800000u   /* what MemoryLayoutInit unmaps for the APU */
 #define MMIO_APU_END  0xFE880000u
+/* The part of that window MemoryLayoutInit actually traps: registers and the
+ * voice processor. The GP and EP DSP memories above stay RAM (see there).
+ * tools/recomp/lifter.py APU_MMIO_TRAP_HI is the same bound. */
+#define APU_TRAP_BYTES 0x00030000u
 
 extern MCPXAPUState *g_apu_state;   /* apu_mmio_hook.c; NULL until audio is up */
+static int g_apu_mmio_trapped;      /* defined with the MCPX state below */
 
 /* The guest VA a host fault address names. Only an address inside the 4 GB
  * guest window names one: truncating the offset to 32 bits would let a host
@@ -789,6 +794,42 @@ static int mmio_fault_va(uintptr_t fault, uint32_t *va)
         return 0;
     *va = (uint32_t)rel;
     return 1;
+}
+
+/* A constant-address mov into the trapped APU window, called from generated
+ * code (XBOX_MMIO_R and _W in recomp_types.h) instead of faulting. Under Proton
+ * each fault is a Wine exception dispatch of about 51 us, and DirectSound
+ * makes thousands of these accesses a second in play. The model is called
+ * under exactly the conditions in which the same access would fault and be
+ * serviced; otherwise (audio off, the model not up yet, an offset the trap
+ * does not cover) this is the plain access the generated code made before,
+ * at the same width, faulting just as it did. */
+uint32_t xbox_MmioRead(uint32_t va, int size)
+{
+    uint32_t off = va - MMIO_APU_BASE;
+
+    if (g_apu_mmio_trapped && off < APU_TRAP_BYTES && g_apu_state)
+        return apu_hook_direct_rd(off, size);
+    switch (size) {
+    case 1:  return *(volatile uint8_t *)((uintptr_t)va + g_memory_offset);
+    case 2:  return *(volatile uint16_t *)((uintptr_t)va + g_memory_offset);
+    default: return *(volatile uint32_t *)((uintptr_t)va + g_memory_offset);
+    }
+}
+
+void xbox_MmioWrite(uint32_t va, uint32_t value, int size)
+{
+    uint32_t off = va - MMIO_APU_BASE;
+
+    if (g_apu_mmio_trapped && off < APU_TRAP_BYTES && g_apu_state) {
+        apu_hook_direct_wr(off, value, size);
+        return;
+    }
+    switch (size) {
+    case 1:  *(volatile uint8_t *)((uintptr_t)va + g_memory_offset) = (uint8_t)value; break;
+    case 2:  *(volatile uint16_t *)((uintptr_t)va + g_memory_offset) = (uint16_t)value; break;
+    default: *(volatile uint32_t *)((uintptr_t)va + g_memory_offset) = value; break;
+    }
 }
 
 #if defined(_WIN32)
@@ -988,7 +1029,7 @@ static void *g_mcpx_regs = NULL;
  * emulated APU. Once that happens they are no longer plain memory, and the
  * counter ticking below must leave them alone -- writing through the pointer
  * faults, and the emulated APU owns those registers anyway. */
-static int g_apu_mmio_trapped = 0;
+static int g_apu_mmio_trapped = 0;   /* declared above, with xbox_MmioRead */
 
 /*
  * GPU completion fences the title waits on in guest memory rather than in the
@@ -3665,7 +3706,6 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                  * (apu_hook_handle_mmio_posix) sees only this range. 0x30000
                  * is a multiple of 16 KB, so macOS arm64 pages split at the
                  * same place. */
-                enum { APU_TRAP_BYTES = 0x00030000 };
                 DWORD old_protect;
                 if (VirtualProtect((char *)g_mcpx_memory, APU_TRAP_BYTES,
                                    PAGE_NOACCESS, &old_protect))
@@ -4058,6 +4098,8 @@ void xbox_MemoryLayoutShutdown(void)
         VirtualFree(g_mcpx_memory, 0, MEM_RELEASE);
         g_mcpx_memory = NULL;
     }
+    /* xbox_MmioRead/Write route by this; a second init re-arms it. */
+    g_apu_mmio_trapped = 0;
     if (g_flash_memory) {
         VirtualFree(g_flash_memory, 0, MEM_RELEASE);
         g_flash_memory = NULL;

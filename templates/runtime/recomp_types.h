@@ -589,6 +589,20 @@ void recomp_trace_esp(const char *name, const char *tag);
 #define MEM16(addr)  (*(volatile uint16_t *)XBOX_PTR(addr))
 #define MEM32(addr)  (*(volatile uint32_t *)XBOX_PTR(addr))
 
+/** A mov at a constant address in the trapped APU window (0xFE800000-
+ *  0xFE82FFFF). The lifter emits these instead of MEMxx so the access calls
+ *  the APU model directly rather than taking a page fault, which costs about
+ *  51 us under Proton. xbox_memory_layout.c falls back to the plain access
+ *  when audio is off. A store is one statement, like `MEM32(a) = v;`. */
+uint32_t xbox_MmioRead(uint32_t va, int size);
+void xbox_MmioWrite(uint32_t va, uint32_t value, int size);
+#define XBOX_MMIO_R8(addr)      ((uint8_t)xbox_MmioRead((addr), 1))
+#define XBOX_MMIO_R16(addr)     ((uint16_t)xbox_MmioRead((addr), 2))
+#define XBOX_MMIO_R32(addr)     xbox_MmioRead((addr), 4)
+#define XBOX_MMIO_W8(addr, v)   xbox_MmioWrite((addr), (uint8_t)(v), 1)
+#define XBOX_MMIO_W16(addr, v)  xbox_MmioWrite((addr), (uint16_t)(v), 2)
+#define XBOX_MMIO_W32(addr, v)  xbox_MmioWrite((addr), (uint32_t)(v), 4)
+
 /** Signed memory reads. */
 #define SMEM8(addr)  (*(volatile int8_t   *)XBOX_PTR(addr))
 #define SMEM16(addr) (*(volatile int16_t  *)XBOX_PTR(addr))

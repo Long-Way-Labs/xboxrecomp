@@ -259,6 +259,12 @@ void xbox_ProtectMirrorsForDebug(void);
  *   xbox_VehMmioFault   Win32 VEH: the PEXCEPTION_POINTERS.
  *   xbox_PosixMmioFault POSIX SIGBUS/SIGSEGV handler: its ucontext_t * and
  *                       si_addr. Always 0 on a host with no decoder. */
+/* A constant-address mov into the trapped APU window, from generated code
+ * (XBOX_MMIO_R and _W): the APU model when the access would fault and be
+ * serviced, else the plain guest access at that width. size is 1, 2 or 4. */
+uint32_t xbox_MmioRead(uint32_t va, int size);
+void xbox_MmioWrite(uint32_t va, uint32_t value, int size);
+
 #if defined(_WIN32)
 int xbox_VehMmioFault(void *exception_pointers);
 #else

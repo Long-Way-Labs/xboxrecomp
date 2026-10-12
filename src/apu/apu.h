@@ -36,6 +36,14 @@ double apu_hook_fault_bench(unsigned n);
  * variable is unset, or off Windows). */
 void apu_hook_trace_start(void);
 
+/* One APU register access made without a fault: generated code calls these
+ * (through xbox_MmioRead/xbox_MmioWrite) for a mov at a constant address in
+ * the trapped window. Same model path, size handling and RECOMP_APU_TRACE
+ * tallies as the fault handlers; off is from 0xFE800000, size 1, 2 or 4. The
+ * caller has checked g_apu_state. */
+uint32_t apu_hook_direct_rd(uint32_t off, int size);
+void apu_hook_direct_wr(uint32_t off, uint32_t v, int size);
+
 /* Play a 440Hz test tone through the APU pipeline to verify audio output.
  * Directly programs a voice without going through DirectSound. */
 void mcpx_apu_play_test_tone(MCPXAPUState *d);

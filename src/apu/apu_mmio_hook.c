@@ -104,17 +104,20 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
  * thread prints a stats line every 10 s and the per-offset table every 30 s
  * (periodic, because a watchdog exit or a SIGINT never reaches atexit):
  *
- *   [APUMMIO-STATS] t=..s reads=N (+n/s) writes=N (+n/s) fails=N handler=..us
+ *   [APUMMIO-STATS] t=..s reads=N (+n/s) writes=N (+n/s) direct=N fails=N
+ *                   handler=..us
  *   [APUMMIO-HIST] 0xOFFSET r=N w=N lastw=VALUE
  *
- * handler is the time spent inside the decoder and model per access; the
- * exception round trip around it is not visible from here (see
- * apu_hook_fault_bench). */
+ * reads and writes count every access; direct is the part that came through
+ * apu_hook_direct_rd/_wr (a constant-address mov in generated code) rather
+ * than a fault, so reads + writes - direct is what still traps. handler is
+ * the time spent inside the decoder and model per access; the exception
+ * round trip around it is not visible from here (see apu_hook_fault_bench). */
 #define APU_HIST_SLOTS (APU_MMIO_SIZE / 4)
 static int s_trace = -1;               /* looked up once, not per access */
 static volatile LONG s_hist_r[APU_HIST_SLOTS], s_hist_w[APU_HIST_SLOTS];
 static volatile uint32_t s_hist_lastw[APU_HIST_SLOTS];
-static volatile LONG64 s_tot_r, s_tot_w, s_handler_ticks;
+static volatile LONG64 s_tot_r, s_tot_w, s_direct, s_handler_ticks;
 static volatile LONG s_reporter_started;
 /* Set by apu_hook_fault_bench (apu_fault_bench.c) while it runs. */
 volatile LONG g_apu_hook_bench_active;
@@ -124,12 +127,12 @@ static void apu_trace_report(int with_table, double t)
 {
     static LONG64 prev_r, prev_w;
     static double prev_t;
-    LONG64 r = s_tot_r, w = s_tot_w, ticks = s_handler_ticks;
+    LONG64 r = s_tot_r, w = s_tot_w, d = s_direct, ticks = s_handler_ticks;
     double dt = t - prev_t > 0 ? t - prev_t : 1;
     fprintf(stderr, "[APUMMIO-STATS] t=%.1fs reads=%lld (+%.0f/s) writes=%lld"
-            " (+%.0f/s) fails=%d handler=%.2fus/access\n", t,
+            " (+%.0f/s) direct=%lld fails=%d handler=%.2fus/access\n", t,
             (long long)r, (r - prev_r) / dt, (long long)w, (w - prev_w) / dt,
-            g_apu_mmio_decode_fail,
+            (long long)d, g_apu_mmio_decode_fail,
             (r + w) ? (double)ticks * 1e6 / (double)s_qpf.QuadPart / (double)(r + w)
                     : 0.0);
     prev_r = r; prev_w = w; prev_t = t;
@@ -181,22 +184,12 @@ void apu_hook_trace_start(void)
     }
 }
 
-bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
-                          uint32_t fault_xbox_va, int is_write)
+/* Tally one traced access, faulted or direct. rval is the value a read
+ * returned when the caller has it; a fault handler does not (the decoder put
+ * it straight in a register), so the listing reads the model again. */
+static void apu_trace_tally(uint32_t mmio_offset, int is_write, bool ok,
+                            const uint32_t *rval)
 {
-    uint32_t mmio_offset = fault_xbox_va - APU_MMIO_BASE;
-    LARGE_INTEGER a, b;
-    int trace = apu_trace_on() && !g_apu_hook_bench_active;
-
-    (void)fault_addr;
-    if (trace)
-        QueryPerformanceCounter(&a);
-    bool ok = apu_decode_and_handle(ctx, mmio_offset, is_write);
-    if (!trace)
-        return ok;
-    QueryPerformanceCounter(&b);
-    InterlockedExchangeAdd64(&s_handler_ticks, b.QuadPart - a.QuadPart);
-
     if (mmio_offset < APU_MMIO_SIZE) {
         uint32_t slot = mmio_offset >> 2;
         if (is_write) {
@@ -220,6 +213,7 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
              * goes past, and an offset alone never shows it. A write shows the
              * value written; a read, what the model returned. */
             uint64_t v = is_write ? s_last_wval
+                       : rval ? *rval
                        : g_apu_state
                        ? mcpx_apu_mmio_read(g_apu_state, mmio_offset, 4) : 0;
             fprintf(stderr, "  [APUMMIO] %s 0x%05X = %08X%s\n",
@@ -227,7 +221,59 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
                     (uint32_t)v, ok ? "" : "  (decode failed)");
         }
     }
+}
+
+bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
+                          uint32_t fault_xbox_va, int is_write)
+{
+    uint32_t mmio_offset = fault_xbox_va - APU_MMIO_BASE;
+    LARGE_INTEGER a, b;
+    int trace = apu_trace_on() && !g_apu_hook_bench_active;
+
+    (void)fault_addr;
+    if (trace)
+        QueryPerformanceCounter(&a);
+    bool ok = apu_decode_and_handle(ctx, mmio_offset, is_write);
+    if (!trace)
+        return ok;
+    QueryPerformanceCounter(&b);
+    InterlockedExchangeAdd64(&s_handler_ticks, b.QuadPart - a.QuadPart);
+    apu_trace_tally(mmio_offset, is_write, ok, NULL);
     return ok;
+}
+
+uint32_t apu_hook_direct_rd(uint32_t off, int size)
+{
+    LARGE_INTEGER a, b;
+    int trace = apu_trace_on() && !g_apu_hook_bench_active;
+    uint32_t v;
+
+    if (trace)
+        QueryPerformanceCounter(&a);
+    v = (uint32_t)apu_mmio_rd(g_apu_state, off, size);
+    if (!trace)
+        return v;
+    QueryPerformanceCounter(&b);
+    InterlockedExchangeAdd64(&s_handler_ticks, b.QuadPart - a.QuadPart);
+    InterlockedIncrement64(&s_direct);
+    apu_trace_tally(off, 0, true, &v);
+    return v;
+}
+
+void apu_hook_direct_wr(uint32_t off, uint32_t v, int size)
+{
+    LARGE_INTEGER a, b;
+    int trace = apu_trace_on() && !g_apu_hook_bench_active;
+
+    if (trace)
+        QueryPerformanceCounter(&a);
+    apu_mmio_wr(g_apu_state, off, v, size);
+    if (!trace)
+        return;
+    QueryPerformanceCounter(&b);
+    InterlockedExchangeAdd64(&s_handler_ticks, b.QuadPart - a.QuadPart);
+    InterlockedIncrement64(&s_direct);
+    apu_trace_tally(off, 1, true, NULL);
 }
 
 #endif /* _WIN32 */
@@ -252,7 +298,7 @@ static uint64_t s_now_ns(void)
 }
 
 static int s_trace = -1;
-static volatile uint64_t s_tot_r, s_tot_w, s_handler_ns;
+static volatile uint64_t s_tot_r, s_tot_w, s_direct, s_handler_ns;
 static volatile uint32_t s_hist_r[APU_MMIO_SIZE / 4], s_hist_w[APU_MMIO_SIZE / 4];
 static volatile uint32_t s_hist_lastw[APU_MMIO_SIZE / 4];
 static int g_apu_mmio_decode_fail;
@@ -294,9 +340,10 @@ static void *apu_trace_reporter(void *unused)
         nanosleep(&ts, NULL);
         r = s_tot_r; w = s_tot_w; ns = s_handler_ns; now = s_now_ns();
         fprintf(stderr, "[APUMMIO-STATS] t=%.1fs reads=%llu (+%.0f/s) writes=%llu"
-                " (+%.0f/s) fails=%d handler=%.2fus/access\n",
+                " (+%.0f/s) direct=%llu fails=%d handler=%.2fus/access\n",
                 (now - t0) / 1e9, (unsigned long long)r, (r - prev_r) / 10.0,
-                (unsigned long long)w, (w - prev_w) / 10.0, g_apu_mmio_decode_fail,
+                (unsigned long long)w, (w - prev_w) / 10.0,
+                (unsigned long long)s_direct, g_apu_mmio_decode_fail,
                 (r + w) ? (double)ns / 1e3 / (double)(r + w) : 0.0);
         prev_r = r; prev_w = w;
         if (++k % 3 == 0) {
@@ -323,6 +370,56 @@ void apu_hook_trace_start(void)
         pthread_detach(th);
 }
 
+/* Tally one traced access, faulted or direct; rval as on Win32. The fault
+ * handler runs in a signal handler and the direct path on the guest thread,
+ * so plain increments (diagnostic counts, racy as before). */
+static void apu_trace_tally(uint32_t off, int w, const uint32_t *rval)
+{
+    uint32_t slot = off >> 2;
+    if (w) { s_tot_w++; s_hist_w[slot]++; s_hist_lastw[slot] = s_last_wval; }
+    else   { s_tot_r++; s_hist_r[slot]++; }
+    {
+        static unsigned n;
+        if (n++ < 400)
+            fprintf(stderr, "  [APUMMIO] %s 0x%05X = %08X\n", w ? "write" : "read ",
+                    off, w ? s_last_wval
+                           : rval ? *rval
+                           : (uint32_t)mcpx_apu_mmio_read(g_apu_state, off, 4));
+    }
+}
+
+static int apu_trace_now(void)
+{
+    if (s_trace < 0)
+        s_trace = recomp_env_on(RENV_APU_TRACE);
+    return s_trace && !g_apu_hook_bench_active;
+}
+
+uint32_t apu_hook_direct_rd(uint32_t off, int size)
+{
+    int trace = apu_trace_now();
+    uint64_t a = trace ? s_now_ns() : 0;
+    uint32_t v = (uint32_t)apu_mmio_rd(g_apu_state, off, size);
+    if (trace) {
+        s_handler_ns += s_now_ns() - a;
+        s_direct++;
+        apu_trace_tally(off, 0, &v);
+    }
+    return v;
+}
+
+void apu_hook_direct_wr(uint32_t off, uint32_t v, int size)
+{
+    int trace = apu_trace_now();
+    uint64_t a = trace ? s_now_ns() : 0;
+    apu_mmio_wr(g_apu_state, off, v, size);
+    if (trace) {
+        s_handler_ns += s_now_ns() - a;
+        s_direct++;
+        apu_trace_tally(off, 1, NULL);
+    }
+}
+
 /* Service one trapped APU access from a SIGBUS/SIGSEGV handler. ucv is the
  * handler's ucontext; is_write is advisory (the decoder reads the opcode).
  * Returns true when the access was emulated and pc advanced. */
@@ -337,9 +434,7 @@ bool apu_hook_handle_mmio_posix(void *ucv, uintptr_t fault_addr,
     (void)fault_addr; (void)is_write;
     if (!g_apu_state || off >= APU_MMIO_SIZE)
         return false;
-    if (s_trace < 0)
-        s_trace = recomp_env_on(RENV_APU_TRACE);
-    trace = s_trace && !g_apu_hook_bench_active;
+    trace = apu_trace_now();
     if (trace)
         a = s_now_ns();
     ok = mmio_emulate_a64(uc, off, g_apu_state, apu_mmio_rd, apu_mmio_wr);
@@ -358,20 +453,24 @@ bool apu_hook_handle_mmio_posix(void *ucv, uintptr_t fault_addr,
         /* Direction from the opcode: bit 22 clear is a store for the
          * single-register forms; LDP/STP carry L in bit 22 as well. */
         uint32_t insn = *(const uint32_t *)(uintptr_t)(A64_CTX_PC(uc) - 4);
-        int w = !((insn >> 22) & 1);
-        uint32_t slot = off >> 2;
-        if (w) { s_tot_w++; s_hist_w[slot]++; s_hist_lastw[slot] = s_last_wval; }
-        else   { s_tot_r++; s_hist_r[slot]++; }
-        {
-            static unsigned n;
-            if (n++ < 400)
-                fprintf(stderr, "  [APUMMIO] %s 0x%05X = %08X\n", w ? "write" : "read ",
-                        off, w ? s_last_wval
-                               : (uint32_t)mcpx_apu_mmio_read(g_apu_state, off, 4));
-        }
+        apu_trace_tally(off, !((insn >> 22) & 1), NULL);
     }
     return true;
 }
 #elif !defined(_WIN32)
+/* x86-64 POSIX: there is no fault decoder here, but with RECOMP_AC97_READY=1
+ * the compat VirtualProtect (mprotect) still arms the trap, so
+ * xbox_MmioRead/Write route constant-address movs to these untraced calls
+ * into the model (a fault there would have no handler). */
 void apu_hook_trace_start(void) {}
+
+uint32_t apu_hook_direct_rd(uint32_t off, int size)
+{
+    return (uint32_t)mcpx_apu_mmio_read(g_apu_state, off, (unsigned)size);
+}
+
+void apu_hook_direct_wr(uint32_t off, uint32_t v, int size)
+{
+    mcpx_apu_mmio_write(g_apu_state, off, v, (unsigned)size);
+}
 #endif

@@ -426,7 +426,10 @@ typedef struct MCPXAPUVPState {
     uint8_t hrtf_submix[4];
     uint8_t submix_headroom[NUM_MIXBINS];
     float sample_buf[NUM_SAMPLES_PER_FRAME][2];
-    uint64_t voice_locked[4];
+    /* Updated with 64-bit atomics (qatomic_or64 and friends), which need
+     * natural alignment: an unaligned 64-bit locked op splits across cache
+     * lines on x86 and faults on arm64. */
+    _Alignas(8) uint64_t voice_locked[4];
 
     struct {
         int current_entry;
@@ -524,6 +527,8 @@ void mcpx_apu_vp_init(MCPXAPUState *d);
 void mcpx_apu_vp_finalize(MCPXAPUState *d);
 void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
 void mcpx_apu_vp_reset(MCPXAPUState *d);
+/* Write the VP's buffered trace lines; frame thread, after it drops d->lock. */
+void mcpx_apu_vp_trace_flush(void);
 
 /* DSP functions (stubbed) */
 void mcpx_apu_dsp_init(MCPXAPUState *d);

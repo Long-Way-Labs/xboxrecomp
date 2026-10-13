@@ -27,6 +27,7 @@
 #include "fpconv.h"
 #include "../kernel/xbox_memory_layout.h"   /* XBOX_WORKER_STACK_TOP */
 #include "../kernel/kernel_prof.h"          /* RECOMP_TRACE=dpc: ISR, se_frame */
+#include "apu_lockstat.h"                    /* RECOMP_TRACE=apu_lock */
 
 /* ============================================================
  * Globals
@@ -347,12 +348,12 @@ static void apu_deliver_irq(MCPXAPUState *d)
      * vehicle select froze on that pair). The post happens without d->lock,
      * since the release of the gate it may take runs other lines' routines
      * here. */
-    qemu_mutex_unlock(&d->lock);
+    apu_lockstat_unlock(d, APU_LOCK_FRAME);
     if (xbox_IrqSafePointsOn()) {
         how = xbox_IrqPost(XBOX_IRQ_APU);
         if (how == XBOX_IRQ_POSTED) {
             apu_irq_stats.posted++;
-            qemu_mutex_lock(&d->lock);
+            apu_lockstat_lock(d, APU_LOCK_FRAME);
             return;
         }
         if (how == XBOX_IRQ_UNGATED)
@@ -363,7 +364,7 @@ static void apu_deliver_irq(MCPXAPUState *d)
         how = xbox_DispatchGateTryEnter() ? XBOX_IRQ_GATED : XBOX_IRQ_UNGATED;
         if (how == XBOX_IRQ_UNGATED && ++held_off <= 50) {
             apu_irq_stats.held_frames++;
-            qemu_mutex_lock(&d->lock);
+            apu_lockstat_lock(d, APU_LOCK_FRAME);
             return;
         }
         if (held_off > 50)
@@ -382,7 +383,7 @@ static void apu_deliver_irq(MCPXAPUState *d)
     }
     if (how == XBOX_IRQ_GATED)
         xbox_DispatchGateLeave();
-    qemu_mutex_lock(&d->lock);
+    apu_lockstat_lock(d, APU_LOCK_FRAME);
 }
 
 /* ============================================================
@@ -924,10 +925,13 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
     apu_wav_write((const int16_t *)period, MIXER_FRAME_SAMPLES);
 
     if (xa2_is_active()) {
+        uint64_t t0 = apu_lockstat_on() ? apu_lockstat_now_ns() : 0;
         int q = hs_poll();
         hs_submit(MIXER_FRAME_SAMPLES,
                   xa2_submit_samples((const int16_t *)period,
                                      MIXER_FRAME_SAMPLES), q);
+        if (t0)
+            apu_lockstat_stage(APU_STAGE_XA2, apu_lockstat_now_ns() - t0);
         return;
     }
     if (g_waveout.initialized)
@@ -1006,8 +1010,11 @@ static void throttle(MCPXAPUState *d)
             d, qemu_clock_get_us(QEMU_CLOCK_REALTIME));
         if (wait_us <= 0)
             break;
+        apu_lockstat_pace_wait();
+        apu_lockstat_hold_end(APU_LOCK_FRAME);
         qemu_cond_timedwait(&d->cond, &d->lock,
                             (int)((wait_us + 999) / 1000));
+        apu_lockstat_hold_begin(APU_LOCK_FRAME);
     }
 
     d->sleep_acc_us += (int)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - start_us);
@@ -1040,9 +1047,21 @@ static void se_frame(MCPXAPUState *d)
     float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
     memset(mixbins, 0, sizeof(mixbins));
 
-    mcpx_apu_vp_frame(d, mixbins);
-    mcpx_apu_dsp_frame(d, mixbins);
-    mcpx_apu_monitor_frame(d);
+    if (apu_lockstat_on()) {
+        uint64_t t0 = apu_lockstat_now_ns(), t1, t2;
+        mcpx_apu_vp_frame(d, mixbins);
+        t1 = apu_lockstat_now_ns();
+        mcpx_apu_dsp_frame(d, mixbins);
+        t2 = apu_lockstat_now_ns();
+        mcpx_apu_monitor_frame(d);
+        apu_lockstat_stage(APU_STAGE_VP, t1 - t0);
+        apu_lockstat_stage(APU_STAGE_DSP, t2 - t1);
+        apu_lockstat_stage(APU_STAGE_MON, apu_lockstat_now_ns() - t2);
+    } else {
+        mcpx_apu_vp_frame(d, mixbins);
+        mcpx_apu_dsp_frame(d, mixbins);
+        mcpx_apu_monitor_frame(d);
+    }
 
     d->ep_frame_div++;
 
@@ -1056,7 +1075,7 @@ static void se_frame(MCPXAPUState *d)
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
-    qemu_mutex_lock(&d->lock);
+    apu_lockstat_lock(d, APU_LOCK_FRAME);
 
     while (!qatomic_read(&d->exiting)) {
         if (d->pause_requested && !g_test_tone.active && !g_mixer_active_count) {
@@ -1065,7 +1084,9 @@ static void *mcpx_apu_frame_thread(void *arg)
                 xa2_expect_drain();     /* a pause, not an underrun */
             hs_rebase();
             qemu_cond_signal(&d->idle_cond);
+            apu_lockstat_hold_end(APU_LOCK_FRAME);
             qemu_cond_wait(&d->cond, &d->lock);
+            apu_lockstat_hold_begin(APU_LOCK_FRAME);
             d->is_idle = false;
             continue;
         }
@@ -1101,6 +1122,14 @@ static void *mcpx_apu_frame_thread(void *arg)
                 long long t0 = xbox_ProfNowUs();
                 se_frame(d);
                 xbox_ProfCount(XBOX_PROF_SE_FRAME, xbox_ProfNowUs() - t0);
+            } else if (apu_lockstat_on()) {
+                LARGE_INTEGER f, a, b;
+                QueryPerformanceFrequency(&f);
+                QueryPerformanceCounter(&a);
+                se_frame(d);
+                QueryPerformanceCounter(&b);
+                apu_lockstat_se_frame((uint64_t)((double)(b.QuadPart - a.QuadPart) * 1e9 /
+                                                 (double)f.QuadPart));
             } else {
                 se_frame(d);
             }
@@ -1133,30 +1162,40 @@ static void *mcpx_apu_frame_thread(void *arg)
         }
         apu_deliver_irq(d);
 
-        /* Let the guest in once per frame.
+        /* Drop the lock once per frame.
          *
          * The thread holds d->lock for its whole loop and only drops it inside
          * throttle()'s wait. Once voices really play, processing can run
          * behind real time, throttle never waits, and the lock is never
-         * released -- while every VOICE_ON/OFF/RELEASE the title writes needs
-         * it (voice_lock). A critical section is not fair, so the title's
-         * thread starved there indefinitely: Burnout 3 froze on its vehicle
-         * select, blocked in voice_lock at raised IRQL, which in turn held
-         * off every USB interrupt. */
-        qemu_mutex_unlock(&d->lock);
+         * released. A critical section is not fair, so a taker starves:
+         * Burnout 3 froze on its vehicle select when voice_lock still took
+         * the lock, blocked in it at raised IRQL, which in turn held off
+         * every USB interrupt. voice_lock is a lock-free bit flip now, so
+         * what this still serves is apu_mixer_play, which takes the lock to
+         * wake this thread, and the trapped-FE path: the yield lets the
+         * title's service routine run and clear FECTL before the check
+         * below. The trace text formatted under the lock is printed here,
+         * with the lock dropped. */
+        apu_lockstat_report();
+        apu_lockstat_unlock(d, APU_LOCK_FRAME);
+        apu_lockstat_flush();
+        mcpx_apu_vp_trace_flush();
         SwitchToThread();
-        qemu_mutex_lock(&d->lock);
+        apu_lockstat_lock(d, APU_LOCK_FRAME);
         if (fe_trapped &&
             (qatomic_read(&d->regs[NV_PAPU_FECTL]) &
              NV_PAPU_FECTL_FEMETHMODE_TRAPPED)) {
             /* Still trapped after the delivery (held off at raised IRQL, or
              * cleared from a DPC): give the title a millisecond with the lock
              * dropped rather than spinning on it. */
+            apu_lockstat_hold_end(APU_LOCK_FRAME);
             qemu_cond_timedwait(&d->cond, &d->lock, 1);
+            apu_lockstat_hold_begin(APU_LOCK_FRAME);
         }
     }
 
-    qemu_mutex_unlock(&d->lock);
+    apu_lockstat_unlock(d, APU_LOCK_FRAME);
+    mcpx_apu_vp_trace_flush();
     return NULL;
 }
 
@@ -1518,10 +1557,10 @@ void apu_mixer_play(int slot, int looping)
     /* The frame thread takes the APU lock before the mixer lock. */
     extern MCPXAPUState *g_state;
     if (g_state) {
-        qemu_mutex_lock(&g_state->lock);
+        apu_lockstat_lock(g_state, APU_LOCK_OTHER);
         g_state->pause_requested = false;
         qemu_cond_signal(&g_state->cond);
-        qemu_mutex_unlock(&g_state->lock);
+        apu_lockstat_unlock(g_state, APU_LOCK_OTHER);
     }
 }
 

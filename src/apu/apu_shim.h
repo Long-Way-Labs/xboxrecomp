@@ -63,6 +63,22 @@ static inline uint32_t qatomic_load32(uint32_t *p)
 #endif
 }
 
+/* 64-bit words (vp.voice_locked). qatomic_or/and above are _InterlockedOr on
+ * a 32-bit long under MSVC and would drop the high half of the word; and
+ * qemu_shim's qatomic_read is a plain dereference, which may tear or be
+ * cached. */
+#ifndef qatomic_or64
+#ifdef _MSC_VER
+#define qatomic_or64(p, v)  _InterlockedOr64((__int64 volatile *)(p), (__int64)(v))
+#define qatomic_and64(p, v) _InterlockedAnd64((__int64 volatile *)(p), (__int64)(v))
+#define qatomic_load64(p)   ((uint64_t)_InterlockedOr64((__int64 volatile *)(p), 0))
+#else
+#define qatomic_or64(p, v)  __atomic_fetch_or((p), (v), __ATOMIC_SEQ_CST)
+#define qatomic_and64(p, v) __atomic_fetch_and((p), (v), __ATOMIC_SEQ_CST)
+#define qatomic_load64(p)   __atomic_load_n((p), __ATOMIC_ACQUIRE)
+#endif
+#endif
+
 /* ============================================================
  * QEMU clock helpers (beyond what NV2A shim provides)
  * ============================================================ */

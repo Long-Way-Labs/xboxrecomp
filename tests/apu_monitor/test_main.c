@@ -159,6 +159,9 @@ static void voice_trace_case(void)
         memset(mixbins, 0, sizeof(mixbins));
         mcpx_apu_vp_frame(d, mixbins);
     }
+    /* The VP buffers its trace lines; the frame thread prints them once it
+     * drops d->lock, and here nothing else does. */
+    mcpx_apu_vp_trace_flush();
     fflush(stderr);
 
     f = fopen("apu_monitor_trace.txt", "r");
@@ -254,6 +257,7 @@ static void ring_case(void)
             memset(mixbins, 0, sizeof(mixbins));
             mcpx_apu_vp_frame(d, mixbins);
         }
+        mcpx_apu_vp_trace_flush();
         fflush(stderr);
     }
 

@@ -15,6 +15,7 @@ add_library(xbox_apu STATIC
     apu_sdl2.c
     apu_wav.c
     apu_vclock.c
+    apu_lockstat.c
 )
 
 target_include_directories(xbox_apu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

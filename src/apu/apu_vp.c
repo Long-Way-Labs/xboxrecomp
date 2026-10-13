@@ -22,7 +22,7 @@
 #include "apu_state.h"
 #include "recomp_env.h"
 #include "fpconv.h"
-#include "../kernel/kernel_prof.h"
+#include <stdarg.h>
 
 /* #define DEBUG_MCPX */
 
@@ -171,35 +171,39 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
     set_notify_status(d, v, notifier, NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
 }
 
-/* RECOMP_TRACE=dpc (kernel_prof.h): how long a title thread, or a DPC on
- * the timer thread, waits here for the frame thread's lock. */
+/* NV1BA0_PIO_VOICE_LOCK, and VOICE_ON/RELEASE around their own writes: a
+ * bit flip, with no d->lock and no wake of the frame thread.
+ *
+ * On the MCPX a PIO method is posted into the front end's FIFO (PIO_FREE
+ * counts the room left); the CPU's store never waits for the voice
+ * processor. xemu takes d->lock here and signals d->cond because its
+ * voice_work_dispatch holds the frame while a queued voice is locked
+ * (hw/xbox/mcpx/apu/vp/vp.c at 36334d9, lines 1712-1738). The port has no
+ * such wait and its VP never reads the bit, and the voice writes in
+ * VOICE_ON/RELEASE ran after the unlock anyway, so the lock only made the
+ * title wait out the rest of the current se_frame (~80 us, 5% of the time,
+ * measured under Proton) and the signal only woke the pacing wait for
+ * nothing. A method can therefore land while the VP is processing the very
+ * voice it updates; making the VP skip a locked voice, as xemu does, would
+ * close that, and is not done here.
+ *
+ * The title thread and a DPC on the timer thread both write here, so the
+ * update is an atomic RMW on the 64-bit word. */
 static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
 {
-    assert(v < MCPX_HW_MAX_VOICES);
-    if (xbox_ProfOn()) {
-        long long t0 = xbox_ProfNowUs();
-        qemu_mutex_lock(&d->lock);
-        xbox_ProfWait(XBOX_PROF_WAIT_APULOCK, xbox_ProfNowUs() - t0);
-    } else {
-        qemu_mutex_lock(&d->lock);
-    }
-
     uint64_t mask = 1ULL << (v % 64);
-    if (lock) {
-        d->vp.voice_locked[v / 64] |= mask;
-    } else {
-        d->vp.voice_locked[v / 64] &= ~mask;
-    }
-
-    qemu_cond_signal(&d->cond);
-    qemu_mutex_unlock(&d->lock);
+    assert(v < MCPX_HW_MAX_VOICES);
+    if (lock)
+        qatomic_or64(&d->vp.voice_locked[v / 64], mask);
+    else
+        qatomic_and64(&d->vp.voice_locked[v / 64], ~mask);
 }
 
 static bool is_voice_locked(MCPXAPUState *d, uint16_t v)
 {
-    assert(v < MCPX_HW_MAX_VOICES);
     uint64_t mask = 1ULL << (v % 64);
-    return (qatomic_read(&d->vp.voice_locked[v / 64]) & mask) != 0;
+    assert(v < MCPX_HW_MAX_VOICES);
+    return (qatomic_load64(&d->vp.voice_locked[v / 64]) & mask) != 0;
 }
 
 /* ============================================================
@@ -781,6 +785,52 @@ static float voice_step_envelope(MCPXAPUState *d, uint16_t v, uint32_t reg_0,
  * (default voice_dump.raw in the working directory).
  * ============================================================ */
 
+/* Trace lines from inside the VP (voice positions, [APU-VSTAT], [APU-RING])
+ * are formatted here while the frame thread holds d->lock and written by
+ * mcpx_apu_vp_trace_flush after it lets go. Under Wine each stderr write is
+ * a slow host call: printed in place, the once-a-second VSTAT burst held the
+ * lock ~45 ms and the position bursts 2-8 ms, and every VOICE_LOCK that
+ * came in meanwhile waited them out. Only the frame thread
+ * writes and flushes, so the buffer needs no lock of its own. A full
+ * VSTAT pass over every voice is ~50 KB. */
+#define VP_TRACE_BUF (64 * 1024)
+static char s_trace_buf[VP_TRACE_BUF];
+static size_t s_trace_len;
+static unsigned s_trace_dropped;
+
+#if defined(__GNUC__)
+__attribute__((format(printf, 1, 2)))
+#endif
+static void vp_trace(const char *fmt, ...)
+{
+    va_list ap;
+    int n;
+    size_t room = sizeof(s_trace_buf) - s_trace_len;
+
+    va_start(ap, fmt);
+    n = vsnprintf(s_trace_buf + s_trace_len, room, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= room) {
+        s_trace_buf[s_trace_len] = '\0';    /* drop the partial line */
+        s_trace_dropped++;
+        return;
+    }
+    s_trace_len += (size_t)n;
+}
+
+void mcpx_apu_vp_trace_flush(void)
+{
+    if (!s_trace_len && !s_trace_dropped)
+        return;
+    if (s_trace_len)
+        fwrite(s_trace_buf, 1, s_trace_len, stderr);
+    if (s_trace_dropped)
+        fprintf(stderr, "[APU] trace lines dropped: %u\n", s_trace_dropped);
+    fflush(stderr);
+    s_trace_len = 0;
+    s_trace_dropped = 0;
+}
+
 struct VpVoiceStat {
     uint32_t frames, zc;
     double   sq;
@@ -873,7 +923,7 @@ static void vp_stat_report(void)
     for (unsigned v = 0; v < MCPX_HW_MAX_VOICES; v++) {
         struct VpVoiceStat *s = &s_vstat[v];
         if (!s->frames) continue;
-        fprintf(stderr, "[APU-VSTAT] t=%us v=%u fmt=%08X stream=%u st=%u ss=%u cs=%u spb=%u"
+        vp_trace("[APU-VSTAT] t=%us v=%u fmt=%08X stream=%u st=%u ss=%u cs=%u spb=%u"
                 " rate=%.3f ea=%.2f vol=%03X/%03X bin=%u/%u addr=%08X %s"
                 " frames=%u rms=%.0f zcr=%.2f\n",
                 s_vstat_secs, v, s->fmt,
@@ -981,7 +1031,7 @@ static void ring_close_block(struct VpRing *r, uint32_t v, uint32_t frames_per_b
             r->stale_total++;
             if (s_ring_logged < 200) {
                 s_ring_logged++;
-                fprintf(stderr, "[APU-RING] stale v=%u blk=%u/%u lap=%u ms=%llu\n",
+                vp_trace("[APU-RING] stale v=%u blk=%u/%u lap=%u ms=%llu\n",
                         v, b, r->nblk, r->laps,
                         (unsigned long long)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) / 1000));
             }
@@ -1080,7 +1130,7 @@ static void vp_ring_report(unsigned secs)
             if (r) r->entries = 0;
             continue;
         }
-        fprintf(stderr, "[APU-RING] t=%us v=%u bytes=%u entries=%u stale=%u"
+        vp_trace("[APU-RING] t=%us v=%u bytes=%u entries=%u stale=%u"
                 " stale_total=%u lead_min=%u lead_avg=%llu\n",
                 secs, v, r->bytes, r->entries, r->stale, r->stale_total,
                 r->lead_n ? r->lead_min : 0,
@@ -1642,7 +1692,7 @@ static void vp_trace_positions(MCPXAPUState *d)
             uint16_t v = (uint16_t)h;
             if (voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE))
-                fprintf(stderr, "[APU] voice %u pos=%u/%u\n", (unsigned)v,
+                vp_trace("[APU] voice %u pos=%u/%u\n", (unsigned)v,
                         voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET,
                                        NV_PAVS_VOICE_PAR_OFFSET_CBO),
                         voice_get_mask(d, v, NV_PAVS_VOICE_PAR_NEXT,

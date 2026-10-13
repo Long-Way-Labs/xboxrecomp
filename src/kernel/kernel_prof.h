@@ -16,6 +16,8 @@
  * and restores what Begin returned. */
 enum { XBOX_PROF_DPC_TIMER, XBOX_PROF_DPC_QUEUE, XBOX_PROF_ISR_VBLANK,
        XBOX_PROF_ISR_APU, XBOX_PROF_ISR_OHCI, XBOX_PROF_SYNC, XBOX_PROF_KINDS };
+/* WAIT_APULOCK has had no caller since voice_lock stopped taking the APU
+ * lock (apu_vp.c); it stays so dpc logs keep their columns across that. */
 enum { XBOX_PROF_WAIT_GATE, XBOX_PROF_WAIT_APULOCK, XBOX_PROF_WAIT_STALL,
        XBOX_PROF_WAITS };
 enum { XBOX_PROF_N_LOOPS, XBOX_PROF_SLEEP_OVER, XBOX_PROF_SCHED_RESTART,

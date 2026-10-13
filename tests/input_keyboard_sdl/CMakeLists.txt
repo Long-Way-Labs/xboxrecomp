@@ -9,9 +9,16 @@ find_package(SDL2 REQUIRED)
 add_executable(input_keyboard_sdl_test
     test_main.c
     ${INPUT_SRC}/keyboard.c
-    ${INPUT_SRC}/keyboard_sdl.c)
+    ${INPUT_SRC}/mouse.c
+    ${INPUT_SRC}/input_names.c
+    ${INPUT_SRC}/kbm_script.c
+    ${INPUT_SRC}/keyboard_sdl.c
+    ${INPUT_SRC}/mouse_sdl.c)
 target_include_directories(input_keyboard_sdl_test PRIVATE ${INPUT_SRC})
 target_link_libraries(input_keyboard_sdl_test PRIVATE platform SDL2::SDL2)
+if(NOT WIN32)
+    target_link_libraries(input_keyboard_sdl_test PRIVATE m)
+endif()
 enable_testing()
 add_test(NAME input_keyboard_sdl COMMAND input_keyboard_sdl_test)
 set_tests_properties(input_keyboard_sdl PROPERTIES

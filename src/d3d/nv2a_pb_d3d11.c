@@ -260,33 +260,46 @@ static int        s_blend_n;
 
 /* ------------------------------------------------------------------------- */
 
-/* The pad stand-in's key table (src/input/keyboard.c); declared here rather
- * than included so this file keeps no dependency on src/input's headers. */
-extern void xbox_InputKeySet(int vk, int down);
+/* The port-0 keyboard and mouse (src/input/keyboard.c, mouse.c); declared
+ * here rather than included so this file keeps no dependency on src/input's
+ * headers. */
+extern void xbox_InputKeyEventWin32(int vk, unsigned long lparam, int down);
 extern void xbox_InputKeysClear(void);
+extern void xbox_InputMouseWin32Msg(void *hwnd, unsigned msg, uintptr_t w, intptr_t l);
+extern void xbox_InputMouseWin32Sync(void *hwnd);
+extern void xbox_InputMouseWin32Release(void *hwnd);
+extern int xbox_InputKeyboardOn(void);
 
 static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
+    /* The mouse only observes (motion, buttons, focus, the capture), so
+     * every message goes on to the cases below. */
+    xbox_InputMouseWin32Msg(h, m, (uintptr_t)w, (intptr_t)l);
+
     switch (m) {
-    /* Keys for RECOMP_KEYBOARD, as the GDI window (fb_present.c) records
-     * them. This window is the only one a D3D11 run has, so without these
-     * the keyboard is a port-0 pad that never presses anything. */
+    /* Keys for the port-0 keyboard, as the GDI window (fb_present.c)
+     * records them. This window is the only one a D3D11 run has, so
+     * without these the keyboard is a port-0 pad that never presses
+     * anything. RECOMP_TRACE=key traces the edges in xbox_InputKeyEvent. */
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
-        xbox_InputKeySet((int)w, 1);
-        if (recomp_env(RENV_KEY_TRACE)) {
-            static unsigned n;
-            if (n++ < 40) {
-                fprintf(stderr, "  [KEY] down vk=0x%02X\n", (unsigned)w);
-                fflush(stderr);
-            }
-        }
+        /* Auto-repeat (bit 30, the previous state) is not a new edge. */
+        if (!(l & (1L << 30)))
+            xbox_InputKeyEventWin32((int)w, (unsigned long)l, 1);
         /* System keys still go to Windows, or Alt+F4 stops closing us. */
         return m == WM_SYSKEYDOWN ? DefWindowProcA(h, m, w, l) : 0;
     case WM_KEYUP:
     case WM_SYSKEYUP:
-        xbox_InputKeySet((int)w, 0);
+        xbox_InputKeyEventWin32((int)w, (unsigned long)l, 0);
         return m == WM_SYSKEYUP ? DefWindowProcA(h, m, w, l) : 0;
+    /* Alt (the walk key) or F10 alone would put the window in menu mode,
+     * which takes the keyboard until the next key. There is no menu;
+     * Alt+F4 is SC_CLOSE and still reaches Windows. With the keyboard off
+     * the keys drive nothing, so Alt+Space keeps the system menu. */
+    case WM_SYSCOMMAND:
+        if ((w & 0xFFF0) == SC_KEYMENU && xbox_InputKeyboardOn())
+            return 0;
+        break;
     /* Alt-tabbing away with a key held would leave it held for ever. */
     case WM_KILLFOCUS:
         xbox_InputKeysClear();
@@ -295,6 +308,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
     if (m == WM_CLOSE) {
         /* Closing the window ends the run, like the CPU path's window.
          * ExitProcess skips atexit, where the missing-file summary prints. */
+        xbox_InputMouseWin32Release(h);   /* no pump follows to drop the clip */
         recomp_exit_hook_run("window");
         ExitProcess(0);
     }
@@ -314,6 +328,7 @@ static void pump(void)
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
     }
+    xbox_InputMouseWin32Sync(s_hwnd);
 }
 
 static int compile(const char *what, const char *src, const char *target,
@@ -516,6 +531,19 @@ static int init(void)
         fprintf(stderr, LOGP "D3D11CreateDeviceAndSwapChain hr=0x%08lX\n",
                 (unsigned long)hr);
         return 0;
+    }
+    /* DXGI's default window association takes Alt+Enter as a fullscreen
+     * toggle, and nothing here follows that switch. With the keyboard on,
+     * Alt is a key players hold in play (a walk key) and Enter is START,
+     * so a pause while walking would switch to exclusive fullscreen behind
+     * the presenter's back. Stock runs (keyboard off) keep DXGI's
+     * default. */
+    if (xbox_InputKeyboardOn()) {
+        IDXGIFactory *f = NULL;
+        if (SUCCEEDED(IDXGISwapChain_GetParent(s_swap, &IID_IDXGIFactory, (void **)&f)) && f) {
+            IDXGIFactory_MakeWindowAssociation(f, s_hwnd, DXGI_MWA_NO_ALT_ENTER);
+            IDXGIFactory_Release(f);
+        }
     }
     IDXGISwapChain_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D, (void **)&s_back);
     if (FAILED(ID3D11DeviceContext_QueryInterface(s_ctx, &IID_ID3D11DeviceContext1,

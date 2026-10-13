@@ -7,10 +7,15 @@
  * and the pack go beside the test's executable, where the layer looks for
  * them, and are removed afterwards. The textures.pack cases pin the
  * [ENHANCE] lines the golden check reads (xboxrecomp-cli golden.py,
- * ENHANCE_PACK_RE).
+ * ENHANCE_PACK_RE). The [input] cases drive enhance_input.c into src/input's
+ * binding table and read it back.
  */
 #include "enhance.h"
 #include "enhance_cfg.h"
+#include "enhance_input.h"
+#include "input_names.h"
+#include "keyboard.h"
+#include "mouse.h"
 #include "nv2a_backend_common.h"
 #include "nv2a_tex_pack.h"
 #include "recomp_cfg.h"
@@ -1216,6 +1221,254 @@ static void test_tex_pack_key(void)
     nv2a_tex_pack_unload();
 }
 
+/* ── [input] (enhance_input.c) ─────────────────────────────────────── */
+
+/* Control ctl's inputs as "Name,Name" (mouse names included). */
+static const char *bound(int ctl)
+{
+    static char buf[256];
+    int codes[XBOX_BIND_MAX], mouse[XBOX_BIND_MAX];
+    int n = xbox_InputBindingsOf(ctl, codes, mouse, XBOX_BIND_MAX);
+    size_t len = 0;
+    buf[0] = 0;
+    for (int i = 0; i < n && i < XBOX_BIND_MAX; i++) {
+        const char *name = xbox_InputCodeName(codes[i], mouse[i]);
+        len += (size_t)snprintf(buf + len, sizeof buf - len, "%s%s", i ? "," : "",
+                                name ? name : "?");
+    }
+    return buf;
+}
+
+/* Load the defaults file and the RECOMP_CONFIG user file, then the [input]
+ * keys; the captured stderr comes back. */
+static const char *input_load(const char *defaults, const char *user)
+{
+    if (defaults)
+        write_file(defaults_file(), defaults);
+    else
+        remove_defaults();
+    write_file("ecfg_in/user.toml", user ? user : "");
+    recomp_env_set(RENV_CONFIG, "ecfg_in/user.toml");
+    capture_begin();
+    enhance_cfg_init("ecfg_in", NULL);
+    enhance_input_init();
+    return capture_end();
+}
+
+static void test_input(void)
+{
+    static const char defaults[] =
+        "[input]\n"
+        "keyboard = true\n"
+        "mouse = true\n"
+        "[input.bindings]\n"
+        "a = \"Space\"\n"
+        "start = [\"Return\", \"Escape\"]\n"
+        "b = \"MouseLeft\"\n";
+    char want[4400];
+    const char *out;
+    xbox_mouse_opts mo;
+
+    MKDIR("ecfg_in");
+    recomp_env_set(RENV_KEYBOARD, NULL);
+    recomp_env_set(RENV_MOUSE, NULL);
+
+    /* The defaults file alone. */
+    out = input_load(defaults, NULL);
+    CHECK(!strcmp(bound(XBOX_CTL_A), "Space"));
+    CHECK(!strcmp(bound(XBOX_CTL_START), "Return,Escape"));
+    CHECK(!strcmp(bound(XBOX_CTL_B), "MouseLeft"));
+    CHECK(xbox_InputKeyboardOn() && xbox_InputMouseOn());
+    CHECK(enhance_cfg_source_of("input.keyboard") == ENHANCE_SRC_DEFAULTS);
+    snprintf(want, sizeof want, "[INPUT] config: keyboard=on mouse=on look=right_stick"
+             " sens=1.0 bindings=3 (%s)\n", defaults_file());
+    CHECK(strstr(out, want) != NULL);
+    CHECK(strstr(out, "config error") == NULL);
+    /* The knobs' defaults (design D3). */
+    xbox_InputMouseGetOpts(&mo);
+    CHECK(mo.capture == XBOX_MOUSE_CAPTURE_FOCUS && mo.look == XBOX_MOUSE_LOOK_RIGHT);
+    CHECK(mo.sensitivity == 1.0 && mo.min_deflection == 0.45);
+    CHECK(mo.release_key == 0x78 && mo.wheel_pulse_ms == 100);
+    /* Every binding key was read, so none is reported unused. */
+    capture_begin();
+    enhance_cfg_report_unused();
+    out = capture_end();
+    CHECK(strstr(out, "input.bindings") == NULL);
+
+    /* The player's a replaces the defaults' whole. */
+    out = input_load(defaults, "[input.bindings]\na = \"J\"\n");
+    CHECK(!strcmp(bound(XBOX_CTL_A), "J"));
+    CHECK(!strcmp(bound(XBOX_CTL_START), "Return,Escape"));
+    CHECK(strstr(out, " bindings=2 (") != NULL);
+    CHECK(strstr(out, " +1 (ecfg_in/user.toml)\n") != NULL);
+
+    /* A key the player binds elsewhere leaves the inherited control. */
+    out = input_load(defaults, "[input.bindings]\nback = \"Escape\"\n");
+    CHECK(!strcmp(bound(XBOX_CTL_BACK), "Escape"));
+    CHECK(!strcmp(bound(XBOX_CTL_START), "Return"));
+    CHECK(!strcmp(bound(XBOX_CTL_A), "Space"));
+
+    /* [] unbinds; a control no file names keeps the compiled-in default. */
+    out = input_load(defaults, "[input.bindings]\na = []\n");
+    CHECK(!strcmp(bound(XBOX_CTL_A), ""));
+    {
+        char compiled[256];
+        xbox_InputBindingsReset();
+        snprintf(compiled, sizeof compiled, "%s", bound(XBOX_CTL_Y));
+        input_load(defaults, NULL);
+        CHECK(!strcmp(bound(XBOX_CTL_Y), compiled) && compiled[0]);
+    }
+
+    /* A control left on the compiled-in default still loses a key the
+     * player binds elsewhere (no defaults file, so A is the compiled one):
+     * the player's b takes A's first compiled key, A keeps the rest. */
+    {
+        char compiled[256], key[64], user[128];
+        const char *comma;
+        xbox_InputBindingsReset();
+        snprintf(compiled, sizeof compiled, "%s", bound(XBOX_CTL_A));
+        CHECK(compiled[0] != 0);
+        comma = strchr(compiled, ',');
+        snprintf(key, sizeof key, "%.*s",
+                 (int)(comma ? (size_t)(comma - compiled) : strlen(compiled)), compiled);
+        snprintf(user, sizeof user, "[input.bindings]\nb = \"%s\"\n", key);
+        input_load(NULL, user);
+        CHECK(!strcmp(bound(XBOX_CTL_B), key));
+        CHECK(!strcmp(bound(XBOX_CTL_A), comma ? comma + 1 : ""));
+    }
+
+    /* The release key and the walk key bound to a control get a warning. */
+    out = input_load(defaults, "[input]\nwalk_key = \"LAlt\"\n"
+                     "[input.bindings]\ny = \"F9\"\n"
+                     "x = \"LAlt\"\n");
+    CHECK(strstr(out, "[INPUT] config warning: input.mouse_release_key 'F9' is also"
+                 " bound to input.bindings.y\n") != NULL);
+    CHECK(strstr(out, "[INPUT] config warning: input.walk_key 'LAlt' is also"
+                 " bound to input.bindings.x\n") != NULL);
+    /* The code default is no walk key (the legacy keyboard): LAlt is free. */
+    out = input_load(defaults, "[input.bindings]\nx = \"LAlt\"\n");
+    CHECK(strstr(out, "input.walk_key") == NULL);
+    out = input_load(defaults, "[input]\nwalk_key = \"F9\"\n");
+    CHECK(strstr(out, "input.walk_key and input.mouse_release_key are the same key")
+          != NULL);
+    out = input_load(defaults, NULL);
+    CHECK(strstr(out, "config warning") == NULL);
+
+    /* "none" and "" are no key, without an error: the release key can be
+     * turned off (its default is F9), and so can the walk key. */
+    out = input_load(defaults, "[input]\nmouse_release_key = \"None\"\nwalk_key = \"\"\n");
+    xbox_InputMouseGetOpts(&mo);
+    CHECK(mo.release_key == 0);
+    CHECK(strstr(out, "config error") == NULL);
+    out = input_load(defaults, NULL);
+    xbox_InputMouseGetOpts(&mo);
+    CHECK(mo.release_key == 0x78);
+
+    /* A script with both devices off would never play: say so. */
+    recomp_env_set(RENV_KBM_SCRIPT, "probe.kbm");
+    out = input_load(NULL, NULL);
+    CHECK(strstr(out, "[INPUT] kbm_script ignored: keyboard and mouse off (probe.kbm)\n")
+          != NULL);
+    out = input_load(defaults, NULL);
+    CHECK(strstr(out, "kbm_script ignored") == NULL);
+    recomp_env_set(RENV_KBM_SCRIPT, NULL);
+
+    /* The three capture choices. */
+    out = input_load(defaults, "[input]\nmouse_capture = \"click\"\n");
+    xbox_InputMouseGetOpts(&mo);
+    CHECK(mo.capture == XBOX_MOUSE_CAPTURE_CLICK);
+    out = input_load(defaults, "[input]\nmouse_capture = \"never\"\n");
+    xbox_InputMouseGetOpts(&mo);
+    CHECK(mo.capture == XBOX_MOUSE_CAPTURE_NEVER);
+    out = input_load(defaults, "[input]\nmouse_capture = \"focus\"\nmouse_look = \"none\"\n"
+                     "mouse_sensitivity = 2\nmouse_invert_y = true\n");
+    xbox_InputMouseGetOpts(&mo);
+    CHECK(mo.capture == XBOX_MOUSE_CAPTURE_FOCUS && mo.look == XBOX_MOUSE_LOOK_NONE);
+    CHECK(mo.sensitivity == 2.0 && mo.invert_y && !mo.invert_x);
+    CHECK(strstr(out, "look=none sens=2.0") != NULL);
+
+    /* One input under two controls in one file: the second is reported
+     * with the first's line, and the first kept. */
+    out = input_load(defaults, "[input.bindings]\nx = \"J\"\ny = \"J\"\n");
+    CHECK(strstr(out, "[INPUT] config error: ecfg_in/user.toml:3: 'J' already bound to"
+                 " input.bindings.x on line 2; ignored here\n") != NULL);
+    CHECK(!strcmp(bound(XBOX_CTL_X), "J"));
+    CHECK(!strcmp(bound(XBOX_CTL_Y), ""));
+
+    /* Each mistake its line, and the rest of the file applied. */
+    out = input_load(defaults,
+                     "[input]\n"
+                     "mouse_sensitivity = 0\n"                  /* 2 */
+                     "mouse_look = \"camera\"\n"                /* 3 */
+                     "walk_scale = 0.3\n"                       /* 4 */
+                     "stick_ramp_ms = \"fast\"\n"               /* 5 */
+                     "[input.bindings]\n"
+                     "jmp = \"J\"\n"                            /* 7 */
+                     "x = [\"Spacebar\", \"K\"]\n"              /* 8 */
+                     "a = 5\n"                                  /* 9 */
+                     "white = \"F10\"\n"                        /* 10 */
+                     "y = \"Q\"\n");                            /* 11 */
+    CHECK(strstr(out, "[INPUT] config error: ecfg_in/user.toml:2: input.mouse_sensitivity 0"
+                 " out of range 0.1 .. 10; using 1\n") != NULL);
+    CHECK(strstr(out, "[INPUT] config error: ecfg_in/user.toml:3: input.mouse_look 'camera'"
+                 " is not one of right_stick, left_stick, none; using right_stick\n") != NULL);
+    CHECK(strstr(out, "[INPUT] config error: ecfg_in/user.toml:4: input.walk_scale 0.3"
+                 " out of range 0.41 .. 1; using 0.41\n") != NULL);
+    CHECK(strstr(out, "[INPUT] config error: ecfg_in/user.toml:5: input.stick_ramp_ms should be"
+                 " an integer (got string); using the default\n") != NULL);
+    CHECK(strstr(out, "[INPUT] config error: ecfg_in/user.toml:7: unknown control 'jmp' under"
+                 " [input.bindings] (controls: a b x y white black ltrigger rtrigger start back"
+                 " lthumb rthumb dpad_up dpad_down dpad_left dpad_right lstick_up lstick_down"
+                 " lstick_left lstick_right rstick_up rstick_down rstick_left rstick_right);"
+                 " ignored\n") != NULL);
+    CHECK(strstr(out, "[INPUT] config error: ecfg_in/user.toml:8: unknown input 'Spacebar' in"
+                 " input.bindings.x (see docs/input.md); skipped\n") != NULL);
+    CHECK(strstr(out, "[INPUT] config error: ecfg_in/user.toml:9: input.bindings.a is a string or"
+                 " a list of strings (got integer); ignored\n") != NULL);
+    CHECK(strstr(out, "[INPUT] config error: ecfg_in/user.toml:10: input.bindings.white 'F10' is"
+                 " the menu hotkey (menu.hotkey); bound anyway\n") != NULL);
+    CHECK(strstr(out, "[ENHANCE] ecfg_in") == NULL);     /* [INPUT] lines only */
+    CHECK(!strcmp(bound(XBOX_CTL_X), "K"));
+    CHECK(!strcmp(bound(XBOX_CTL_A), "Space"));            /* the defaults' */
+    CHECK(!strcmp(bound(XBOX_CTL_WHITE), "F10"));
+    CHECK(!strcmp(bound(XBOX_CTL_Y), "Q"));
+    xbox_InputMouseGetOpts(&mo);
+    CHECK(mo.sensitivity == 1.0 && mo.look == XBOX_MOUSE_LOOK_RIGHT);
+
+    /* The environment over the file, left to the env path. */
+    recomp_env_set(RENV_KEYBOARD, "0");
+    out = input_load(defaults, NULL);
+    CHECK(!xbox_InputKeyboardOn() && xbox_InputMouseOn());
+    CHECK(enhance_cfg_source_of("input.keyboard") == ENHANCE_SRC_ENV);
+    CHECK(strstr(out, "[INPUT] config: keyboard=off mouse=on") != NULL);
+    recomp_env_set(RENV_KEYBOARD, NULL);
+    /* The player's file turns the mouse off. */
+    out = input_load(defaults, "[input]\nmouse = false\n");
+    CHECK(xbox_InputKeyboardOn() && !xbox_InputMouseOn());
+
+    /* none: no file, both off, the compiled-in table. */
+    recomp_env_set(RENV_CONFIG, "none");
+    capture_begin();
+    enhance_cfg_init("ecfg_in", NULL);
+    enhance_input_init();
+    out = capture_end();
+    CHECK(strstr(out, "[INPUT] config: keyboard=off mouse=off (RECOMP_CONFIG=none)\n") != NULL);
+    CHECK(!xbox_InputKeyboardOn() && !xbox_InputMouseOn());
+    {
+        char now[256];
+        snprintf(now, sizeof now, "%s", bound(XBOX_CTL_START));
+        xbox_InputBindingsReset();
+        CHECK(!strcmp(now, bound(XBOX_CTL_START)));
+    }
+
+    remove_defaults();
+    remove("ecfg_in/user.toml");
+    recomp_env_set(RENV_CONFIG, NULL);
+    enhance_cfg_shutdown();
+    xbox_InputKeyboardEnable(-1);
+    xbox_InputMouseEnable(-1);
+}
+
 /* ── recomp_exe_dir ────────────────────────────────────────────────── */
 
 static void test_exe_dir(void)
@@ -1253,6 +1506,7 @@ int main(void)
     test_enhance_init();
     test_present_surface();
     test_tex_pack_key();
+    test_input();
     test_exe_dir();
     printf("enhance_cfg: %d checks, %d failed\n", s_checks, s_fail);
     return s_fail ? 1 : 0;

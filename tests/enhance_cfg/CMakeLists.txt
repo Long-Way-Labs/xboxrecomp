@@ -1,6 +1,7 @@
 # enhance_cfg - the TOML-subset reader (src/enhance/recomp_cfg.c) and the
 # env-over-file layering (src/enhance/enhance_cfg.c), xbox_enhance_init
-# (src/enhance/enhance.c) and recomp_exe_dir. Pure C, no device:
+# (src/enhance/enhance.c), the [input] keys (src/enhance/enhance_input.c,
+# into src/input's binding table) and recomp_exe_dir. Pure C, no device:
 #   cmake -S tests/enhance_cfg -B build/enhance_cfg
 #   cmake --build build/enhance_cfg && ctest --test-dir build/enhance_cfg
 # Also works from a parent project with add_subdirectory().
@@ -15,11 +16,18 @@ add_executable(enhance_cfg_test
     ${XR_SRC}/enhance/recomp_cfg.c
     ${XR_SRC}/enhance/enhance_cfg.c
     ${XR_SRC}/enhance/enhance.c
+    ${XR_SRC}/enhance/enhance_input.c
+    ${XR_SRC}/input/keyboard.c
+    ${XR_SRC}/input/mouse.c
+    ${XR_SRC}/input/input_names.c
+    ${XR_SRC}/input/kbm_script.c
     ${XR_SRC}/kernel/nv2a_backend_common.c
     ${XR_SRC}/kernel/nv2a_tex_pack.c
     ${XR_SRC}/platform/recomp_env.c
-    ${XR_SRC}/platform/recomp_exe_dir.c)
+    ${XR_SRC}/platform/recomp_exe_dir.c
+    ${XR_SRC}/platform/recomp_exit_hook.c)
 target_include_directories(enhance_cfg_test PRIVATE ${XR_SRC}/enhance ${XR_SRC}/platform
+    ${XR_SRC}/input
     ${XR_SRC}/kernel ${XR_SRC}/d3d ${XR_SRC})
 target_compile_definitions(enhance_cfg_test PRIVATE RECOMP_ENV_HAVE_ENHANCE_KEYS)
 if(NOT MSVC)

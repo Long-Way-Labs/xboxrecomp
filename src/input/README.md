@@ -11,8 +11,12 @@ Maps the Xbox controller API to Windows XInput. The original Xbox used `XInputGe
 | `input_core.c` | The public API: connection cache, probe backoff, keyboard merge, shutdown |
 | `input_backend.h` | The seam between `input_core.c` and a host backend (tests swap it) |
 | `xinput_device.c` | Host backends: XInput (Windows, Proton) and SDL2 GameController |
-| `keyboard.c` | The key table and the one key map, every host |
+| `keyboard.c` | The key table, the compiled-in key map, the runtime bindings and the keyboard-and-mouse composer, every host |
+| `mouse.h`, `mouse.c` | The mouse: motion as a stick, buttons, the wheel, the capture state machine; its `_WIN32` half is the Win32 windows' mouse |
+| `input_names.h`, `input_names.c` | The binding vocabulary: key, mouse and control names |
+| `kbm_script.c` | `RECOMP_DEBUG=kbm_script=<file>`: key and mouse events injected on the poll |
 | `keyboard_sdl.c` | The SDL window's key and focus events into that table (POSIX) |
+| `mouse_sdl.c` | The SDL window's mouse events, and the capture as relative mode (POSIX) |
 
 ## Quick Start
 
@@ -164,9 +168,11 @@ and fails if the table below and the code disagree. Regenerate it with
 
 ### Keyboard → Xbox mapping
 
-With `RECOMP_KEYBOARD=1` (and the host pad on) the keyboard is a pad on
-port 0, merged on top of a controller there: a real pad keeps working and
-the keys only add. One map in `keyboard.c` serves every host: the Win32
+With `RECOMP_KEYBOARD=1` the keyboard is a pad on port 0, merged on top of
+a controller there: a real pad keeps working and the keys only add. The
+table below is the compiled-in map: the runtime bindings start as a copy of
+it, and a title's settings file replaces them (see "Keyboard and mouse"
+below). One map in `keyboard.c` serves every host: the Win32
 windows (GDI and D3D11, under Proton too) record Windows virtual-key codes,
 and the SDL window on macOS and Linux turns SDL keycodes into the same codes
 (`keyboard_sdl.c`). `tests/input_keyboard` checks every row and fails if the
@@ -182,8 +188,10 @@ table below and the code disagree; regenerate it with
   SDL window there, while Win32 reports the same keys as VK `1` and `3`. Auto-repeat is ignored, and on macOS Cmd+key is left to
   the system (Cmd going down releases the held keys).
 - Face buttons, shoulders and triggers read 255 held, 0 released; stick keys
-  give full deflection, and opposite keys cancel.
-- `RECOMP_KEY_TRACE=1` logs the first 40 key-downs as `[KEY] down vk=0x..`.
+  give full deflection (unless `stick_ramp_ms` is set), and opposite keys
+  cancel.
+- `RECOMP_TRACE=key` logs every key and mouse edge by its binding name
+  (`[KEY] down Return`), the first 200 and then one in 50.
 
 <!-- keyboard_map:begin (generated from src/input/keyboard.c; tests/input_keyboard checks it) -->
 | Key | Guest control |
@@ -213,6 +221,64 @@ table below and the code disagree; regenerate it with
 | J | Right stick left |
 | L | Right stick right |
 <!-- keyboard_map:end -->
+
+### Keyboard and mouse
+
+The keyboard and the mouse are one source on port 0 (`xbox_InputKbmPoll`,
+the backend hook), switched by `RECOMP_KEYBOARD` and `RECOMP_MOUSE` or by a
+title's `[input]` table (`src/enhance/enhance_input.c`, documented in
+[`docs/runtime/config.md`](../../docs/runtime/config.md#input)). It composes
+the pad from the runtime bindings: a control (`a`, `start`, `lstick_up`,
+...) holds up to eight inputs, and any of them held drives it.
+
+- **Vocabulary** (`input_names.c`, case-insensitive): `A`..`Z`, `0`..`9`,
+  `F1`..`F12`, `Space`, `Return` (alias `Enter`), `Escape` (alias `Esc`),
+  `Backspace`, `Tab`, `LShift`/`RShift`/`Shift`, `LCtrl`/`RCtrl`/`Ctrl`,
+  `LAlt`/`RAlt`/`Alt`, the arrows `Up`/`Down`/`Left`/`Right`, `Insert`,
+  `Delete`, `Home`, `End`, `PageUp`, `PageDown`, `KP0`..`KP9`, `KPEnter`,
+  `KPPlus`, `KPMinus`, `KPMultiply`, `KPDivide`, `KPPeriod`, the US-labelled
+  punctuation (`Comma`, `Period`, `Slash`, `Semicolon`, `Quote`,
+  `LBracket`, `RBracket`, `Backslash`, `Minus`, `Equals`, `Grave`), and
+  `MouseLeft`, `MouseRight`, `MouseMiddle`, `Mouse4`, `Mouse5`, `WheelUp`,
+  `WheelDown`. `Shift`, `Ctrl` and `Alt` hear either side; keypad Enter also
+  holds `Return`, as Win32 reports it. `LGui`/`RGui` (Cmd, the Windows key)
+  are the system's and have no name.
+- **Controls**: `a`, `b`, `x`, `y`, `white`, `black`, `ltrigger`,
+  `rtrigger`, `start`, `back`, `lthumb`, `rthumb`, `dpad_up`, `dpad_down`,
+  `dpad_left`, `dpad_right`, `lstick_up`, `lstick_down`, `lstick_left`,
+  `lstick_right`, `rstick_up`, `rstick_down`, `rstick_left`,
+  `rstick_right`.
+- **Stick keys**: with `stick_ramp_ms` above 0 a stick key starts at 0.41 of
+  full deflection (just past a 0.4 deadzone) and reaches full over that
+  time; two perpendicular keys give 1/√2 each, and the walk key caps the
+  magnitude at `walk_scale`. With 0, every key is full deflection as the
+  table above gives.
+- **Mouse**: the counts since the last poll become a stick deflection
+  (`min_deflection + (1 - min_deflection) · min(1, counts · sensitivity / 40)`),
+  replacing the keys' value on that axis for that poll; a mouse at rest reads
+  zero the next poll. A wheel notch holds its control for `wheel_pulse_ms`,
+  then one poll released before the next notch.
+- **Capture**: the cursor is captured (hidden, confined, relative) while the
+  window has focus (`focus`, the default), after a click in it (`click`), or
+  never (`never`). Focus loss, the release key (`F9` by default, a toggle)
+  and `xbox_InputMouseSuspend(1)` (an overlay menu) free it, and each
+  transition logs `[INPUT] mouse captured` or `[INPUT] mouse released
+  (<reason>)`. A button press while free drives nothing, and in `focus` mode
+  neither does the click that focused the window: Win32's
+  `WM_MOUSEACTIVATE` names it, and otherwise (SDL, or Wine when the window
+  manager focuses first) it is the first press within
+  `XBOX_MOUSE_FOCUS_CLICK_MS` (250 ms) of the focus.
+- `RECOMP_TRACE=mouse` logs the model per poll: `[MOUSE] dx= dy= -> RS(x,y)`.
+- `RECOMP_DEBUG=kbm_script=<file>` injects key and mouse events on the poll
+  (one per line: `<seconds>|<N>p key down|up NAME`, `mouse move DX DY`,
+  `mouse down|up NAME`, `wheel N`); it captures the mouse itself and is
+  refused when the title runs its own input script.
+
+A title's own layout belongs in its settings file (BLiNX 2's is
+`packaging/config.default.toml`), not in the compiled-in map, which stays
+the fallback for titles without one. `tests/input_bindings` checks the
+names, the composer, the mouse model, the capture rules, the injector and
+the merge on every host.
 
 ## Connection state and rumble
 

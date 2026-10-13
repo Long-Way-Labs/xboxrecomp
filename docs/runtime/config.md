@@ -172,8 +172,8 @@ one line which value it runs instead. Such keys change only that game's
 code and leave the toolkit's backends alone, so every backend sees the same
 guest values. The title documents its keys with its environment variables.
 
-The input-selection keys (`[input]`) will be added later, when that work is
-done.
+The keyboard and mouse keys (`[input]`, `[input.bindings]`) have their own
+section, [Input](#input), below.
 
 ### What the render and present keys do
 
@@ -333,6 +333,129 @@ presenters read them at start.
   setting. A golden run must show
   `textures.pack=none`: the golden check fails any other value.
 
+### Input
+
+`[input]` turns the keyboard and mouse on as a source on port 0 (player 1)
+and tunes them; `[input.bindings]` says which key or mouse input drives
+each of the Duke's controls. `xbox_enhance_init` reads both through
+`src/enhance/enhance_input.c` into `src/input` (`keyboard.c`, `mouse.c`).
+The keys and mouse merge onto a pad on port 0: buttons are OR'd, the larger
+analog value wins, and a stick the keys or mouse move replaces the pad's.
+A title that never calls `xbox_enhance_init` keeps the compiled-in key
+table of `src/input/README.md` and no mouse.
+
+| Key | Type | Values | Default | Env override |
+|---|---|---|---|---|
+| `input.keyboard` | bool | the keys drive port 0 | `false` | `RECOMP_KEYBOARD` |
+| `input.mouse` | bool | the mouse drives port 0: motion is a stick, buttons and the wheel as bound | `false` | `RECOMP_MOUSE` |
+| `input.mouse_look` | string | `"right_stick"`, `"left_stick"`, `"none"`: the stick mouse motion drives | `"right_stick"` | none |
+| `input.mouse_sensitivity` | float | `0.1` .. `10.0`; at `1.0`, 40 counts in one poll is full deflection | `1.0` | none |
+| `input.mouse_invert_y` | bool | mouse forward looks down | `false` | none |
+| `input.mouse_invert_x` | bool | | `false` | none |
+| `input.mouse_min_deflection` | float | `0.0` .. `0.9`: any motion deflects the stick at least this much | `0.45` | none |
+| `input.mouse_capture` | string | `"focus"`: the cursor is grabbed while the window has focus (the click that brings the window forward drives nothing: Win32 says which click that is, and on SDL and under a window manager that focuses first it is the first press within 250 ms of the focus); `"click"`: the first click in the window grabs it (and drives nothing); `"never"` | `"focus"` | none |
+| `input.mouse_release_key` | string | a key name: frees the cursor, and grabs it again; `""` or `"none"`: no release key | `"F9"` | none |
+| `input.wheel_pulse_ms` | int | `20` .. `2000`: how long one wheel notch holds its control | `100` | none |
+| `input.stick_ramp_ms` | int | `0` .. `2000`: a stick key goes from 0.41 of full deflection to full over this time; `0` is full at once | `0` | none |
+| `input.walk_key` | string | a key name: while held, the stick keys give `walk_scale` of full; `""` or `"none"`: no walk key | none | none |
+| `input.walk_scale` | float | `0.41` .. `1.0` (outside is clamped) | `1.0` | none |
+
+These defaults are the layer's. The three stick knobs default to the
+legacy keyboard (no ramp, no walk key), so a title that ships no `[input]`
+keys keeps it; BLiNX 2's `config.default.toml` sets 60 ms, `LAlt` and
+`0.5`. A title's `config.default.toml` also sets the two switches (BLiNX 2
+ships both `true`), and `RECOMP_CONFIG=none` reads no
+file, so both stay off unless the environment turns them on.
+`RECOMP_KEYBOARD` and `RECOMP_MOUSE` predate the naming rule and keep their
+names.
+
+The floor of 0.41 is there because titles commonly ignore a stick below
+about 0.4 of full deflection (BLiNX 2 does): a tap of a stick key or a
+slow mouse motion that stayed under it would do nothing.
+
+**Bindings.** Each key of `[input.bindings]` is a control, and its value
+a string or a list of strings naming inputs:
+
+```toml
+[input.bindings]
+a = "Space"
+start = ["Return", "Escape"]
+b = "MouseLeft"
+lthumb = []                 # unbound
+```
+
+Controls: `a b x y white black ltrigger rtrigger start back lthumb rthumb
+dpad_up dpad_down dpad_left dpad_right lstick_up lstick_down lstick_left
+lstick_right rstick_up rstick_down rstick_left rstick_right`.
+
+Inputs, in any case, by the label the host layout gives the key (the key
+labelled Z is `Z` on AZERTY too): `A`..`Z`, `0`..`9`, `F1`..`F12`,
+`Space`, `Return` (or `Enter`), `Escape` (or `Esc`), `Backspace`, `Tab`,
+`LShift` `RShift` `Shift`, `LCtrl` `RCtrl` `Ctrl`, `LAlt` `RAlt` `Alt`
+(the unsided names match either side), `Up` `Down` `Left` `Right`,
+`Insert` `Delete` `Home` `End` `PageUp` `PageDown`, `KP0`..`KP9`,
+`KPEnter` `KPPlus` `KPMinus` `KPMultiply` `KPDivide` `KPPeriod`, `Comma`
+`Period` `Slash` `Semicolon` `Quote` `LBracket` `RBracket` `Backslash`
+`Minus` `Equals` `Grave`; the mouse: `MouseLeft` `MouseRight`
+`MouseMiddle` `Mouse4` `Mouse5` `WheelUp` `WheelDown`. The Cmd and
+Windows keys are not bindable: they belong to the system. The table lives
+in `src/input/input_names.c`; `RECOMP_TRACE=key` prints each key's name as
+it is pressed. A control holds up to 8 inputs.
+
+**Resolution.**
+
+- Per control, the highest file that names it wins whole: the player's
+  `start = "Return"` replaces the defaults' `["Return", "Escape"]`, and
+  `a = []` unbinds.
+- An input a higher file names under one control is removed from every
+  control a lower file gave it, so binding `Escape` to `back` in your file
+  takes it off `start` without touching `start`.
+- Inside one file, an input named under two controls is reported and the
+  second ignored.
+- A control no file names keeps the compiled-in table's keys, less any a
+  file binds elsewhere.
+
+**Errors** never stop the game and leave the rest of the file applied; each
+is one line, with the file and the line of the key:
+
+```
+[INPUT] config error: config/config.toml:7: unknown control 'jmp' under [input.bindings] (controls: a b x ... rstick_right); ignored
+[INPUT] config error: config/config.toml:8: unknown input 'Spacebar' in input.bindings.x (see docs/input.md); skipped
+[INPUT] config error: config/config.toml:3: 'J' already bound to input.bindings.x on line 2; ignored here
+[INPUT] config error: config/config.toml:9: input.bindings.a is a string or a list of strings (got integer); ignored
+[INPUT] config error: config/config.toml:2: input.mouse_sensitivity 0 out of range 0.1 .. 10; using 1
+[INPUT] config error: config/config.toml:3: input.mouse_look 'camera' is not one of right_stick, left_stick, none; using right_stick
+[INPUT] config error: config/config.toml:5: input.stick_ramp_ms should be an integer (got string); using the default
+```
+
+`F9`, `F10` and `F11` are reserved (freeing the cursor, the menu hotkey,
+fullscreen); binding one is applied with a warning in the same format,
+`... input.bindings.white 'F10' is the menu hotkey (menu.hotkey); bound
+anyway`.
+
+The release key and the walk key act before the bindings, so a control
+bound to either never sees it. That gets a warning, as does setting both to
+the same key:
+
+```
+[INPUT] config warning: input.mouse_release_key 'F9' is also bound to input.bindings.y
+[INPUT] config warning: input.walk_key and input.mouse_release_key are the same key
+```
+
+`RECOMP_KBM_SCRIPT` plays through the keyboard and mouse, so with both off
+it is ignored, with `[INPUT] kbm_script ignored: keyboard and mouse off`.
+
+**Log.** One line at init: the switches, the look target and sensitivity,
+and how many controls each file decided, lowest file first:
+
+```
+[INPUT] config: keyboard=on mouse=on look=right_stick sens=1.0 bindings=24 (<exe dir>/config.default.toml) +1 (./config/config.toml)
+[INPUT] config: keyboard=off mouse=off (RECOMP_CONFIG=none)
+```
+
+The `[ENHANCE]` lines do not mention `[input]`, and the golden runs, which
+run under `RECOMP_CONFIG=none`, keep both off.
+
 ### Naming rule
 
 - Tables group keys by feature: `[render]`, `[present]`, `[display]`, `[aspect]`, and a title's own.
@@ -360,6 +483,8 @@ exist only when the layer is built (`RECOMP_ENV_HAVE_ENHANCE_KEYS`):
 | `RECOMP_TEXTURES_PACK` | overrides `textures.pack` |
 | `RECOMP_TEXTURES_FONT` | overrides `textures.font` |
 | `RECOMP_TEXTURES_TEXT` | overrides `textures.text` |
+| `RECOMP_KEYBOARD` | overrides `input.keyboard` (an older name, outside the naming rule) |
+| `RECOMP_MOUSE` | overrides `input.mouse` |
 
 The layer converts an environment value to the type of the key:
 

@@ -24,6 +24,8 @@
 #include <string.h>
 #include "video_player.h"   /* the xbox_FramebufferWindow* prototypes */
 #include "window_title.h"
+#include "keyboard.h"       /* src/input: the key table this window feeds */
+#include "mouse.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -140,37 +142,43 @@ void xbox_FramebufferWindowFrameStats(uint32_t draws)
 
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
+    /* The mouse only observes (motion, buttons, focus, the capture), so
+     * every message goes on to the cases below. */
+    xbox_InputMouseWin32Msg(h, m, (uintptr_t)w, (intptr_t)l);
+
     switch (m) {
     case WM_CLOSE:
     case WM_DESTROY:
+        /* The loop ends without another pump to drop the cursor clip. */
+        xbox_InputMouseWin32Release(h);
         InterlockedExchange(&s_fb_running, 0);
         return 0;
 
+    /* RECOMP_TRACE=key traces each edge by its binding name inside
+     * xbox_InputKeyEvent: an edge trace, not a sample of what is held,
+     * because a 100 ms tap is missed by a once-a-second sample nine times
+     * in ten, and "did the key arrive" is what a remote test needs. */
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
-        xbox_InputKeySet((int)w, 1);
-        /* RECOMP_KEY_TRACE: each key as it arrives, edge-triggered.
-         *
-         * The obvious diagnostic -- sampling which keys are held, once a
-         * second, from the input path -- cannot tell a key that was never
-         * pressed from one that was tapped: a 100 ms press is caught about
-         * one time in ten. That ambiguity is expensive when the only way
-         * to test is to ask someone to press a key and describe what
-         * happened. This answers "did it arrive" on its own. */
-        if (recomp_env(RENV_KEY_TRACE)) {
-            static unsigned n;
-            if (n++ < 40) {
-                fprintf(stderr, "  [KEY] down vk=0x%02X\n", (unsigned)w);
-                fflush(stderr);
-            }
-        }
+        /* Auto-repeat (bit 30, the previous state) is not a new edge. */
+        if (!(l & (1L << 30)))
+            xbox_InputKeyEventWin32((int)w, (unsigned long)l, 1);
         /* System keys still go to Windows, or Alt+F4 stops closing us. */
         return m == WM_SYSKEYDOWN ? DefWindowProcA(h, m, w, l) : 0;
 
     case WM_KEYUP:
     case WM_SYSKEYUP:
-        xbox_InputKeySet((int)w, 0);
+        xbox_InputKeyEventWin32((int)w, (unsigned long)l, 0);
         return m == WM_SYSKEYUP ? DefWindowProcA(h, m, w, l) : 0;
+
+    /* Alt (the walk key) or F10 alone would put the window in menu mode,
+     * which takes the keyboard until the next key. This window has no
+     * menu; Alt+F4 is SC_CLOSE and still reaches Windows. With the keyboard
+     * off the keys drive nothing, so Alt+Space keeps the system menu. */
+    case WM_SYSCOMMAND:
+        if ((w & 0xFFF0) == SC_KEYMENU && xbox_InputKeyboardOn())
+            return 0;
+        break;
 
     /* Alt-tabbing away with a key held would leave it held for ever. */
     case WM_KILLFOCUS:
@@ -346,6 +354,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
+        xbox_InputMouseWin32Sync(hwnd);
         if (s_present_idx >= 0 && s_rgb) {
             /* A finished frame, published by the flip. Copied into s_rgb so
              * the dump path and GDI see one consistent image even if the

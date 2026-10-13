@@ -9,9 +9,15 @@
 set(INPUT_SRC ${CMAKE_CURRENT_LIST_DIR}/../../src/input)
 add_executable(input_keyboard_test
     test_main.c
-    ${INPUT_SRC}/keyboard.c)
+    ${INPUT_SRC}/keyboard.c
+    ${INPUT_SRC}/mouse.c
+    ${INPUT_SRC}/input_names.c
+    ${INPUT_SRC}/kbm_script.c)
 target_include_directories(input_keyboard_test PRIVATE ${INPUT_SRC})
 target_link_libraries(input_keyboard_test PRIVATE platform)
+if(NOT WIN32)
+    target_link_libraries(input_keyboard_test PRIVATE m)
+endif()
 # The README beside the binary, as tests/input_map does (Proton runs the
 # test from its own directory).
 configure_file(${INPUT_SRC}/README.md ${CMAKE_CURRENT_BINARY_DIR}/input_README.md COPYONLY)

@@ -95,6 +95,7 @@ extern "C" {
     X(HEAP_RECLAIM,      CONFIG, "RECOMP_HEAP_RECLAIM",      NULL, "set: the heap splits and merges freed blocks exactly (upstream, default off)") \
     X(EXT_VMA,           CONFIG, "RECOMP_EXT_VMA",           NULL, "set: honour reservations at fixed addresses above the RAM mirrors (upstream, default off)") \
     X(KEYBOARD,          CONFIG, "RECOMP_KEYBOARD",          NULL, "1: keyboard drives pad 1") \
+    X(MOUSE,             CONFIG, "RECOMP_MOUSE",             NULL, "1: the mouse drives pad 1 (a stick and buttons); 0: off") \
     X(PAD_DEADZONE,      CONFIG, "RECOMP_PAD_DEADZONE",      NULL, "stick deadzone, 0..32767 (default 0)") \
     X(STDIO_LOG,         CONFIG, "RECOMP_STDIO_LOG",         NULL, "send stdout/stderr to this file") \
     X(LOG_LEVEL,         CONFIG, "RECOMP_LOG_LEVEL",         "XBOX_LOG_LEVEL", "kernel log level, 0 (error) .. 4 (trace)") \
@@ -137,7 +138,8 @@ extern "C" {
     X(USB_TRACE,         TRACE, "usb",             "RECOMP_USB_TRACE",         "OHCI trace") \
     X(USB_STATS,         TRACE, "usb_stats",       "RECOMP_USB_STATS",         "OHCI summary line every 5 s") \
     X(INPUT_DIAG,        TRACE, "input_diag",      "RECOMP_INPUT_DIAG",        "input chain probe once a second") \
-    X(KEY_TRACE,         TRACE, "key",             "RECOMP_KEY_TRACE",         "key-down events, every window") \
+    X(KEY_TRACE,         TRACE, "key",             "RECOMP_KEY_TRACE",         "every key and mouse edge by binding name (first 200, then 1 in 50)") \
+    X(MOUSE_TRACE,       TRACE, "mouse",           NULL,                       "mouse model per poll: counts in, stick out (first 200)") \
     X(TITLE_STATS,       TRACE, "title",           NULL,                       "window title also shows FPS and draws, once a second") \
     X(CS_TRACE_CRT,      TRACE, "cs_crt",          "RECOMP_CS_TRACE_CRT",      "CRT critical sections; =all every one") \
     X(CS_WATCH,          TRACE, "cs_watch",        "RECOMP_CS_WATCH",          "=va: critical section at that address") \
@@ -231,6 +233,7 @@ extern "C" {
     X(USB_PADS,          CONFIG, "RECOMP_USB_PADS",          NULL, "emulated USB pads plugged in, 1..4 (default 1)") \
     X(PAD_SCRIPT,        DEBUG, "pad_script",      "RECOMP_PAD_SCRIPT",        "=ms:btn[+btn][:hold],... or =@file: timed pad presses") \
     X(PAD_LIVE,          DEBUG, "pad_live",        "RECOMP_PAD_LIVE",          "=file: press each line appended to it (btn[+btn][:hold])") \
+    X(KBM_SCRIPT,        DEBUG, "kbm_script",      NULL,                       "=file: inject key and mouse events on the pad poll (src/input/kbm_script.c); refused with RECOMP_INPUT_SCRIPT") \
     X(PB_REPORT_MS,      TRACE, "pb_report_ms",    "RECOMP_PB_REPORT_MS",      "=ms: [PB] report / fb_dump interval (10000, min 100)") \
     X(DPC_PROF,          TRACE, "dpc",             NULL,                       "[DPCPROF] time per host-run DPC/ISR routine and its waits, under the 600-vblank line") \
     X(PACING_TRACE,      TRACE, "pacing",          NULL,                       "[PACING] flip intervals, vblank gaps, the flip hold (holds, held ms, timeouts, intervals), CPU and spin-wait sites every 600 flips; =all also every flip") \

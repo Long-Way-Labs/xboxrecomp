@@ -61,7 +61,7 @@ static uint64_t xi_now_ms(void) { return GetTickCount64(); }
  * idle pad for an empty user index. If a Wine/Proton build does that, the
  * connection probe has to move to XInputGetCapabilities. */
 const xbox_input_backend xbox_input_host_backend = {
-    NULL, xi_get_state, xi_set_state, xbox_InputKeyboardPoll, xi_now_ms
+    NULL, xi_get_state, xi_set_state, xbox_InputKbmPoll, xi_now_ms
 };
 
 /* ======================================================================== */
@@ -165,7 +165,7 @@ static uint64_t sdl_now_ms(void)
 }
 
 const xbox_input_backend xbox_input_host_backend = {
-    sdl_init, sdl_get_state, sdl_set_state, xbox_InputKeyboardPoll, sdl_now_ms
+    sdl_init, sdl_get_state, sdl_set_state, xbox_InputKbmPoll, sdl_now_ms
 };
 
 #endif /* _WIN32 */

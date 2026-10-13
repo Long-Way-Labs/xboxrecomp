@@ -13,6 +13,7 @@
  * tests/input_map swaps in a fake one to count the calls.
  */
 #include "input_backend.h"
+#include "keyboard.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -52,6 +53,9 @@ void xbox_InputInit(void)
     g_inited = 1;
     if (g_be->init)
         g_be->init();
+    /* The keyboard's stick ramp and the wheel pulses run on the poll's
+     * clock, the backend's, so a test's fake clock drives them too. */
+    xbox_InputKbmSetClock(g_be->now_ms);
     for (DWORD p = 0; p < XBOX_MAX_CONTROLLERS; p++)
         probe(p, &st);
     /* A crash or an exit while the title has the motors on must not leave a

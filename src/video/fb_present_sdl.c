@@ -86,6 +86,7 @@
 #include "fb_present_metal.h"
 #endif
 #include "keyboard_sdl.h"     /* src/input: keys into the pad stand-in */
+#include "mouse_sdl.h"        /* src/input: the mouse and its capture */
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_log_thread_role(const char *role, uint32_t routine);
@@ -636,9 +637,10 @@ int xbox_HostWindowMain(int (*guest_main)(void))
          * xinput_device.c then only reads. */
         if (SDL_WaitEventTimeout(&ev, 100)) {
             do {
-                /* Keys for the pad stand-in, and the window events that
-                 * release them; it only reads the event. */
+                /* Keys and the mouse for port 0, and the window events
+                 * that release them; both only read the event. */
                 xbox_InputSdlEvent(&ev);
+                xbox_InputSdlMouseEvent(&ev);
                 if (ev.type == SDL_QUIT)
                     quit = 1;
                 else if (ev.type == s_guest_done_event)
@@ -651,6 +653,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                     dirty = 1;
             } while (SDL_PollEvent(&ev));
         }
+        /* The capture can change on the poll thread (the release key, a
+         * script); relative mode has to be set here, on the window's. */
+        xbox_InputSdlMouseSync();
 
         pthread_mutex_lock(&s_lock);
         seq = s_ready_seq;

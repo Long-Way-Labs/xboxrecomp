@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "enhance_cfg.h"
+#include "enhance_input.h"
 #include "kernel_pacing.h"
 #include "nv2a_backend_common.h"
 #include "nv2a_tex_pack.h"
@@ -129,6 +130,7 @@ int xbox_enhance_init(const char *root, const char *title)
             " present.pacing=%s present.surface=%s (display.aspect=%s)\n", o.render_scale,
             s_filters[o.present_filter], o.fullscreen, s_pacing[pacing], surface_txt, aspect);
     load_tex_pack(&o);
+    enhance_input_init();
     /* No enhance_cfg_report_unused() here: the title reads its own keys
      * (game.mode, say) after this, and calls it then. */
     return rc;

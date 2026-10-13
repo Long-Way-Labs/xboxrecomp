@@ -115,13 +115,40 @@ static uint32_t voice_get_mask(MCPXAPUState *d, uint16_t voice_handle,
            ctz32(mask);
 }
 
+/* The title's front-end methods (VOICE_OFF and VOICE_PAUSE, from its own
+ * thread, outside d->lock) and the frame thread's voice processing write bits
+ * of the same voice words. As a plain read-modify-write, one side could put
+ * back bits the other had just changed: the frame thread's per-frame
+ * NEW_VOICE clear restored an ACTIVE bit that VOICE_OFF had cleared, the
+ * voice played on with no idle-voice trap, and DirectSound's buffer teardown
+ * spun until its 500 ms watchdog forced the voice off (BLiNX 2 froze for
+ * 0.5 s or 1 s at a time, most often in Time Stop, which stops and restarts
+ * voices every frame). The MCPX front end and voice processor never lose
+ * each other's writes, so the masked bits change by compare-and-swap,
+ * without a lock.
+ *
+ * That makes updates of disjoint bits safe only. A caller that reads a field,
+ * computes from it and writes it back (envelope state and counters, CBO, an
+ * end-of-buffer voice_off decided from a CBO read earlier) can still lose to
+ * the other thread writing the same field in between. */
 static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
                            hwaddr offset, uint32_t mask, uint32_t val)
 {
     hwaddr voice = d->regs[NV_PAPU_VPVADDR] + voice_handle * NV_PAVS_SIZE;
-    uint32_t v = ldl_le_phys(address_space_memory, voice + offset) & ~mask;
-    stl_le_phys(address_space_memory, voice + offset,
-                v | ((val << ctz32(mask)) & mask));
+    uint32_t *word = (uint32_t *)mcpx_apu_phys(voice + offset);
+    uint32_t bits = (val << ctz32(mask)) & mask;
+    assert(((uintptr_t)word & 3) == 0);
+    uint32_t old = qatomic_load32(word);
+    for (;;) {
+        /* Most writes (the per-frame NEW_VOICE clear above all) change
+         * nothing; skip the locked instruction for those. */
+        if ((old & mask) == bits)
+            return;
+        uint32_t seen = qatomic_cmpxchg32(word, old, (old & ~mask) | bits);
+        if (seen == old)
+            return;
+        old = seen;
+    }
 }
 
 /* ============================================================

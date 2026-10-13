@@ -36,6 +36,33 @@
 #endif
 #endif
 
+/* 32-bit compare-and-swap: returns the value *p held, so the swap happened
+ * when that equals old. A function rather than a macro so the width is fixed
+ * by the prototype: long is 32 bits under MSVC but not on LP64 hosts. */
+static inline uint32_t qatomic_cmpxchg32(uint32_t *p, uint32_t old, uint32_t nv)
+{
+#ifdef _MSC_VER
+    return (uint32_t)_InterlockedCompareExchange((long volatile *)p, (long)nv,
+                                                 (long)old);
+#else
+    __atomic_compare_exchange_n(p, &old, nv, 0, __ATOMIC_SEQ_CST,
+                                __ATOMIC_SEQ_CST);
+    return old;
+#endif
+}
+
+/* 32-bit acquire load, for a value a compare-and-swap loop then trusts (a
+ * no-op write is skipped on it). _InterlockedOr with 0 is MSVC's full-barrier
+ * load. */
+static inline uint32_t qatomic_load32(uint32_t *p)
+{
+#ifdef _MSC_VER
+    return (uint32_t)_InterlockedOr((long volatile *)p, 0);
+#else
+    return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+#endif
+}
+
 /* ============================================================
  * QEMU clock helpers (beyond what NV2A shim provides)
  * ============================================================ */

@@ -985,23 +985,27 @@ static void test_enhance_init(void)
     recomp_env_set(RENV_DISPLAY_ASPECT, "16:9");
     CHECK(xbox_enhance_init(".", NULL) == 0 && o->render_scale == 1);
 
-    /* present.pacing: spin by default, from the file, env over file, and a
-     * bad value reported with the file answering. */
+    /* present.pacing: sleep by default (no file, no variable), spin from
+     * the file, env over file, and a bad value reported with the file
+     * answering: the file says spin, so the fallback is visible. */
     recomp_env_set(RENV_DISPLAY_ASPECT, NULL);
     recomp_env_set(RENV_CONFIG, "none");
     s_pacing_mode = -1;
-    CHECK(xbox_enhance_init(".", NULL) == 0 && s_pacing_mode == 0);
-    write_file("ecfg_pacing.toml", "[present]\npacing = \"sleep\"\n");
-    recomp_env_set(RENV_CONFIG, "ecfg_pacing.toml");
     CHECK(xbox_enhance_init(".", NULL) == 0 && s_pacing_mode == 1);
-    recomp_env_set(RENV_PRESENT_PACING, "spin");
+    write_file("ecfg_pacing.toml", "[present]\npacing = \"spin\"\n");
+    recomp_env_set(RENV_CONFIG, "ecfg_pacing.toml");
     CHECK(xbox_enhance_init(".", NULL) == 0 && s_pacing_mode == 0);
+    recomp_env_set(RENV_PRESENT_PACING, "sleep");
+    CHECK(xbox_enhance_init(".", NULL) == 0 && s_pacing_mode == 1);
     CHECK(enhance_cfg_report_unused() == 0);    /* overridden, not unused */
     recomp_env_set(RENV_PRESENT_PACING, "nap");
-    CHECK(xbox_enhance_init(".", NULL) == 0 && s_pacing_mode == 1);
+    CHECK(xbox_enhance_init(".", NULL) == 0 && s_pacing_mode == 0);
     recomp_env_set(RENV_PRESENT_PACING, NULL);
     recomp_env_set(RENV_CONFIG, "none");
-    recomp_env_set(RENV_PRESENT_PACING, "sleep");
+    recomp_env_set(RENV_PRESENT_PACING, "spin");
+    CHECK(xbox_enhance_init(".", NULL) == 0 && s_pacing_mode == 0);
+    /* A bad value with no file falls to the code default, sleep. */
+    recomp_env_set(RENV_PRESENT_PACING, "nap");
     CHECK(xbox_enhance_init(".", NULL) == 0 && s_pacing_mode == 1);
     recomp_env_set(RENV_PRESENT_PACING, NULL);
 

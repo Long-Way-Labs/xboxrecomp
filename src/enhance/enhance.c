@@ -89,8 +89,12 @@ int xbox_enhance_init(const char *root, const char *title)
     o.present_filter = enhance_cfg_choice("present.filter", s_filters, NV2A_PRESENT_NEAREST);
     o.fullscreen = enhance_cfg_bool("present.fullscreen", 0);
     /* How lowered guest spin waits wait (kernel_pacing.h): only titles
-     * generated with --spin-waits have any. Set before the guest starts. */
-    pacing = enhance_cfg_choice("present.pacing", s_pacing, XBOX_PACING_SPIN);
+     * generated with --spin-waits have any. Set before the guest starts.
+     * The default sleeps: the wait frees a host core and the frames and
+     * pace match the spin. "spin" is the console-original timing, where
+     * the wait holds a core as on the Xbox; a title's config.default.toml
+     * can keep it, and without this layer the kernel stays at spin. */
+    pacing = enhance_cfg_choice("present.pacing", s_pacing, XBOX_PACING_SLEEP);
     xbox_PacingSetMode(pacing);
     /* Who scales the frame to the screen. Under gamescope the compositor
      * should: its filter (Steam's FSR) upscales only a surface smaller than

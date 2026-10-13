@@ -145,9 +145,11 @@ CRLF line endings are accepted.
 
 ## Keys
 
-The current keys are listed below. Every key defaults to the stock behaviour,
-so an empty file (or no file) runs the game as it was. Golden runs always use
-the stock settings.
+The current keys are listed below. Every key defaults to the stock behaviour
+except `present.pacing`, which defaults to `"sleep"` (the frames and pace
+match the console's spin, and a host core is freed), so an empty file (or no
+file) runs the game as it was apart from that wait. Golden runs always use
+the stock settings, `present.pacing = "spin"` included.
 
 | Key | Type | Values | Default | Env override |
 |---|---|---|---|---|
@@ -155,7 +157,7 @@ the stock settings.
 | `display.aspect` | string | `"4:3"` only for now (`"16:9"`, `"16:10"`, `"21:9"` are reported as not implemented, and 4:3 is used) | `"4:3"` | `RECOMP_DISPLAY_ASPECT` |
 | `present.filter` | string | `"nearest"`, `"linear"`, `"integer"` | `"nearest"` | `RECOMP_PRESENT_FILTER` |
 | `present.fullscreen` | bool | borderless fullscreen at start | `false` | `RECOMP_PRESENT_FULLSCREEN` |
-| `present.pacing` | string | `"spin"` (stock), `"sleep"`: how a lowered guest busy-wait waits | `"spin"` | `RECOMP_PRESENT_PACING` |
+| `present.pacing` | string | `"sleep"`, `"spin"` (stock, the console-original timing): how a lowered guest busy-wait waits | `"sleep"` | `RECOMP_PRESENT_PACING` |
 | `present.surface` | string | `"auto"`, `"window"`, `"internal"`: who scales the frame to the screen, the game or the compositor | `"auto"` | `RECOMP_PRESENT_SURFACE` |
 | `textures.pack` | string | a texture pack file ([texture-pack.md](../formats/texture-pack.md)); relative to the executable's directory | none | `RECOMP_TEXTURES_PACK` |
 | `textures.font` | string | `"on"`, `"off"`: the pack's font-atlas entries | `"on"` | `RECOMP_TEXTURES_FONT` |
@@ -183,7 +185,7 @@ libraries never link the layer: without it the options are all zero, which
 is stock. One line shows the values in force:
 
 ```
-[ENHANCE] render.scale=2 present.filter=integer present.fullscreen=0 present.pacing=spin present.surface=window(auto) (display.aspect=4:3)
+[ENHANCE] render.scale=2 present.filter=integer present.fullscreen=0 present.pacing=sleep present.surface=window(auto) (display.aspect=4:3)
 ```
 
 A change while the game runs (the in-game menu) goes through
@@ -272,11 +274,16 @@ presenters read them at start.
   SDL renderer window (the CPU backend) ignores the key with one line.
 - **`present.pacing`.** Only for a title generated with
   `tools.recomp --spin-waits` ([lifting](../pipeline/04-lifting.md#spin-waits)),
-  whose busy-wait loops call `RECOMP_SPIN_WAIT` on their back edge. `spin`
-  (stock) does nothing there: the loop holds a host core as it holds the
-  console's CPU. `sleep` blocks the thread until the kernel signals a state
-  change (a vblank, an ISR or DPC, a fence write) or 1 ms passes
-  (`src/kernel/kernel_pacing.h`), which frees that core. The frames are the
+  whose busy-wait loops call `RECOMP_SPIN_WAIT` on their back edge. `sleep`
+  (the default) blocks the thread until the kernel signals a state change
+  (a vblank, an ISR or DPC, a fence write) or 1 ms passes
+  (`src/kernel/kernel_pacing.h`), which frees a host core. `spin` is the
+  console-original timing and does nothing there: the loop holds a host
+  core as it holds the console's CPU. Set it with `[present]`
+  `pacing = "spin"` in the player's `config.toml`, or
+  `RECOMP_PRESENT_PACING=spin`; a title's `config.default.toml` can ship
+  either, and its value wins over this default. Without the layer the
+  kernel stays at `spin`. The frames are the
   guest's own either way; what can move is when the loop sees its exit,
   by up to the wake latency. Without lowered loops the key changes nothing.
   `RECOMP_TRACE=pacing` prints the flip intervals, process CPU and, per

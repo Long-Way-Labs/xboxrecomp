@@ -121,10 +121,12 @@ extern "C" {
     X(SURF_TRACE,        TRACE, "surf",            "RECOMP_SURF_TRACE",        "=offset: surface methods from that colour offset") \
     X(PB_SEMA_TRACE,     TRACE, "sema",            "RECOMP_PB_SEMA_TRACE",     "every semaphore release") \
     X(PB_UNHANDLED_ALL,  TRACE, "unhandled_all",   "RECOMP_PB_UNHANDLED_ALL",  "list every unhandled method, not ten") \
-    X(PB_SCAN,           TRACE, "pb_scan",         "RECOMP_PB_SCAN",           "pushbuffer survey and its report") \
-    X(NV2A_TRACE,        TRACE, "nv2a",            "RECOMP_NV2A_TRACE",        "NV2A register poll") \
+    X(PB_SCAN,           TRACE, "pb_scan",         "RECOMP_PB_SCAN",           "pushbuffer survey and the periodic [GPU]/[PB] report") \
+    X(NV2A_TRACE,        TRACE, "nv2a",            "RECOMP_NV2A_TRACE",        "NV2A poll: a [NV2A] DMA_PUT line per kick (costly on Windows), PCRTC_START, fb checksum, periodic report") \
     X(PB_WRAP_TRACE,     TRACE, "pb_wrap",         "RECOMP_PB_WRAP_TRACE",     "pushbuffer wraps") \
     X(HEAP_TRACE,        TRACE, "heap",            "RECOMP_HEAP_TRACE",        "=va: heap blocks covering that address") \
+    X(FILE_TRACE,        TRACE, "file",            NULL,                       "[READ]/[WRITE] records per NtReadFile/NtWriteFile call: caller, buffer, offset, length, status and the first bytes") \
+    X(KERNEL_SUMMARY,    TRACE, "kernel_summary",  NULL,                       "the 2 s [KERNEL] summary block: cumulative calls, the ordinal the tick landed on, esp, the six most-called ordinals") \
     X(KERNEL_LOG_BUDGET, TRACE, "kernel_budget",   "RECOMP_KERNEL_LOG_BUDGET", "=n: kernel log lines per call site (200)") \
     X(TRACE_BUDGET,      TRACE, "call_budget",     "RECOMP_TRACE_BUDGET",      "=n: call-trace line budget (400000)") \
     X(TRACE_ARGS,        TRACE, "call_args",       "RECOMP_TRACE_ARGS",        "=n: call trace prints n stack args") \

@@ -1137,6 +1137,7 @@ VOID __stdcall xbox_KeBugCheck(ULONG BugCheckCode)
     /* ExitProcess skips atexit. Guest code calls this, never from inside
      * the report's lock, so the summary's list write may take it. */
     xbox_missing_summary("bugcheck");
+    xbox_kernel_summary_report("bugcheck");
     ExitProcess(BugCheckCode);
 }
 
@@ -1159,6 +1160,7 @@ VOID __stdcall xbox_KeBugCheckEx(
     /* ExitProcess skips atexit. Guest code calls this, never from inside
      * the report's lock, so the summary's list write may take it. */
     xbox_missing_summary("bugcheck");
+    xbox_kernel_summary_report("bugcheck");
     ExitProcess(BugCheckCode);
 }
 

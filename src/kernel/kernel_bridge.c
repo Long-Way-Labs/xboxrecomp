@@ -30,6 +30,7 @@
 #include "kernel_pacing.h"
 #include "recomp_env.h"
 #include "platform/host_time.h"
+#include "recomp_exit_hook.h"
 #include "guest_vmem.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
@@ -1848,6 +1849,7 @@ static void bridge_HalReturnToFirmware(void)
     /* The missing-file summary, for the same reason. On POSIX ExitProcess is
      * exit() and atexit runs after all; the summary prints once either way. */
     xbox_missing_summary("firmware");
+    xbox_kernel_summary_report("firmware");
 
     /* Let a host-played FMV finish before the process goes away.
      *
@@ -4659,6 +4661,17 @@ static int bridge_async_io_enabled(void)
     return on;
 }
 
+/* The [READ]/[WRITE] records behind RECOMP_TRACE=file. They are bring-up
+ * evidence, one line per call on the guest thread, and a load or a save
+ * prints them by the thousand; nothing reads them in a default run. */
+static int bridge_file_trace(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = recomp_env(RENV_FILE_TRACE) ? 1 : 0;
+    return on;
+}
+
 /* ── NtReadFile (ordinal 219, 8 args = 32 bytes) ──────── */
 static void bridge_NtReadFile(void)
 {
@@ -4688,7 +4701,7 @@ static void bridge_NtReadFile(void)
     /* What a read actually delivered. A decoder that rejects its input cannot
      * say whether the bytes were wrong or the read was, and the two look
      * identical from inside the title -- the first bytes settle it. */
-    {
+    if (bridge_file_trace()) {
         const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(buffer_va);
         uint32_t got = (uint32_t)ios.Information;
         /* The offset matters as much as the length. A title streaming a pack
@@ -4762,7 +4775,7 @@ static void bridge_NtWriteFile(void)
     /* The same record as [READ]: where the bytes came from and the first of
      * them. A cache copy that comes out all zeros is either a write from the
      * wrong buffer or a right buffer that was cleared, and this tells which. */
-    if (length >= 4096) {
+    if (length >= 4096 && bridge_file_trace()) {
         const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(buffer_va);
         fprintf(stderr, "  [WRITE] from=0x%08X buf=0x%08X @%lld len=%u st=0x%08X  "
                 "%02X %02X %02X %02X\n", g_xbox_kernel_caller, buffer_va,
@@ -10782,6 +10795,78 @@ static void kernel_thunk_dispatch(void)
         xbox_GuestCpuAcquire();
 }
 
+/* The [KERNEL] summary block: the cumulative call count, the call this one
+ * happened to be, and the six most-called ordinals since boot. */
+static void kernel_summary_print(const char *why, ULONG ordinal, int slot,
+                                 uint32_t esp)
+{
+    /* On the stack: the periodic block and an exit report can run at once,
+     * on different threads. */
+    unsigned char shown_ord[XBOX_KERNEL_THUNK_TABLE_SIZE];
+    int r, shown;
+
+    fprintf(stderr, "  [KERNEL] summary%s%s%s: %lld total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
+            why ? " (" : "", why ? why : "", why ? ")" : "",
+            g_kernel_call_count, (unsigned)ordinal, slot, esp);
+    /* And which ones, ranked. "Latest" names whatever the sample
+     * happened to land on; the question behind this line is what a
+     * title sitting still is actually asking the kernel for, and
+     * that wants counting rather than sampling. The counters are read
+     * unsynchronised, a deliberate snapshot: the watchdog calls this for
+     * a wedged thread that may hold any lock there could be. */
+    memset(shown_ord, 0, sizeof shown_ord);
+    for (shown = 0; shown < 6; shown++) {
+        int best = -1;
+        for (r = 0; r < XBOX_KERNEL_THUNK_TABLE_SIZE; r++)
+            if (g_ordinal_calls[r] && !shown_ord[r]
+                && (best < 0 || g_ordinal_calls[r] > g_ordinal_calls[best]))
+                best = r;
+        if (best < 0)
+            break;
+        shown_ord[best] = 1;
+        fprintf(stderr, "  [KERNEL]   ordinal %3d x%llu\n", best,
+                (unsigned long long)g_ordinal_calls[best]);
+    }
+    fflush(stderr);
+}
+
+/* Every 2 s the block repeated the same six ordinals for the whole run, on
+ * whichever guest thread's call landed on the tick; once at exit and in the
+ * watchdog's hang report says the same. RECOMP_TRACE=kernel_summary brings
+ * the periodic form back. */
+static int kernel_summary_trace(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = recomp_env(RENV_KERNEL_SUMMARY) ? 1 : 0;
+    return on;
+}
+
+/* The call the latest dispatch was, for the exit and watchdog reports, which
+ * run on threads that are not the caller's (g_esp is thread-local). */
+static ULONG    s_last_ordinal;
+static int      s_last_slot;
+static uint32_t s_last_esp;
+static int      s_summary_hooked;
+static int      s_summary_done;
+
+/* Once, by whichever exit gets there first: on POSIX a firmware exit also
+ * runs atexit, and a window close can race the main thread's exit. */
+void xbox_kernel_summary_report(const char *why)
+{
+    if (g_kernel_call_count == 0 || __atomic_exchange_n(&s_summary_done, 1, __ATOMIC_ACQ_REL) != 0)
+        return;
+    kernel_summary_print(why,
+                         __atomic_load_n(&s_last_ordinal, __ATOMIC_RELAXED),
+                         __atomic_load_n(&s_last_slot, __ATOMIC_RELAXED),
+                         __atomic_load_n(&s_last_esp, __ATOMIC_RELAXED));
+}
+
+static void kernel_summary_at_exit(void)
+{
+    xbox_kernel_summary_report("exit");
+}
+
 static void kernel_thunk_dispatch_body(void)
 {
     int slot = g_kernel_dispatch_slot;
@@ -10822,36 +10907,21 @@ static void kernel_thunk_dispatch_body(void)
         fflush(stderr);
     }
 
-    {
+    __atomic_store_n(&s_last_ordinal, ordinal, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_last_slot, slot, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_last_esp, g_esp, __ATOMIC_RELAXED);
+    if (!__atomic_load_n(&s_summary_hooked, __ATOMIC_RELAXED)
+        && !__atomic_exchange_n(&s_summary_hooked, 1, __ATOMIC_ACQ_REL)) {
+        atexit(kernel_summary_at_exit);
+        recomp_exit_hook_add(xbox_kernel_summary_report);  /* the windows' ExitProcess */
+    }
+
+    if (kernel_summary_trace()) {
         static DWORD last_summary_tick = 0;
         DWORD now = GetTickCount();
         if (last_summary_tick == 0) last_summary_tick = now;
         if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
-            fprintf(stderr, "  [KERNEL] summary: %lld total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
-                    g_kernel_call_count, ordinal, slot, g_esp);
-            /* And which ones, ranked. "Latest" names whatever the sample
-             * happened to land on; the question behind this line is what a
-             * title sitting still is actually asking the kernel for, and
-             * that wants counting rather than sampling. */
-            {
-                static unsigned char shown_ord[XBOX_KERNEL_THUNK_TABLE_SIZE];
-                int r, shown;
-
-                memset(shown_ord, 0, sizeof shown_ord);
-                for (shown = 0; shown < 6; shown++) {
-                    int best = -1;
-                    for (r = 0; r < XBOX_KERNEL_THUNK_TABLE_SIZE; r++)
-                        if (g_ordinal_calls[r] && !shown_ord[r]
-                            && (best < 0 || g_ordinal_calls[r] > g_ordinal_calls[best]))
-                            best = r;
-                    if (best < 0)
-                        break;
-                    shown_ord[best] = 1;
-                    fprintf(stderr, "  [KERNEL]   ordinal %3d x%llu\n", best,
-                            (unsigned long long)g_ordinal_calls[best]);
-                }
-            }
-            fflush(stderr);
+            kernel_summary_print(NULL, ordinal, slot, g_esp);
             last_summary_tick = now;
         }
     }

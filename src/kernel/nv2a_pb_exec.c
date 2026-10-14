@@ -6461,6 +6461,19 @@ static void peek_chain(void)
     fflush(stderr);
 }
 
+/* The report's RECOMP_FB_DUMP picture on its own, for a run that asked for
+ * pictures but not for the [GPU] text. One picture per report rather than
+ * per clear: a title clears hundreds of times a second and nobody wants that
+ * many files. The last flip's surface, once there is one: mid-frame, the
+ * current target is as likely an offscreen one. */
+void nv2a_pb_exec_report_dump(void)
+{
+    if (s_present.offset)
+        dump_present_bmp();
+    else
+        dump_surface_bmp();
+}
+
 void nv2a_pb_exec_report(void)
 {
     peek_addresses();
@@ -6498,14 +6511,7 @@ void nv2a_pb_exec_report(void)
         fprintf(stderr, ", %u dropped for scratch", s_xv_fail);
     fputc('\n', stderr);
     vsh_report();
-    /* One picture per report rather than per clear: a title clears hundreds of
-     * times a second and nobody wants that many files. The last flip's
-     * surface, once there is one: mid-frame, the current target is as likely
-     * an offscreen one. */
-    if (s_present.offset)
-        dump_present_bmp();
-    else
-        dump_surface_bmp();
+    nv2a_pb_exec_report_dump();
 
     /* Drawn and skipped separately: "nothing appeared" and "every batch needed
      * a vertex program we do not run" look identical on screen, and only one

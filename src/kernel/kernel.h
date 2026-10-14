@@ -515,6 +515,11 @@ ULONG_PTR xbox_resolve_ordinal(ULONG ordinal);
 /* Kernel bridge (kernel_bridge.c) - resolve kernel thunks in Xbox memory */
 void xbox_kernel_bridge_init(void);
 
+/* The [KERNEL] summary block (calls since boot, the latest call, the six
+ * most-called ordinals), once per process with why in its first line. The
+ * exit paths and the watchdog's hang report print it. */
+void xbox_kernel_summary_report(const char *why);
+
 /**
  * Per-title kernel ordinal remap.
  *

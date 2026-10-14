@@ -1440,6 +1440,10 @@ static void pgraph_fence_tick(volatile uint32_t *regs)
 }
 
 static int s_nv2a_trace = 0;
+/* The periodic [GPU]/[PB] report: set by RECOMP_TRACE=nv2a, pb_scan, or
+ * any key that is only ever read inside the report (peek, find_nan,
+ * tex_state...). Without it those keys would be accepted and do nothing. */
+static int s_pb_report = 0;
 
 /* The display framebuffer, as reported by AvSetDisplayMode. Checksummed once a
  * second so a run can answer the only question that matters before building a
@@ -1731,6 +1735,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 {
                     extern void nv2a_pb_scan(uint32_t, uint32_t);
                     extern void nv2a_pb_scan_report(void);
+                    extern void nv2a_pb_exec_report_dump(void);
                     static DWORD last_report;
 
                     /* DMA_PUT holds a PHYSICAL address -- Xbox D3D writes
@@ -1784,9 +1789,15 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                         report_ms = e ? atol(e) : 10000;
                         if (report_ms < 100) report_ms = 100;
                     }
-                    if (s_nv2a_trace && now_ms - last_report > (uint64_t)report_ms) {
+                    /* The [GPU]/[PB] text is a bring-up report, so it waits
+                     * for a key that asks for it; RECOMP_FB_DUMP on its own
+                     * still gets its picture every interval. */
+                    if (now_ms - last_report > (uint64_t)report_ms) {
                         last_report = now_ms;
-                        nv2a_pb_scan_report();
+                        if (s_pb_report)
+                            nv2a_pb_scan_report();
+                        else if (s_pb_exec && recomp_env(RENV_FB_DUMP))
+                            nv2a_pb_exec_report_dump();
                     }
                 }
                 /* Consumed, now that it has actually been executed. */
@@ -1814,21 +1825,24 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                  * with the completed fence, so two hosts' logs can be lined up
                  * by time and by GPU progress (Proton's fence was seen
                  * advancing ~100x slower than macOS's). */
+                /* One write for the whole line: stderr is unbuffered, so
+                 * four calls were four writes, each of which another
+                 * thread's line could land between. */
                 if (s_nv2a_trace) {
                     uint32_t g = *(volatile uint32_t *)
                                  ((char *)regs + NV2A_USER_DMA_GET);
                     uint32_t fv = 0;
-                    int have_fence = fence_completed(&fv);
-                    fprintf(stderr, "  [NV2A] %8lu ms  DMA_PUT = 0x%08X  DMA_GET = "
-                            "0x%08X  fence ", xbox_log_ms(),
-                            put, g);
-                    if (have_fence)
-                        fprintf(stderr, "0x%08X", fv);
+                    char fence[16], line[128];
+                    if (fence_completed(&fv))
+                        snprintf(fence, sizeof fence, "0x%08X", fv);
                     else
-                        fprintf(stderr, "-");
-                    fprintf(stderr, "%s\n", g == put ? "" : "  (GPU behind)");
+                        snprintf(fence, sizeof fence, "-");
+                    snprintf(line, sizeof line, "  [NV2A] %8lu ms  DMA_PUT = 0x%08X"
+                             "  DMA_GET = 0x%08X  fence %s%s\n", xbox_log_ms(),
+                             put, g, fence, g == put ? "" : "  (GPU behind)");
+                    fputs(line, stderr);
+                    fflush(stderr);
                 }
-                fflush(stderr);
             }
         }
         if (s_nv2a_trace) {
@@ -2798,6 +2812,10 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
                     g_icall_trace[(g_icall_trace_idx + k) & 15]);
         fprintf(stderr, "\n");
     }
+    /* What the title has been asking the kernel for, and the call it made
+     * last: the hang question, which the periodic block only answered by
+     * being repeated every two seconds. */
+    xbox_kernel_summary_report("watchdog");
     /* Guest globals worth seeing at the moment of the hang.
      *
      * RECOMP_PEEK is otherwise only sampled by the pushbuffer reporter, which
@@ -3606,12 +3624,20 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     {
         uintptr_t nv2a_native = XBOX_NV2A_BASE + g_memory_offset;
         g_nv2a_memory = layout_commit_at((LPVOID)nv2a_native, XBOX_NV2A_SIZE);
-        /* The pushbuffer survey rides on the same poll, so either
-         * variable arms it. */
         s_pb_exec = recomp_env(RENV_PB_EXEC) != NULL;
-        s_nv2a_trace = recomp_env(RENV_NV2A_TRACE) != NULL
-                    || recomp_env(RENV_PB_SCAN) != NULL
-                    || recomp_env(RENV_PB_EXEC) != NULL;
+        /* The trace follows RECOMP_TRACE=nv2a alone. RECOMP_PB_EXEC used to
+         * arm it as well, from when the executor was opt-in; once the
+         * executor defaulted on, that put a line per pushbuffer kick in
+         * every run's log -- about 1,800 synchronous writes a second on the
+         * walker, which native Windows' file filter made a third of this
+         * thread's time while the title spun on the kick. The executor and
+         * the survey read their own keys (nv2a_pb_scan). */
+        s_nv2a_trace = recomp_env(RENV_NV2A_TRACE) != NULL;
+        s_pb_report = s_nv2a_trace
+                   || recomp_env(RENV_PB_SCAN) || recomp_env(RENV_PEEK)
+                   || recomp_env(RENV_PEEK_CHAIN) || recomp_env(RENV_FIND_NAN)
+                   || recomp_env(RENV_FIND_QUAD) || recomp_env(RENV_TEX_STATE)
+                   || recomp_env(RENV_PB_UNHANDLED_ALL);
         if (g_nv2a_memory) {
             fprintf(stderr, "  NV2A register aperture: %u MB at Xbox VA "
                     "0x%08X (zeroed, no register semantics)\n",

@@ -89,7 +89,7 @@ extern "C" {
     X(FB_WINDOW,         CONFIG, "RECOMP_FB_WINDOW",         NULL, "Windows: show the framebuffer window") \
     X(SAVE_DIR,          CONFIG, "RECOMP_SAVE_DIR",          NULL, "root for the title's UDATA/TDATA") \
     X(AC97_READY,        CONFIG, "RECOMP_AC97_READY",        NULL, "emulated APU and audio; default on (x86-64 Windows/Proton, macOS/Linux arm64), 0: off") \
-    X(VBLANK,            CONFIG, "RECOMP_VBLANK",            NULL, "deliver the vblank interrupt") \
+    X(VBLANK,            CONFIG, "RECOMP_VBLANK",            NULL, "deliver the vblank interrupt; =0 off") \
     X(TITLE_KEVENTS,     CONFIG, "RECOMP_TITLE_KEVENTS",     NULL, "1: a KEVENT the title builds itself gets a host event (upstream, default off)") \
     X(GUEST_LOCK,        CONFIG, "RECOMP_GUEST_LOCK",        NULL, "1: one guest thread runs guest code at a time, released in kernel calls (upstream, default off)") \
     X(HEAP_RECLAIM,      CONFIG, "RECOMP_HEAP_RECLAIM",      NULL, "set: the heap splits and merges freed blocks exactly (upstream, default off)") \

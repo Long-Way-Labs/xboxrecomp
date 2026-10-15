@@ -1293,6 +1293,7 @@ static int s_pb_exec = 0;
 extern uint32_t nv2a_pb_exec_semaphore_releases(void);
 extern uint32_t nv2a_pb_scan_catchups(void);
 extern uint32_t nv2a_pb_exec_semaphore_last_va(void);
+extern uint32_t nv2a_pb_exec_semaphore_last_value(void);
 
 /* Mirror "submitted" into "completed" -- now only the fallback.
  *
@@ -1399,14 +1400,20 @@ static void fence_mirrors_tick(void)
  * That reads as "the GPU's own copy of the last semaphore value has reached
  * memory". The fence word is written only when the release is consumed (by the
  * executor, or the mirror above), so tracking it here, after the work has been
- * done, gives the same answer the hardware would. Against plain RAM the
+ * done, gives the same answer the hardware would. The value is read through
+ * a registered fence mirror's device; a title that registers none gets the
+ * executor's last released semaphore value instead, which is the same
+ * number once the executor writes the fence. Against plain RAM the
  * register stays 0 and the wait only passes when the fence happens to be a
  * multiple of 32. The name is not confirmed; the behaviour is what the wait
  * needs. */
 #define NV2A_PGRAPH_FENCE_MIRROR 0x400B10u
 
-/* The completed-fence word of the first fence-mirror device: what the title
- * reads as "the GPU has finished through here". 0 when there is none yet. */
+/* What the title reads as "the GPU has finished through here": the
+ * completed-fence word of the first readable fence-mirror device. With no
+ * mirror registered at all, the executor's last released semaphore value,
+ * once it has released one. 0 (nothing to report) otherwise: before the
+ * first release, or while every registered mirror's device is unreadable. */
 static int fence_completed(uint32_t *out)
 {
     for (int i = 0; i < g_fence_mirror_count; i++) {
@@ -1425,15 +1432,33 @@ static int fence_completed(uint32_t *out)
         *out = *(volatile uint32_t *)((uintptr_t)get_ptr + g_memory_offset);
         return 1;   /* one device drives the GPU */
     }
+    /* No mirror registered: the executor's last released value is the
+     * GPU's own copy of the last semaphore, which is what the register
+     * means. Without this a title that registers no mirror (a fresh
+     * scaffold) spins in D3D's wait-for-idle for ever. A registered mirror
+     * whose device is not readable yet is not this case: the register waits
+     * for it, as before (Burnout 3 registers before device creation). */
+    if (g_fence_mirror_count == 0 && nv2a_pb_exec_semaphore_releases()) {
+        static volatile LONG said;
+        if (!InterlockedExchange(&said, 1)) {
+            fprintf(stderr, "  NV2A PGRAPH fence: no fence mirror registered;"
+                            " 0x400B10 follows the executor's semaphore releases\n");
+            fflush(stderr);
+        }
+        *out = nv2a_pb_exec_semaphore_last_value();
+        return 1;
+    }
     return 0;
 }
 
-static void pgraph_fence_tick(volatile uint32_t *regs)
+void xbox_Nv2aPgraphFenceTick(void)
 {
     uint32_t v;
-    volatile uint32_t *r =
-        (volatile uint32_t *)((char *)regs + NV2A_PGRAPH_FENCE_MIRROR);
+    volatile uint32_t *r;
 
+    if (!g_nv2a_memory)
+        return;
+    r = (volatile uint32_t *)((char *)g_nv2a_memory + NV2A_PGRAPH_FENCE_MIRROR);
     if (!fence_completed(&v))
         return;
     if (((*r ^ (v << 2)) & 0x7Cu) != 0) {
@@ -1881,7 +1906,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     __atomic_thread_fence(__ATOMIC_RELEASE);
                     *get = put;
                 }
-                pgraph_fence_tick(regs);
+                xbox_Nv2aPgraphFenceTick();
                 g_scanned_put = put; last_put_ms = now_ms;
                 /* GET as well as PUT. A title that stops submitting has either
                  * finished or is spinning on the GPU catching up, and only GET

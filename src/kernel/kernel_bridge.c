@@ -3039,7 +3039,7 @@ static int kernel_vblank_enabled(void)
     static int enabled = -1;
 
     if (enabled < 0)
-        enabled = recomp_env(RENV_VBLANK) != NULL;
+        enabled = recomp_env_on(RENV_VBLANK);
     return enabled;
 }
 

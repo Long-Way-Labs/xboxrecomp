@@ -86,6 +86,9 @@ if(NOT WIN32)
     # And the semaphore release's context DMA base (RAMHT/PRAMIN lookup).
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/pb_semaphore
                      ${CMAKE_CURRENT_BINARY_DIR}/pb_semaphore)
+    # And PGRAPH 0x400B10 from the executor's releases or a fence mirror.
+    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/pgraph_fence
+                     ${CMAKE_CURRENT_BINARY_DIR}/pgraph_fence)
 endif()
 
 # The HLSL the parse -> generate pipeline emits, against recorded hashes

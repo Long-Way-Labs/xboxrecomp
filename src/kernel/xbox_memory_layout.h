@@ -234,6 +234,15 @@ int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
  * through it when a SET_CONTEXT_DMA_* method binds an object. */
 const volatile uint8_t *xbox_Nv2aAperture(void);
 
+/* Set PGRAPH 0x400B10 bits 2..6 from the completed fence (a registered fence
+ * mirror's completed word or, with none registered, the executor's last
+ * semaphore release), which XDK D3D's wait-for-idle polls. A no-op while the
+ * aperture is unmapped or there is no value yet. Called by the NV2A ack loop
+ * after each pushbuffer walk; not static so tests/pgraph_fence can drive it.
+ * It reads the executor's state without a lock: call it only from the ack
+ * thread, or while the executor is idle (as the ctest does). */
+void xbox_Nv2aPgraphFenceTick(void);
+
 void xbox_MemoryLayoutShutdown(void);
 
 /**

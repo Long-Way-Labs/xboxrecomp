@@ -715,6 +715,44 @@ static int host_main(void)
     g_xbox_mem_offset = xbox_GetMemoryOffset();
     printf("Xbox memory mapped. Offset: 0x%llX\n", (unsigned long long)g_xbox_mem_offset);
 
+    /* D3D's GPU completion fence. XDK D3D keeps a pointer to its device in a
+     * global; the device holds the fence it last submitted at +0x2C and, at
+     * +0x30, a pointer to the word the GPU writes as it completes work. The
+     * toolkit drives PGRAPH 0x400B10, which D3D's wait-for-idle polls, from
+     * that word. With RECOMP_PB_EXEC on the executor writes the word itself
+     * at each semaphore release and this mirror steps aside after the first
+     * one; it stays registered as the catch-up path when a walk stops short
+     * of PUT, and as the only fence when the executor is off.
+     *
+     * The pointer is the game's: 0x2F1FB8 in BLiNX 2, 0x235528 in Spartan,
+     * 0x35FB48 in Burnout 3 (XDK 5849; the same two offsets in all three).
+     * `xbr new` fills the line in when it finds D3D's fence wait in the
+     * dump's D3D section; otherwise find it as the CLI's docs/porting.md
+     * ("The D3D fence") says and replace the example below. The runtime's
+     * "NV2A fence mirror: ... now written by the executor; mirror off" line
+     * confirms it. */
+    /* xbox_Nv2aMirrorFence(0x00000000, 0x2C, 0x30); */
+
+    /* The vblank interrupt, which the toolkit raises only on request. XDK
+     * D3D connects the NV2A interrupt during device creation and paces Swap,
+     * BlockUntilVerticalBlank and the title's vblank callback on its DPC;
+     * without it the boot stops in D3D's first vblank wait. Nothing is
+     * delivered until the title connects the ISR and enables the interrupt,
+     * so a title that never asks for it only pays a 60 Hz timer. An explicit
+     * RECOMP_VBLANK in the environment still wins (=0 turns it off). */
+    if (!recomp_env(RENV_VBLANK))
+        recomp_env_set(RENV_VBLANK, "1");
+
+    /* D3D8 builds the KEVENT its vblank DPC sets inline, without
+     * KeInitializeEvent. The toolkit gives such an event a host event only on
+     * request (upstream's ke_guest_event); without it KeSetEvent hands the
+     * guest address to the host as a handle, which fails silently on Win32
+     * and faults on POSIX. The vblank above needs it, and it does nothing for
+     * an event KeInitializeEvent made. An explicit RECOMP_TITLE_KEVENTS in
+     * the environment still wins (=0 turns it off). */
+    if (!recomp_env(RENV_TITLE_KEVENTS))
+        recomp_env_set(RENV_TITLE_KEVENTS, "1");
+
     /* Bring up the emulated APU.
      *
      * Gated on the same variable that unmaps its registers, because the two

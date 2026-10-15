@@ -44,3 +44,8 @@ foreach(t no_xbe stdio_log)
             -DMODE=${t}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/run.cmake)
 endforeach()
+# The template's own lines, read as text: the defaults and the example line
+# the CLI patches. No build or host needed.
+add_test(NAME template_main_defaults
+    COMMAND ${CMAKE_COMMAND} -DMAIN=${TEMPLATE_DIR}/src/main.c
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/defaults.cmake)

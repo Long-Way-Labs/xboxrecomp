@@ -228,6 +228,12 @@ uint32_t xbox_ContiguousInUseBytes(void);
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off);
 
+/* The host mapping of the NV2A register aperture (guest VA 0xFD000000,
+ * 16 MB) as the title has written it, or NULL when it could not be mapped.
+ * The pushbuffer executor reads RAMHT and the context DMA objects in PRAMIN
+ * through it when a SET_CONTEXT_DMA_* method binds an object. */
+const volatile uint8_t *xbox_Nv2aAperture(void);
+
 void xbox_MemoryLayoutShutdown(void);
 
 /**

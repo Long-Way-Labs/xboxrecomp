@@ -132,6 +132,131 @@ static uint32_t dma_resolve(uint32_t offset)
     return offset;                         /* nothing better to offer */
 }
 
+/* Where a context DMA object starts, and how far it reaches.
+ *
+ * An offset method (SET_SEMAPHORE_OFFSET, GET_REPORT) is an offset inside
+ * the object the matching SET_CONTEXT_DMA_* method bound. XDK D3D makes its
+ * surface, texture and vertex objects cover physical memory from 0, which
+ * dma_resolve assumes, but it aims the semaphore object at its fence page:
+ * BLiNX 2's at physical 0x1000, Burnout 3's at 0x3E6000, Spartan's (XDK
+ * 5849) at 0x2000, object 8 = { 0x0002B03D, limit 0x20, frame 0x00002003 }.
+ * Read as a bare offset, every release went to physical 0. BLiNX 2 and
+ * Burnout 3 got by on their fence mirrors; Spartan registers none, and D3D's
+ * fence wait (sub_00228FA0) spun during device creation.
+ *
+ * The object is found the way PFIFO finds it: the handle in RAMHT (base and
+ * size from PFIFO_RAMHT), whose context word holds the instance offset in
+ * PRAMIN (aperture 0x700000). Its base is the frame page (word 2, bits
+ * 31:12) plus the adjust (word 0, bits 31:20); its limit is word 1. RAMHT
+ * is searched rather than hashed: the hash takes the channel id, which this
+ * runtime does not model, and handles are unique in XDK D3D's one channel.
+ * The table is 4 to 32 KB and is read once per bind. Returns 0 when the
+ * aperture is unmapped or the handle is not there (a title that never built
+ * RAMHT); the caller then keeps the bare offset with no limit. */
+#define NV2A_PFIFO_RAMHT  0x002210u
+#define NV2A_PRAMIN       0x700000u
+#define NV2A_PRAMIN_SIZE  0x100000u
+
+struct ctxdma_hit { uint32_t ramht_off, inst, w0, w1, w2; };
+
+static int ctxdma_lookup(uint32_t handle, uint32_t *base, uint32_t *limit,
+                         struct ctxdma_hit *hit, uint32_t *ramht_reg)
+{
+    const volatile uint8_t *ap = xbox_Nv2aAperture();
+    uint32_t ramht, rbase, size, i, ctx, inst;
+
+    *ramht_reg = 0;
+    if (!ap)
+        return 0;
+#define AP32(off) (*(const volatile uint32_t *)(ap + (off)))
+    ramht = *ramht_reg = AP32(NV2A_PFIFO_RAMHT);
+    rbase = ((ramht >> 4) & 0x1Fu) << 12;            /* BASE_ADDRESS [8:4] */
+    size = 0x1000u << ((ramht >> 16) & 0x3u);        /* SIZE [17:16]: 4-32 KB */
+    for (i = 0; i + 8 <= size && rbase + i + 8 <= NV2A_PRAMIN_SIZE; i += 8) {
+        if (AP32(NV2A_PRAMIN + rbase + i) != handle)
+            continue;
+        ctx = AP32(NV2A_PRAMIN + rbase + i + 4);
+        if (!(ctx & 0x80000000u))                    /* not valid */
+            continue;
+        inst = (ctx & 0xFFFFu) << 4;
+        if (inst + 12 > NV2A_PRAMIN_SIZE)
+            continue;
+        hit->ramht_off = rbase + i;
+        hit->inst = inst;
+        hit->w0 = AP32(NV2A_PRAMIN + inst);
+        hit->w1 = AP32(NV2A_PRAMIN + inst + 4);
+        hit->w2 = AP32(NV2A_PRAMIN + inst + 8);
+        *base = (hit->w2 & 0xFFFFF000u) | (hit->w0 >> 20);
+        *limit = hit->w1;
+        return 1;
+    }
+#undef AP32
+    return 0;
+}
+
+/* One bound offset object (semaphore, report), resolved when it is bound,
+ * as PFIFO does: a re-bind re-reads instance memory, nothing else does. */
+struct ctxdma_bind {
+    uint32_t handle, base, limit;
+    int found;
+    int said;                     /* bind lines printed, capped at 8 */
+    int refused_said;             /* the refused-write line, once per purpose */
+    int have_last;
+    uint32_t last_handle, last_base, last_limit;
+    int last_found;
+};
+
+static void ctxdma_bind(struct ctxdma_bind *b, const char *what, uint32_t handle)
+{
+    struct ctxdma_hit hit;
+    uint32_t ramht = 0;
+
+    b->handle = handle;
+    b->base = 0;
+    b->limit = 0;
+    b->found = ctxdma_lookup(handle, &b->base, &b->limit, &hit, &ramht);
+    if (b->have_last && b->last_handle == handle && b->last_found == b->found
+            && b->last_base == b->base && b->last_limit == b->limit)
+        return;                   /* the same answer: said already */
+    b->have_last = 1;
+    b->last_handle = handle;
+    b->last_found = b->found;
+    b->last_base = b->base;
+    b->last_limit = b->limit;
+    if (b->said >= 8)
+        return;
+    b->said++;
+    if (b->found)
+        fprintf(stderr, "  [GPU] %s context DMA 0x%08X: base 0x%08X limit "
+                "0x%08X (RAMHT +0x%X, instance 0x%X: %08X %08X %08X)\n",
+                what, handle, b->base, b->limit, hit.ramht_off, hit.inst,
+                hit.w0, hit.w1, hit.w2);
+    else
+        fprintf(stderr, "  [GPU] %s context DMA 0x%08X not in RAMHT "
+                "(PFIFO_RAMHT 0x%08X): the bare offset, no limit\n",
+                what, handle, ramht);
+    fflush(stderr);
+}
+
+/* The physical address of [offset, offset + bytes) in a bound object, or
+ * refuse it (return 0) when it ends past the object's limit: the hardware
+ * raises a DMA protection error and writes nothing. */
+static int ctxdma_place(struct ctxdma_bind *b, const char *what,
+                        uint32_t offset, uint32_t bytes, uint32_t *phys)
+{
+    if (b->found && (uint64_t)offset + bytes > (uint64_t)b->limit + 1u) {
+        if (!b->refused_said++)
+            fprintf(stderr, "  [GPU] REFUSING %s write at offset 0x%08X (%u "
+                    "bytes): past the limit 0x%08X of context DMA 0x%08X\n",
+                    what, offset, bytes, b->limit, b->handle);
+        return 0;
+    }
+    *phys = b->base + offset;
+    return 1;
+}
+
+static struct ctxdma_bind s_sema_bind, s_report_bind;
+
 static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what)
 {
     static int said;
@@ -294,8 +419,9 @@ static uint32_t s_sema_last_va, s_sema_last_value;
  * (put_pixel). A backend that draws on a GPU cannot report a count to the
  * walker yet, so its tests report every test as visible (RECOMP_ZPASS_FIXED,
  * default 0x10000), the same as a GL occlusion query that saw the whole
- * object. The report DMA object is not read: XDK D3D's covers physical memory
- * from 0, the same assumption the semaphore makes. */
+ * object. The offset is inside the report DMA object, whose base and limit
+ * are read from instance memory when SET_CONTEXT_DMA_REPORT binds it
+ * (ctxdma_bind), as the semaphore's are. */
 #define NV097_SET_CONTEXT_DMA_REPORT        0x01A8
 #define NV097_CLEAR_REPORT_VALUE            0x17C8
 #define NV097_SET_ZPASS_PIXEL_COUNT_ENABLE  0x17CC
@@ -5217,7 +5343,7 @@ static void get_report(uint32_t param)
 {
     static int fixed_set = -1;
     static uint32_t fixed = 0x10000;
-    uint32_t va = dma_resolve(param & 0x00FFFFFFu), value;
+    uint32_t va, value, phys;
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
 
     if (fixed_set < 0) {
@@ -5226,7 +5352,14 @@ static void get_report(uint32_t param)
         if (e)
             fixed = (uint32_t)strtoul(e, NULL, 0);
     }
-    if ((param >> 24) != 1 || surface_hits_image(va, 16)) {
+    if ((param >> 24) != 1) {
+        note_unhandled(NV097_GET_REPORT, param);
+        return;
+    }
+    if (!ctxdma_place(&s_report_bind, "report", param & 0x00FFFFFFu, 16, &phys))
+        return;
+    va = dma_resolve(phys);
+    if (surface_hits_image(va, 16)) {
         note_unhandled(NV097_GET_REPORT, param);
         return;
     }
@@ -5985,7 +6118,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
 
     case NV097_SET_CONTEXT_DMA_REPORT:
-        return;                            /* covers physical memory from 0 */
+        ctxdma_bind(&s_report_bind, "report", param);
+        return;
     case NV097_CLEAR_REPORT_VALUE:
         s_zpass_count = 0;
         if (s_backend->on_zpass_clear)
@@ -6002,6 +6136,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
     case NV097_SET_CONTEXT_DMA_SEMAPHORE:
         s_gpu.sema_dma = param;
+        ctxdma_bind(&s_sema_bind, "semaphore", param);
         return;
 
     case NV097_SET_SEMAPHORE_OFFSET:
@@ -6010,19 +6145,23 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         return;
 
     case NV097_BACK_END_WRITE_SEMAPHORE_RELEASE: {
-        /* The semaphore offset is a DMA-object offset like every other one
-         * here, so it goes through the same resolution. The DMA object's own
-         * base is not read (no RAMHT/PRAMIN walk yet); for XDK D3D it covers
-         * physical memory from 0, which is what dma_resolve assumes, and the
-         * first release is logged so a title where that is false says so. */
-        uint32_t va = dma_resolve(s_gpu.sema_offset);
+        /* The semaphore offset is an offset inside the semaphore's context
+         * DMA object, whose base and limit were read from instance memory
+         * when it was bound (ctxdma_bind); base plus offset is then a
+         * physical address like every other one here and goes through the
+         * same resolution. The first release is logged. */
         uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+        uint32_t va, phys;
 
         if (!s_gpu.sema_offset_set) {
             /* No offset yet: nowhere honest to write. */
             note_unhandled(method, param);
             return;
         }
+        if (!ctxdma_place(&s_sema_bind, "semaphore", s_gpu.sema_offset, 4,
+                          &phys))
+            return;
+        va = dma_resolve(phys);
         if (surface_hits_image(va, 4)) {
             static int said;
             if (!said++)

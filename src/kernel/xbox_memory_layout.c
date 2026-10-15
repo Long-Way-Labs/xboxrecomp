@@ -1303,9 +1303,12 @@ extern uint32_t nv2a_pb_exec_semaphore_last_va(void);
  * before it had been read -- the same race the DMA_GET comment below
  * describes. So a mirror steps aside once the executor has released a
  * semaphore onto that same word, and keeps going otherwise: with RECOMP_PB_EXEC
- * off, before the first release, or if the title's semaphore points somewhere
- * else (said once, because that means the DMA-object base is not what the
- * executor assumes). */
+ * off, before the first release, or if the title's releases land somewhere
+ * else (said once). The executor places releases at the semaphore context
+ * DMA's base plus offset, so a mismatch means either the handle was not in
+ * RAMHT and the release fell back to the bare offset (the bind logs "not in
+ * RAMHT"), or the title releases into a different object than the word it
+ * waits on. */
 static void fence_mirrors_tick(void)
 {
     uint32_t releases = s_pb_exec ? nv2a_pb_exec_semaphore_releases() : 0;
@@ -4275,6 +4278,11 @@ BOOL xbox_IsXboxAddress(uintptr_t address)
 void *xbox_GetMemoryBase(void)
 {
     return g_memory_base;
+}
+
+const volatile uint8_t *xbox_Nv2aAperture(void)
+{
+    return (const volatile uint8_t *)g_nv2a_memory;
 }
 
 ptrdiff_t xbox_GetMemoryOffset(void)

@@ -6200,7 +6200,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     uint32_t stops = nv2a_pb_scan_stops();
                     /* decode is walk minus draw minus present; kicks are the
                      * title's KickOff flushes acknowledged since the last
-                     * flip, kickwait how long it spun on them in all, and
+                     * flip, kickwait how long it spun on them in all (on
+                     * native Windows it under-reads by up to 0.5 ms a kick:
+                     * the observer naps on the timer and sees kicks late), and
                      * stops the walks that stopped short of PUT since then
                      * (the lifetime total is in the [PB] report). */
                     fprintf(stderr, "[PB-PERF] flip %u wall %.2f ms walk %.2f ms"

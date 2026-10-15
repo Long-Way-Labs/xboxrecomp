@@ -44,6 +44,49 @@ void xbox_HostTimerThreadInit(void);
 void xbox_HostTimerSleepNs(uint64_t ns);
 void xbox_HostTimerWake(void);
 
+/* The Windows build under Wine (ntdll exports wine_get_version); 0 on a
+ * native Windows host and on POSIX. Looked up once. */
+int xbox_HostUnderWine(void);
+
+typedef enum {
+    XBOX_NAP_AUTO,      /* the rule at xbox_HostNapNs, resolved once */
+    XBOX_NAP_TIMER,     /* the thread's high-resolution waitable timer
+                         * (POSIX: nanosleep) */
+    XBOX_NAP_DELAY,     /* NtDelayExecution (POSIX: nanosleep) */
+    XBOX_NAP_SPIN,      /* busy-wait on the clock with a pause instruction */
+    XBOX_NAP_HYBRID     /* SPIN for a hot nap, TIMER for a cold one */
+} XboxNapMode;
+
+/* Set once before the napping threads start (an A/B switch). */
+void xbox_HostNapModeSet(XboxNapMode mode);
+/* The mode in effect, never AUTO. TIMER becomes DELAY for the process when a
+ * thread cannot create the high-resolution timer (Windows before 1803). */
+XboxNapMode xbox_HostNapMode(void);
+/* 0 once a thread could not create the high-resolution timer: TIMER naps,
+ * and HYBRID's cold ones, are NtDelayExecution from then on. 1 elsewhere. */
+int xbox_HostNapHasTimer(void);
+
+/* A poll loop's short sleep (the NV2A ack loop's ~50 us between polls).
+ * `hot` says the caller expects what it polls for within a couple of
+ * milliseconds (it saw activity just now): under HYBRID a hot nap spins and
+ * a cold one takes the timer; the other modes ignore the flag.
+ *
+ * The hosts differ. Every timed wait on native Windows expires on the system
+ * clock interrupt: NtDelayExecution and Sleep round up to the clock
+ * interval, 1 ms under timeBeginPeriod(1), and even the high-resolution
+ * waitable timer, which is exempt from coalescing, can be one interval late,
+ * and the finest interval is 0.5 ms (a 50 us request measured p50 511 us,
+ * NtDelayExecution 1005 us, a spin 50 us). So native Windows spins hot and
+ * takes the timer cold. Wine's non-alertable NtDelayExecution is a select
+ * with a timeval inside ntdll and is honoured (~110 us), while its waitable
+ * timer is a wineserver object, two server round trips a nap: Wine keeps
+ * NtDelayExecution. POSIX nanosleep is honoured (~80 us). AUTO is HYBRID on
+ * native Windows and DELAY under Wine and on POSIX.
+ *
+ * 0 returns at once. The caller re-reads its clock, as with
+ * xbox_HostSleepNs. */
+void xbox_HostNapNs(uint64_t ns, int hot);
+
 #ifdef __cplusplus
 }
 #endif

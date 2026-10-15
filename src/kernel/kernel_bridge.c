@@ -3760,6 +3760,31 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         if (tbp)
             tbp(1);
     }
+    /* Windows 11 may ignore that request while the window is occluded,
+     * minimised or otherwise not visible, which would put Sleep(1) and the
+     * ms vblank schedule back on the 15.6 ms tick whenever the game loses
+     * focus. Opting out of that throttling makes the system keep honouring
+     * the request. Windows 10 and Wine refuse or lack the class: ignored. */
+    {
+#ifndef PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+#define PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION 0x4
+#endif
+        typedef struct {
+            ULONG Version, ControlMask, StateMask;
+        } power_throttling_state;
+        typedef BOOL (WINAPI *spi_fn)(HANDLE, int, LPVOID, DWORD);
+        HMODULE k32 = GetModuleHandleA("kernel32.dll");
+        spi_fn spi = k32 ? (spi_fn)(void *)GetProcAddress(k32,
+                                                         "SetProcessInformation")
+                         : NULL;
+        power_throttling_state st;
+        st.Version = 1;               /* PROCESS_POWER_THROTTLING_CURRENT_VERSION */
+        st.ControlMask = PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+        st.StateMask = 0;
+        if (spi)
+            spi(GetCurrentProcess(), 4 /* ProcessPowerThrottling */, &st,
+                sizeof st);
+    }
 #endif
 
     if (kernel_vblank_clock_ms())

@@ -174,6 +174,7 @@ extern "C" {
     X(PB_NULL_DRAW_US,   DEBUG, "null_draw_us",    "RECOMP_PB_NULL_DRAW_US",   "=us: null backend cost per draw") \
     X(PB_INJECT_STOP,    DEBUG, "pb_inject_stop",  "RECOMP_PB_INJECT_STOP",    "=n: stop every nth walk (test hook)") \
     X(FAST_KICK,         DEBUG, "fast_kick",       "RECOMP_FAST_KICK",         "=0: ack loop ticks at Sleep(1)") \
+    X(KICK_NAP,          DEBUG, "kick_nap",        NULL,                       "=hybrid|timer|delay|spin: how the ack loop naps between its ~50 us polls (docs/env.md)") \
     X(FORCE_RETURN,      DEBUG, "force_return",    "RECOMP_FORCE_RETURN",      "honour forced returns in the build") \
     X(TRAP_NULL,         DEBUG, "trap_null",       "RECOMP_TRAP_NULL",         "guest page zero faults") \
     X(DSP_ACK,           DEBUG, "dsp_ack",         "RECOMP_DSP_ACK",           "=va,...: zero these words (no APU)") \

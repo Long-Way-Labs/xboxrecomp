@@ -20,11 +20,11 @@
 #include "nv2a_flip_hold.h"
 #include "apu/apu_wav.h"  /* the watchdog finalises the WAV dump */
 #include "guest_vmem.h"
+#include "platform/host_time.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <setjmp.h>
-#include <time.h>     /* nanosleep, for the KickOff thread */
 #if !defined(_WIN32)
 #include <unistd.h>   /* _exit */
 #endif
@@ -1538,9 +1538,15 @@ static void framebuffer_probe_tick(void)
  * the title is kicking (RECOMP_FAST_KICK, default on; =0 is the old
  * Sleep(1)). A kick then waits for the walker to finish the segment before
  * it, not for a timer, and the walker starts on a new PUT within ~50 us.
+ * Native Windows has no 50 us timed wait (host_time.h): there the naps spin
+ * while the loop is within KICK_NAP_SPIN_BUDGET_NS of its last kick, PUT or
+ * flip hold, which covers the title's gaps between kicks in a frame, and
+ * take the timer beyond it, so a menu or an idle frame does not hold a core.
  *
  * With RECOMP_FLIP_LOG an observer thread watches the bit, so the [PB-PERF]
- * line can say how many kicks a frame made and how long they waited.
+ * line can say how many kicks a frame made and how long they waited. It
+ * naps cold: on native Windows it may see a kick up to a clock interval
+ * (0.5 ms) late, and kickwait under-reads by that much.
  */
 #define NV2A_KICK_REG  0x100410u
 #define NV2A_KICK_BIT  0x00010000u
@@ -1553,34 +1559,13 @@ static uint64_t g_kick_wait_ns;
 
 uint64_t nv2a_pb_now_ns(void);
 
-static void kick_nap_us(unsigned us)
+#define KICK_NAP_SPIN_BUDGET_NS 2000000ull
+
+/* host_time.h says how each host takes a nap this short; `hot` is the
+ * caller's "activity within the spin budget". */
+static void kick_nap_us(unsigned us, int hot)
 {
-#if defined(_WIN32)
-    /* Sleep() is whole milliseconds; NtDelayExecution takes 100 ns units,
-     * which Wine honours (select with a timeval) and native Windows rounds
-     * to its timer resolution. */
-    typedef LONG (WINAPI *delay_fn)(BOOLEAN, PLARGE_INTEGER);
-    static delay_fn delay;
-    static int looked;
-    if (!looked) {
-        HMODULE nt = GetModuleHandleA("ntdll.dll");
-        looked = 1;
-        if (nt)
-            delay = (delay_fn)(void *)GetProcAddress(nt, "NtDelayExecution");
-    }
-    if (delay) {
-        LARGE_INTEGER t;
-        t.QuadPart = -(LONGLONG)us * 10;
-        delay(FALSE, &t);
-    } else {
-        Sleep(1);
-    }
-#else
-    struct timespec ts;
-    ts.tv_sec = 0;
-    ts.tv_nsec = (long)us * 1000L;
-    nanosleep(&ts, NULL);
-#endif
+    xbox_HostNapNs((uint64_t)us * 1000u, hot);
 }
 
 /* The bit was seen clear by whoever cleared it: account the wait. */
@@ -1617,18 +1602,101 @@ static DWORD WINAPI nv2a_kick_thread(LPVOID param)
             last_kick = now;
         }
         /* Fine-grained while the title is kicking, 1 ms when it is not. */
-        kick_nap_us(now - last_kick < 200000000ull ? 50 : 1000);
+        kick_nap_us(now - last_kick < 200000000ull ? 50 : 1000, 0);
     }
     return 0;
 }
 
-static void xbox_Nv2aKickStart(void *regs)
+static int nap_cmp(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+/* The p50 of 32 naps of 50 us on the calling thread, in us. */
+static unsigned kick_nap_p50_us(int hot)
+{
+    uint64_t t[32];
+    int i;
+
+    for (i = 0; i < 32; i++) {
+        uint64_t t0 = xbox_HostNowNs();
+        xbox_HostNapNs(50000u, hot);
+        t[i] = xbox_HostNowNs() - t0;
+    }
+    qsort(t, 32, sizeof t[0], nap_cmp);
+    return (unsigned)(t[16] / 1000u);
+}
+
+/* Before the ack thread exists, so no thread naps on an unresolved mode:
+ * the fast-kick switch, the nap mode, and the startup line with what each
+ * nap the mode uses measures here (a native Windows log has to show whether
+ * 50 us is 50 us or a clock interval). */
+static void kick_nap_init(void)
 {
     const char *e = recomp_env(RENV_FAST_KICK);
+    const char *n = recomp_env(RENV_KICK_NAP);
+    XboxNapMode asked = XBOX_NAP_AUTO;
+    char nap[160];
+
     g_kick_fast = !(e && *e == '0');
-    fprintf(stderr, "  NV2A KickOff flush: %s\n", g_kick_fast
+    if (n && !strcmp(n, "hybrid"))
+        asked = XBOX_NAP_HYBRID;
+    else if (n && !strcmp(n, "timer"))
+        asked = XBOX_NAP_TIMER;
+    else if (n && !strcmp(n, "delay"))
+        asked = XBOX_NAP_DELAY;
+    else if (n && !strcmp(n, "spin"))
+        asked = XBOX_NAP_SPIN;
+    else if (n && *n)
+        fprintf(stderr, "  NV2A KickOff flush: kick_nap=%s unknown"
+                " (hybrid | timer | delay | spin); the host default\n", n);
+    xbox_HostNapModeSet(asked);
+
+    if (xbox_HostNapMode() == XBOX_NAP_HYBRID) {
+        unsigned spin = kick_nap_p50_us(1), cold = kick_nap_p50_us(0);
+#ifdef _WIN32
+        const char *cname = xbox_HostNapHasTimer() ? "timer" : "delay";
+#else
+        const char *cname = "nanosleep";
+#endif
+        snprintf(nap, sizeof nap, "nap hybrid (%s%s within %u ms of activity,"
+                 " then %s): spin p50 %u us, %s p50 %u us",
+                 xbox_HostNapHasTimer() ? "" : "no high-resolution timer: ",
+                 "spin", (unsigned)(KICK_NAP_SPIN_BUDGET_NS / 1000000u),
+                 cname, spin, cname, cold);
+    } else {
+        unsigned p50 = kick_nap_p50_us(0);
+        const char *name;
+        switch (xbox_HostNapMode()) {
+        case XBOX_NAP_SPIN:
+            name = "spin";
+            break;
+#ifdef _WIN32
+        case XBOX_NAP_TIMER:
+            name = "timer";
+            break;
+        default:
+            name = !xbox_HostNapHasTimer() && asked == XBOX_NAP_TIMER
+                 ? "delay (no high-resolution timer)"
+                 : asked == XBOX_NAP_DELAY ? "delay"
+                 : xbox_HostUnderWine() ? "delay (wine)" : "delay";
+            break;
+#else
+        default:
+            name = "nanosleep";
+            break;
+#endif
+        }
+        snprintf(nap, sizeof nap, "nap %s: 50 us -> p50 %u us", name, p50);
+    }
+    fprintf(stderr, "  NV2A KickOff flush: %s; %s\n", g_kick_fast
             ? "ack loop polls at ~50 us while kicking (RECOMP_DEBUG=fast_kick=0: Sleep(1))"
-            : "ack loop ticks at Sleep(1) (RECOMP_DEBUG=fast_kick=0)");
+            : "ack loop ticks at Sleep(1) (RECOMP_DEBUG=fast_kick=0)", nap);
+}
+
+static void xbox_Nv2aKickStart(void *regs)
+{
     if (recomp_env(RENV_FLIP_LOG))
         g_nv2a_kick_thread = CreateThread(NULL, 0, nv2a_kick_thread, regs, 0, NULL);
 }
@@ -1921,7 +1989,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     Sleep(1);
                     break;
                 }
-                kick_nap_us(50);
+                kick_nap_us(50, now - last_active < KICK_NAP_SPIN_BUDGET_NS);
                 now = nv2a_pb_now_ns();
             }
         }
@@ -1934,6 +2002,7 @@ static void xbox_Nv2aAckStart(void)
     dsp_ack_init();
     poke_init();
     g_nv2a_ack_stop = 0;
+    kick_nap_init();
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
     xbox_Nv2aKickStart(g_nv2a_memory);

@@ -4,7 +4,10 @@
  * Windows (and Wine): QueryPerformanceCounter, and a high-resolution
  * waitable timer per thread (Windows 10 1803+; Wine has it too), which waits
  * to the 100 ns unit where Sleep rounds to the system tick. Without one,
- * Sleep in whole milliseconds, rounded up.
+ * Sleep in whole milliseconds, rounded up. The short nap (xbox_HostNapNs)
+ * takes the same timer for its cold naps on native Windows only and spins
+ * its hot ones: see host_time.h for why, and why Wine keeps
+ * NtDelayExecution.
  * POSIX: CLOCK_MONOTONIC and nanosleep.
  */
 #include "host_time.h"
@@ -51,32 +54,181 @@ uint64_t xbox_HostNowNs(void)
 #endif
 }
 
+#ifdef _WIN32
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+/* The calling thread's high-resolution waitable timer, created on first use;
+ * NULL where the host has none (a Windows before 1803 refuses the flag with
+ * ERROR_INVALID_PARAMETER), and then NULL for good on this thread. */
+static HANDLE thread_timer(void)
+{
+    static HOST_THREAD_LOCAL HANDLE timer;
+    static HOST_THREAD_LOCAL int timer_failed;
+
+    if (!timer && !timer_failed) {
+        timer = CreateWaitableTimerExW(NULL, NULL,
+                                       CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                       TIMER_ALL_ACCESS);
+        timer_failed = !timer;
+    }
+    return timer;
+}
+
+/* Wait `ns` on the thread's timer; 0 when there is none or it failed. */
+static int timer_wait(uint64_t ns)
+{
+    HANDLE timer = thread_timer();
+    LARGE_INTEGER due;
+
+    if (!timer)
+        return 0;
+    due.QuadPart = -(LONGLONG)((ns + 99u) / 100u);   /* relative, 100 ns */
+    return SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE) &&
+           WaitForSingleObject(timer, INFINITE) == WAIT_OBJECT_0;
+}
+#endif
+
 void xbox_HostSleepNs(uint64_t ns)
 {
     if (!ns)
         return;
 #ifdef _WIN32
-#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
-#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
-#endif
-    {
-        static HOST_THREAD_LOCAL HANDLE timer;
-        static HOST_THREAD_LOCAL int timer_failed;
-
-        if (!timer && !timer_failed) {
-            timer = CreateWaitableTimerExW(NULL, NULL,
-                                           CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-                                           TIMER_ALL_ACCESS);
-            timer_failed = !timer;
-        }
-        if (timer) {
-            LARGE_INTEGER due;
-            due.QuadPart = -(LONGLONG)((ns + 99u) / 100u);   /* relative, 100 ns */
-            if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE) &&
-                WaitForSingleObject(timer, INFINITE) == WAIT_OBJECT_0)
-                return;
-        }
+    if (!timer_wait(ns))
         Sleep((DWORD)((ns + 999999u) / 1000000u));
+#else
+    {
+        struct timespec ts = { (time_t)(ns / 1000000000u),
+                               (long)(ns % 1000000000u) };
+        nanosleep(&ts, NULL);
+    }
+#endif
+}
+
+#ifdef _WIN32
+/* ntdll's exports the naps need, looked up once: wine_get_version says the
+ * process runs under Wine, and NtDelayExecution is found at run time so the
+ * mingw build needs no ntdll import. */
+typedef LONG (WINAPI *nt_delay_fn)(BOOLEAN, PLARGE_INTEGER);
+static INIT_ONCE s_ntdll_once = INIT_ONCE_STATIC_INIT;
+static int s_under_wine;
+static nt_delay_fn s_nt_delay;
+
+static BOOL CALLBACK ntdll_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    HMODULE nt = GetModuleHandleA("ntdll.dll");
+
+    (void)once; (void)param; (void)ctx;
+    if (nt) {
+        s_under_wine = GetProcAddress(nt, "wine_get_version") != NULL;
+        s_nt_delay = (nt_delay_fn)(void *)GetProcAddress(nt, "NtDelayExecution");
+    }
+    return TRUE;
+}
+#endif
+
+int xbox_HostUnderWine(void)
+{
+#ifdef _WIN32
+    InitOnceExecuteOnce(&s_ntdll_once, ntdll_init, NULL, NULL);
+    return s_under_wine;
+#else
+    return 0;
+#endif
+}
+
+/* The mode the naps take: AUTO until set or first used. Resolving AUTO twice
+ * at once is harmless (both threads resolve it the same way), but the word
+ * is read and written atomically so it is not a data race. */
+#ifdef _WIN32
+static volatile LONG s_nap_mode = XBOX_NAP_AUTO;
+static volatile LONG s_nap_no_timer;
+#define NAP_LOAD(v)     InterlockedCompareExchange(&(v), 0, 0)
+#define NAP_STORE(v, x) InterlockedExchange(&(v), (LONG)(x))
+#else
+static int s_nap_mode = XBOX_NAP_AUTO;
+static int s_nap_no_timer;
+#define NAP_LOAD(v)     __atomic_load_n(&(v), __ATOMIC_ACQUIRE)
+#define NAP_STORE(v, x) __atomic_store_n(&(v), (int)(x), __ATOMIC_RELEASE)
+#endif
+
+static XboxNapMode nap_auto(void)
+{
+#ifdef _WIN32
+    return xbox_HostUnderWine() ? XBOX_NAP_DELAY : XBOX_NAP_HYBRID;
+#else
+    return XBOX_NAP_DELAY;
+#endif
+}
+
+void xbox_HostNapModeSet(XboxNapMode mode)
+{
+    NAP_STORE(s_nap_mode, mode == XBOX_NAP_AUTO ? nap_auto() : mode);
+}
+
+XboxNapMode xbox_HostNapMode(void)
+{
+    XboxNapMode m = (XboxNapMode)NAP_LOAD(s_nap_mode);
+
+    if (m == XBOX_NAP_AUTO) {
+        m = nap_auto();
+        NAP_STORE(s_nap_mode, m);
+    }
+    return m;
+}
+
+int xbox_HostNapHasTimer(void)
+{
+    return !NAP_LOAD(s_nap_no_timer);
+}
+
+static void cpu_relax(void)
+{
+#if defined(_WIN32)
+    YieldProcessor();
+#elif defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#endif
+}
+
+void xbox_HostNapNs(uint64_t ns, int hot)
+{
+    XboxNapMode m;
+
+    if (!ns)
+        return;
+    m = xbox_HostNapMode();
+    if (m == XBOX_NAP_HYBRID)
+        m = hot ? XBOX_NAP_SPIN : XBOX_NAP_TIMER;
+    if (m == XBOX_NAP_SPIN) {
+        /* Bounded by the clock, never by a count. */
+        uint64_t end = xbox_HostNowNs() + ns;
+        while (xbox_HostNowNs() < end)
+            cpu_relax();
+        return;
+    }
+#ifdef _WIN32
+    if (m == XBOX_NAP_TIMER && !NAP_LOAD(s_nap_no_timer)) {
+        if (timer_wait(ns))
+            return;
+        if (!thread_timer()) {
+            /* No high-resolution timer: the cold naps are NtDelayExecution
+             * for the process; a TIMER mode says so, HYBRID keeps spinning
+             * its hot naps. */
+            NAP_STORE(s_nap_no_timer, 1);
+            if (NAP_LOAD(s_nap_mode) == XBOX_NAP_TIMER)
+                NAP_STORE(s_nap_mode, XBOX_NAP_DELAY);
+        }
+    }
+    InitOnceExecuteOnce(&s_ntdll_once, ntdll_init, NULL, NULL);
+    if (s_nt_delay) {
+        LARGE_INTEGER t;
+        t.QuadPart = -(LONGLONG)((ns + 99u) / 100u);   /* relative, 100 ns */
+        s_nt_delay(FALSE, &t);
+    } else {
+        Sleep(1);
     }
 #else
     {

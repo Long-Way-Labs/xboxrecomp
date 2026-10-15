@@ -101,7 +101,7 @@ if(WIN32)
         d3d11
         dxgi
         dxguid
-        xinput
+        $<IF:$<BOOL:${MINGW}>,xinput1_4,xinput>
         winmm
         # Lets the fault handler resolve the host RIP back to the generated
         # function's symbol, i.e. to the guest function that faulted.

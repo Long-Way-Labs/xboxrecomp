@@ -28,7 +28,7 @@ target_include_directories(template_main_test PRIVATE
     ${TEMPLATE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
 if(WIN32)
     target_link_libraries(template_main_test PRIVATE
-        d3d11 dxgi dxguid xinput winmm dbghelp)
+        d3d11 dxgi dxguid $<IF:$<BOOL:${MINGW}>,xinput1_4,xinput> winmm dbghelp)
 endif()
 
 enable_testing()

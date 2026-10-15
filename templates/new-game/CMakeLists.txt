@@ -33,6 +33,14 @@ add_compile_definitions(
 set(XBOXRECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../xboxrecomp" CACHE PATH
     "Path to the xboxrecomp toolkit root directory")
 
+# Off Windows, xbox_kernel links OpenSSL::Crypto PUBLIC but finds it inside its
+# own subdirectory, where the imported target stays invisible to this
+# executable ("target not found" for OpenSSL::Crypto). Finding it here first
+# puts it in scope for both.
+if(NOT WIN32)
+    find_package(OpenSSL REQUIRED)
+endif()
+
 # Add xboxrecomp as a subdirectory -- this builds all 6 runtime libraries
 # and provides the 'xboxrecomp' umbrella target to link against.
 add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
@@ -63,6 +71,8 @@ set(GAME_SOURCES
 #   src/recomp/recomp_dispatch.h     - binary search dispatch table
 #   src/recomp/recomp_types.h        - register model, ICALL macros, MEM helpers
 
+# WIN32 selects the GUI subsystem on Windows and is ignored elsewhere, so the
+# macOS build is a plain console executable.
 add_executable(${PROJECT_NAME} WIN32
     ${GAME_SOURCES}
     ${RECOMP_GEN_SOURCES}
@@ -78,17 +88,26 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${XBOXRECOMP_DIR}/include
 )
 
-# Windows SDK libraries needed at link time
-target_link_libraries(${PROJECT_NAME} PRIVATE
-    d3d11
-    dxgi
-    dxguid
-    xinput
-    winmm
-    # Lets the fault handler resolve the host RIP back to the generated
-    # function's symbol, i.e. to the guest function that faulted.
-    dbghelp
-)
+# Windows SDK libraries needed at link time. Other hosts get graphics (SDL2,
+# Metal), input and crypto through the xboxrecomp targets and need nothing
+# extra here.
+#
+# The executable stays unstripped on every host: the fault handler names the
+# generated function a crash happened in from the symbol table (dbghelp on
+# Windows, dladdr elsewhere). macOS needs no -export_dynamic for that, only no
+# strip -x / -Wl,-x.
+if(WIN32)
+    target_link_libraries(${PROJECT_NAME} PRIVATE
+        d3d11
+        dxgi
+        dxguid
+        xinput
+        winmm
+        # Lets the fault handler resolve the host RIP back to the generated
+        # function's symbol, i.e. to the guest function that faulted.
+        dbghelp
+    )
+endif()
 
 # MSVC-specific: large address aware, increase section limit for big generated files
 if(MSVC)
@@ -97,6 +116,15 @@ if(MSVC)
     )
     # The generated code files can be very large. Increase object file section limit.
     target_compile_options(${PROJECT_NAME} PRIVATE /bigobj)
+endif()
+
+# The lifter writes compares as `if ((a == b))`, which Clang (Apple clang and
+# llvm-mingw alike) flags as -Wparentheses-equality once per site: tens of
+# thousands of warnings a full build, burying the real ones. Generated code
+# only.
+if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+    set_property(SOURCE ${RECOMP_GEN_SOURCES} APPEND PROPERTY
+        COMPILE_OPTIONS -Wno-parentheses-equality)
 endif()
 
 # ── Game-specific additions ─────────────────────────────────────

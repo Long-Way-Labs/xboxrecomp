@@ -70,11 +70,17 @@ static const path_rule s_rules[] = {
      * a race gate on 2026-10-15 overwrote LocalCache08.bin in a dump meant to
      * stay read-only. It goes with the saves for the same reasons they do.
      *
+     * Its folder is TitleCache, not CACHE: Z: and Partition3-5 (the cache
+     * partitions behind X:, Y: and Z:) already go to <save>/Cache, and on a
+     * case-insensitive host (Windows, Proton, macOS) CACHE and Cache are one
+     * folder, so the title's files would mix with the utility-drive caches
+     * and could collide by name.
+     *
      * Partition1 as a whole cannot follow it: a title may read its own assets
      * through Partition1 (Wreckless links \??\Z: to Partition1\ and loads
      * everything through z:\, see resolve_symlink), and those live in the
      * game dir. So only the directories a title writes move, one rule each. */
-    { "\\Device\\Harddisk0\\Partition1\\CACHE", 2, "\\CACHE",  "/CACHE"      },
+    { "\\Device\\Harddisk0\\Partition1\\CACHE", 2, "\\TitleCache","/TitleCache" },
     { "\\Device\\Harddisk0\\Partition1\\",    0, NULL,         NULL          },
     /* The rest of the disk. Partition 0 is the whole raw device, 2 holds
      * system data, and 3-5 are the per-title caches behind X:, Y: and Z:.
@@ -117,9 +123,10 @@ static const path_rule s_rules[] = {
  * Match a rule against a path: the prefix, and then a boundary unless the
  * prefix already ends in a separator. Without the boundary the bare
  * directory rules matched any name that starts the same way, so an asset
- * read through E: such as Partition1\cached.dat became <save>/CACHE/d.dat,
- * and Partition1\UDATAX\a went to the saves. Wreckless loads every asset
- * through z:, which it links to Partition1\, so such a name is reachable.
+ * read through E: such as Partition1\cached.dat became <save>/CACHE/d.dat
+ * (before CACHE moved to TitleCache), and Partition1\UDATAX\a went to the
+ * saves. Wreckless loads every asset through z:, which it links to
+ * Partition1\, so such a name is reachable.
  *
  * Returns the number of chars consumed, or 0 if the rule does not apply.
  */
@@ -373,7 +380,7 @@ int xbox_path_tree(const char *xbox_path)
 
 static WCHAR s_game_dir[MAX_PATH];
 static WCHAR s_save_dir[MAX_PATH];
-static WCHAR s_user_dir[MAX_PATH];   /* UDATA/TDATA/CACHE root: s_save_dir or RECOMP_SAVE_DIR */
+static WCHAR s_user_dir[MAX_PATH];   /* UDATA/TDATA/TitleCache root: s_save_dir or RECOMP_SAVE_DIR */
 static BOOL  s_initialized = FALSE;
 
 #define XBOX_DISK_IMAGE_NAME   L"Partition0.img"
@@ -646,7 +653,7 @@ translate:
 
 static char s_game_dir[MAX_PATH];
 static char s_save_dir[MAX_PATH];
-static char s_user_dir[MAX_PATH];   /* UDATA/TDATA/CACHE root: s_save_dir or RECOMP_SAVE_DIR */
+static char s_user_dir[MAX_PATH];   /* UDATA/TDATA/TitleCache root: s_save_dir or RECOMP_SAVE_DIR */
 static BOOL s_initialized = FALSE;
 
 /* Strip a single trailing '/' (but never the root '/'). */

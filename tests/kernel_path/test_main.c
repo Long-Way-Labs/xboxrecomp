@@ -6,7 +6,10 @@
  * writes -- UDATA and TDATA (saves) and CACHE (scratch) -- must land under
  * the user-data root. Burnout 3 opens E:\CACHE\LocalCache00.bin and
  * LocalCache08.bin with FILE_OPEN_IF; while CACHE fell through to the
- * Partition1 rule, every run wrote them into the user's dump.
+ * Partition1 rule, every run wrote them into the user's dump. CACHE maps to
+ * TitleCache, not CACHE, since Z: and Partition3-5 (the cache partitions
+ * behind X:, Y: and Z:) use <save>/Cache and the two names are one folder on
+ * a case-insensitive host.
  *
  * Cross-platform: Win32 backend on Windows and Proton, POSIX elsewhere, so
  * both forms of each rule (sub_win, sub_posix) are checked by the same cases.
@@ -147,6 +150,20 @@ static int under(const char *path, const char *dir)
     return path[n] == SEP[0];
 }
 
+/* The directory part of a host path, folded to lower case: Windows, Proton
+ * and macOS treat names that differ only in case as one folder. */
+static void folded_dir(const char *path, char *out, size_t n)
+{
+    char *slash;
+    size_t i;
+
+    snprintf(out, n, "%s", path);
+    slash = strrchr(out, SEP[0]);
+    if (slash) *slash = '\0';
+    for (i = 0; out[i]; i++)
+        if (out[i] >= 'A' && out[i] <= 'Z') out[i] = (char)(out[i] - 'A' + 'a');
+}
+
 static void expect(const char *guest, const char *want, const char *what)
 {
     const char *got = host(guest);
@@ -164,11 +181,32 @@ static void test_default_root(void)
     recomp_env_set(RENV_SAVE_DIR, "");
     xbox_path_init(g_game, g_save);
 
-    snprintf(want, sizeof want, "%s" SEP "CACHE" SEP "LocalCache08.bin", g_save);
+    snprintf(want, sizeof want, "%s" SEP "TitleCache" SEP "LocalCache08.bin", g_save);
     expect("\\Device\\Harddisk0\\Partition1\\CACHE\\LocalCache08.bin", want,
-           "Partition1\\CACHE goes to <save>/CACHE");
+           "Partition1\\CACHE goes to <save>/TitleCache");
     check(!under(host("\\Device\\Harddisk0\\Partition1\\CACHE\\LocalCache08.bin"), g_game),
           "Partition1\\CACHE is not under the game dir");
+
+    /* E:\CACHE and the utility-drive caches share the save root here, so
+     * they must differ by more than case: <save>/CACHE was <save>/Cache on
+     * a case-insensitive host, and the title's files mixed with Z:'s. */
+    {
+        static const char *const others[][2] = {
+            { "Z:\\LocalCache08.bin",                               "Z:\\"         },
+            { "\\Device\\Harddisk0\\Partition3\\LocalCache08.bin", "Partition3" },
+            { "\\Device\\Harddisk0\\Partition5\\LocalCache08.bin", "Partition5" },
+        };
+        char title[1200], other[1200], what[128];
+        size_t i;
+        folded_dir(host("\\Device\\Harddisk0\\Partition1\\CACHE\\LocalCache08.bin"),
+                   title, sizeof title);
+        for (i = 0; i < sizeof others / sizeof others[0]; i++) {
+            folded_dir(host(others[i][0]), other, sizeof other);
+            snprintf(what, sizeof what, "E:\\CACHE and %s are different folders, ignoring case",
+                     others[i][1]);
+            check(title[0] && other[0] && strcmp(title, other) != 0, what);
+        }
+    }
 }
 
 /* RECOMP_SAVE_DIR moves CACHE with UDATA and TDATA. */
@@ -183,17 +221,17 @@ static void test_save_dir_root(void)
     xbox_path_init(g_game, g_save);
 
     /* Burnout 3's exact spelling: lower-case "partition1". */
-    snprintf(want, sizeof want, "%s" SEP "CACHE" SEP "LocalCache00.bin", g_user);
+    snprintf(want, sizeof want, "%s" SEP "TitleCache" SEP "LocalCache00.bin", g_user);
     expect("\\Device\\Harddisk0\\partition1\\CACHE\\LocalCache00.bin", want,
-           "partition1\\CACHE (B3's case) goes to <user>/CACHE");
+           "partition1\\CACHE (B3's case) goes to <user>/TitleCache");
     p = host("\\Device\\Harddisk0\\partition1\\CACHE\\LocalCache08.bin");
     check(!under(p, g_game) && !under(p, g_save), "it is under neither the game dir nor the save dir");
 
     /* The title opens its file with FILE_OPEN_IF, which needs the parent. */
-    snprintf(dir, sizeof dir, "%s" SEP "CACHE", g_user);
-    check(is_dir(dir), "translating it made <user>/CACHE");
+    snprintf(dir, sizeof dir, "%s" SEP "TitleCache", g_user);
+    check(is_dir(dir), "translating it made <user>/TitleCache");
 
-    snprintf(want, sizeof want, "%s" SEP "CACHE", g_user);
+    snprintf(want, sizeof want, "%s" SEP "TitleCache", g_user);
     expect("\\Device\\Harddisk0\\Partition1\\CACHE", want, "the bare CACHE directory too");
     expect("\\Device\\Harddisk0\\Partition1\\CACHE\\", want, "and with a trailing separator");
 
@@ -217,8 +255,8 @@ static void test_save_dir_root(void)
     xbox_IoCreateSymbolicLink(&l, &t);
     snprintf(want, sizeof want, "%s" SEP "media" SEP "a.ipk", g_game);
     expect("q:\\media\\a.ipk", want, "a title link to Partition1\\ still reads the game dir");
-    snprintf(want, sizeof want, "%s" SEP "CACHE" SEP "LocalCache08.bin", g_user);
-    expect("q:\\CACHE\\LocalCache08.bin", want, "and its CACHE goes to <user>/CACHE");
+    snprintf(want, sizeof want, "%s" SEP "TitleCache" SEP "LocalCache08.bin", g_user);
+    expect("q:\\CACHE\\LocalCache08.bin", want, "and its CACHE goes to <user>/TitleCache");
 
     check(xbox_path_tree("\\Device\\Harddisk0\\Partition1\\CACHE\\x") == XBOX_TREE_USER,
           "xbox_path_tree: CACHE is the user tree");

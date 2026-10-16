@@ -9,6 +9,14 @@ blinx2-v0.3.2; earlier tags are described by their commits.
 
 ## [Unreleased]
 
+### Fixed
+- A title's `E:\CACHE` (`\Device\Harddisk0\Partition1\CACHE`) now goes
+  to `<save_dir>/TitleCache` (or under `RECOMP_SAVE_DIR`), not
+  `<save_dir>/CACHE`. On Windows, Proton and macOS that was the same folder
+  as `Cache`, where Z: and Partition3-5 (the cache partitions behind X:, Y:
+  and Z:) go, so the files could mix and collide. Files left in the old
+  folder are not moved; the title rebuilds its cache.
+
 ## [blinx2-v0.4.0] - 2026-10-15
 
 ### Added

@@ -99,7 +99,7 @@ extern "C" {
     X(FB_WINDOW,         CONFIG, "RECOMP_FB_WINDOW",         NULL, "Windows: show the framebuffer window (not beside the d3d11 backend)") \
     X(GAME_FILES,        CONFIG, "RECOMP_GAME_FILES",        NULL, "game files directory; the launcher sets it, the game's main.c has the default") \
     X(HDD_DIR,           CONFIG, "RECOMP_HDD_DIR",           NULL, "emulated hard disk: partition images, saves, caches") \
-    X(SAVE_DIR,          CONFIG, "RECOMP_SAVE_DIR",          NULL, "root for the title's UDATA/TDATA") \
+    X(SAVE_DIR,          CONFIG, "RECOMP_SAVE_DIR",          NULL, "root for the title's UDATA/TDATA/CACHE") \
     X(AC97_READY,        CONFIG, "RECOMP_AC97_READY",        NULL, "emulated APU and audio; default on (x86-64 Windows/Proton, macOS/Linux arm64), 0: off") \
     X(VBLANK,            CONFIG, "RECOMP_VBLANK",            NULL, "deliver the vblank interrupt; =0 off") \
     X(TITLE_KEVENTS,     CONFIG, "RECOMP_TITLE_KEVENTS",     NULL, "1: a KEVENT the title builds itself gets a host event (upstream, default off)") \

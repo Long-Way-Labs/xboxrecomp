@@ -57,11 +57,24 @@ static const path_rule s_rules[] = {
      * save in the game dir, shared by all runs and all save dirs: a fresh
      * XDG_DATA_HOME still saw the last run's save game. Listed first so they
      * win over Partition1; no trailing separator, the title opens the bare
-     * directories too. RECOMP_SAVE_DIR moves just these two (to_save 2), so a
+     * directories too. RECOMP_SAVE_DIR moves just these (to_save 2), so a
      * scripted run can start from an empty save without touching the rest of
      * the save dir (partition images, caches). */
     { "\\Device\\Harddisk0\\Partition1\\UDATA", 2, "\\UDATA",  "/UDATA"      },
     { "\\Device\\Harddisk0\\Partition1\\TDATA", 2, "\\TDATA",  "/TDATA"      },
+    /* E:\CACHE is the title's own scratch on the console's hard disk, and it
+     * writes there: Burnout 3 opens CACHE\LocalCache00.bin and
+     * LocalCache08.bin with disposition 3 (FILE_OPEN_IF) from 0x0032A73C. Under
+     * the Partition1 rule below those landed in the game dir, so every run
+     * wrote into the user's dump and shared one cache across all save dirs;
+     * a race gate on 2026-10-15 overwrote LocalCache08.bin in a dump meant to
+     * stay read-only. It goes with the saves for the same reasons they do.
+     *
+     * Partition1 as a whole cannot follow it: a title may read its own assets
+     * through Partition1 (Wreckless links \??\Z: to Partition1\ and loads
+     * everything through z:\, see resolve_symlink), and those live in the
+     * game dir. So only the directories a title writes move, one rule each. */
+    { "\\Device\\Harddisk0\\Partition1\\CACHE", 2, "\\CACHE",  "/CACHE"      },
     { "\\Device\\Harddisk0\\Partition1\\",    0, NULL,         NULL          },
     /* The rest of the disk. Partition 0 is the whole raw device, 2 holds
      * system data, and 3-5 are the per-title caches behind X:, Y: and Z:.
@@ -99,6 +112,30 @@ static const path_rule s_rules[] = {
     { "\\??\\T:\\",                           1, "\\TitleData","/TitleData"  },
 };
 #define PATH_RULE_COUNT ((int)(sizeof(s_rules) / sizeof(s_rules[0])))
+
+/*
+ * Match a rule against a path: the prefix, and then a boundary unless the
+ * prefix already ends in a separator. Without the boundary the bare
+ * directory rules matched any name that starts the same way, so an asset
+ * read through E: such as Partition1\cached.dat became <save>/CACHE/d.dat,
+ * and Partition1\UDATAX\a went to the saves. Wreckless loads every asset
+ * through z:, which it links to Partition1\, so such a name is reachable.
+ *
+ * Returns the number of chars consumed, or 0 if the rule does not apply.
+ */
+static int match_rule(const char* path, const path_rule* rule)
+{
+    int  n = match_prefix(path, rule->prefix);
+    char last, next;
+
+    if (!n)
+        return 0;
+    last = rule->prefix[n - 1];
+    next = path[n];
+    if (last == '\\' || last == '/' || next == '\0' || next == '\\' || next == '/')
+        return n;
+    return 0;
+}
 
 /*
  * Rewrite a path through a drive letter the title mapped for itself.
@@ -165,7 +202,7 @@ static int resolve_symlink(const char* xbox_path, char* out, size_t out_size)
     out[tlen + rlen] = '\0';
 
     for (i = 0; i < PATH_RULE_COUNT; i++) {
-        if (match_prefix(out, s_rules[i].prefix))
+        if (match_rule(out, &s_rules[i]))
             return 1;           /* the target is somewhere we can place */
     }
     return 0;
@@ -321,7 +358,7 @@ int xbox_path_tree(const char *xbox_path)
     }
 
     for (i = 0; i < PATH_RULE_COUNT; i++) {
-        if (match_prefix(p, s_rules[i].prefix))
+        if (match_rule(p, &s_rules[i]))
             return s_rules[i].to_save == 2 ? XBOX_TREE_USER
                  : s_rules[i].to_save     ? XBOX_TREE_HDD : XBOX_TREE_GAME;
     }
@@ -336,7 +373,7 @@ int xbox_path_tree(const char *xbox_path)
 
 static WCHAR s_game_dir[MAX_PATH];
 static WCHAR s_save_dir[MAX_PATH];
-static WCHAR s_user_dir[MAX_PATH];   /* UDATA/TDATA root: s_save_dir or RECOMP_SAVE_DIR */
+static WCHAR s_user_dir[MAX_PATH];   /* UDATA/TDATA/CACHE root: s_save_dir or RECOMP_SAVE_DIR */
 static BOOL  s_initialized = FALSE;
 
 #define XBOX_DISK_IMAGE_NAME   L"Partition0.img"
@@ -466,8 +503,8 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
         }
     }
 
-    /* RECOMP_SAVE_DIR: the root for the title's UDATA and TDATA, created if
-     * missing. Absolute; under Wine a DOS path (Z:\home\...) is safest. */
+    /* RECOMP_SAVE_DIR: the root for the title's UDATA, TDATA and CACHE,
+     * created if missing. Absolute; under Wine a DOS path (Z:\home\...) is safest. */
     {
         const char *ov = recomp_env(RENV_SAVE_DIR);
         /* Room for the longest suffix the rules append (UDATA\<title id>\
@@ -493,7 +530,7 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     }
 
     s_initialized = TRUE;
-    xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%S, save=%S, udata/tdata=%S",
+    xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%S, save=%S, user data=%S",
              s_game_dir, s_save_dir, s_user_dir);
 }
 
@@ -539,7 +576,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     }
 
     for (int i = 0; i < PATH_RULE_COUNT; i++) {
-        skip = match_prefix(xbox_path, s_rules[i].prefix);
+        skip = match_rule(xbox_path, &s_rules[i]);
         if (skip) {
             remainder = xbox_path + skip;
             base_dir  = s_rules[i].to_save == 2 ? s_user_dir
@@ -609,7 +646,7 @@ translate:
 
 static char s_game_dir[MAX_PATH];
 static char s_save_dir[MAX_PATH];
-static char s_user_dir[MAX_PATH];   /* UDATA/TDATA root: s_save_dir or RECOMP_SAVE_DIR */
+static char s_user_dir[MAX_PATH];   /* UDATA/TDATA/CACHE root: s_save_dir or RECOMP_SAVE_DIR */
 static BOOL s_initialized = FALSE;
 
 /* Strip a single trailing '/' (but never the root '/'). */
@@ -718,8 +755,8 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
         }
     }
 
-    /* RECOMP_SAVE_DIR: the root for the title's UDATA and TDATA, created if
-     * missing, so a scripted run can start from an empty save. */
+    /* RECOMP_SAVE_DIR: the root for the title's UDATA, TDATA and CACHE,
+     * created if missing, so a scripted run can start from an empty save. */
     {
         const char* ov = recomp_env(RENV_SAVE_DIR);
         if (ov && ov[0]) {
@@ -732,7 +769,7 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     }
 
     s_initialized = TRUE;
-    xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%s, save=%s, udata/tdata=%s",
+    xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%s, save=%s, user data=%s",
              s_game_dir, s_save_dir, s_user_dir);
 }
 
@@ -767,7 +804,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     }
 
     for (int i = 0; i < PATH_RULE_COUNT; i++) {
-        skip = match_prefix(xbox_path, s_rules[i].prefix);
+        skip = match_rule(xbox_path, &s_rules[i]);
         if (skip) {
             remainder = xbox_path + skip;
             base_dir  = s_rules[i].to_save == 2 ? s_user_dir

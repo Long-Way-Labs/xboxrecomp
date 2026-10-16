@@ -517,7 +517,7 @@ struct nv2a_stage {
     int      on;        /* CONTROL0 enable as used (never-set stage 0 counts on) */
     int      mode;      /* 0 none, 1 2D, 4 pass-through, other: sampled as 2D */
     /* SET_TEXTURE_SET_BUMP_ENV_MAT (0x1B28..0x1B34), as stored: the four
-     * registers hold 00, 01, 11, 10 (see nv2a_ps_consts.bump); then
+     * slots hold 00, 01, 11, 10 (see nv2a_ps_consts.bump); then
      * BUMP_ENV_SCALE (0x1B38) and BUMP_ENV_OFFSET (0x1B3C). */
     float    bump[4], bump_scale, bump_offset;
     int      raw_mode;  /* the shader program's mode before the gating */
@@ -896,10 +896,14 @@ struct nv2a_ps_consts {
     float    tex_scale[4][4];   /* xy: texcoord multiplier (1/size for linear);
                                  * z: nv2a_rect_snap_scale, 0 for none */
     uint32_t tex_mode[4];       /* stage texture-shader mode, 0 = none */
-    /* BUMPENVMAP stages: the bump matrix as the registers hold it -- 00,
-     * 01, 11, 10, not the 00 01 10 11 their order suggests (xemu reads them
-     * that way): du' = dot(dudv, bump.xw), dv' = dot(dudv, bump.yz) -- and
-     * BUMPENVMAP_LUMINANCE's scale (x) and offset (y). */
+    /* BUMPENVMAP stages: the bump matrix as the method slots hold it --
+     * 00, 01, 11, 10, not the 00 01 10 11 their order suggests. The XDK's
+     * texture-stage states run BUMPENVMAT00, 01, 11, 10 (22..25) and are
+     * written to the slots in index order, and xemu's
+     * SET_TEXTURE_SET_BUMP_ENV_MAT handler stores slot 2 in BUMPMAT11 and
+     * slot 3 in BUMPMAT10 (its swizzle[]): du' = dot(dudv, bump.xw),
+     * dv' = dot(dudv, bump.yz) -- and BUMPENVMAP_LUMINANCE's scale (x) and
+     * offset (y). */
     float    bump[4][4];
     float    bumpls[4][4];
 };
@@ -920,6 +924,41 @@ unsigned nv2a_rect_snap_scale(const struct nv2a_stage *t, unsigned scale);
 void nv2a_ps_consts_fill(const struct nv2a_pb_vsh *v,
                          const struct nv2a_stage st[4],
                          struct nv2a_ps_consts *pc);
+
+/* SET_SHADER_OTHER_STAGE_INPUT: the earlier stage whose texel a dependent
+ * read in stage n (BUMPENVMAP, ...) takes. Stage 1 always reads stage 0;
+ * stages 2 and 3 name theirs in bits 16-19 and 20-23, as xemu's
+ * input_tex[]. An input at or past n is a title bug: xemu asserts, and it
+ * is clamped to n - 1 here so the shader still builds. 0 for stage 0. */
+static inline int nv2a_stage_input(int n, uint32_t other_stage_input)
+{
+    uint32_t in;
+    if (n <= 1)
+        return 0;
+    in = (other_stage_input >> (n == 2 ? 16 : 20)) & 0xFu;
+    return in < (uint32_t)n ? (int)in : n - 1;
+}
+
+/* The pixel shader's mode for stage n of a backend that generates
+ * BUMPENVMAP: NONE, PASSTHRU and CLIPPLANE (5, from raw_mode) stay, 6 and 7
+ * stay from stage 1 on (stage 0 has no earlier stage to read), and every
+ * other mode is sampled as 2D. Both GPU backends key their shaders on it. */
+static inline uint32_t nv2a_stage_ps_mode(const struct nv2a_stage *t, int n)
+{
+    uint32_t m = (uint32_t)t->mode;
+    if (t->raw_mode == 5)
+        return 5;   /* CLIPPLANE reads 0, not NONE's (0, 0, 0, 1) */
+    if ((m == 6 || m == 7) && n > 0)
+        return m;
+    return m && m != 4 ? 1u : m;
+}
+
+/* RECOMP_TRACE=bump: one line on stderr the first time a batch shows a
+ * distinct BUMPENVMAP configuration (stage, mode, input stage, the matrix as
+ * stored, scale, offset, the stage's and the input's format and size), with
+ * the flip. The caller checks the key. Printing only. */
+void nv2a_bump_trace(const struct nv2a_pb_vsh *v, const struct nv2a_stage st[4],
+                     uint32_t flip);
 
 /* Stage n samples a w x h render target instead of guest memory: linear
  * coordinates are texels of the surface as drawn (1/size), and no snap,

@@ -129,7 +129,7 @@ _Static_assert(offsetof(struct nv2a_vp_consts, u) == 48, "nv2a_vp_consts.u moved
 /* PsConsts (MSL): float4 c0[8], c1[8], fc0, fc1, fog_color; uint4 atest
  * (x alpha_ref as float bits, y alpha_func, z alpha_test_enable, w fog_enable);
  * uint4 alpha_only; float4 tex_scale[4]; uint4 tex_mode; float4 bump[4];
- * float4 bumpls[4] (BUMPENVMAP; read by the D3D11 generator only, so far). */
+ * float4 bumpls[4] (BUMPENVMAP). */
 #define PS_AT(m, off) \
     _Static_assert(offsetof(struct nv2a_ps_consts, m) == (off), "nv2a_ps_consts." #m " moved")
 PS_AT(c0, 0);
@@ -1688,9 +1688,9 @@ static uint32_t fnv(const void *p, size_t n)
 static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v)
 {
     static char msl[65536];
-    static struct { int valid; uint32_t r[37]; id<MTLFunction> fn; } memo;
+    static struct { int valid; uint32_t r[38]; id<MTLFunction> fn; } memo;
     NV2ACombinerState st;
-    uint32_t key[37], modes = 0, hash;
+    uint32_t key[38], modes = 0, inputs = 0, hash;
     FsEntry *e = NULL;
     char what[32];
     int n;
@@ -1698,10 +1698,11 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v)
     if (!(v->rc_set && (v->rc_ctl & 0xFF)))
         return s_fs_basic;
     for (n = 0; n < 4; n++) {
-        uint32_t m = (uint32_t)s_stage[n].mode;
-        if (s_stage[n].raw_mode == 5)
-            m = 5;          /* CLIPPLANE reads 0, not NONE's (0, 0, 0, 1) */
-        else if (m && m != 4) m = 1;
+        /* As D3D11: BUMPENVMAP(_LUMINANCE) from stage 1 on, reading the
+         * stage OTHER_STAGE_INPUT names. */
+        uint32_t m = nv2a_stage_ps_mode(&s_stage[n], n);
+        if (m == 6 || m == 7)
+            inputs |= (uint32_t)nv2a_stage_input(n, v->other_stage_input) << (4 * n);
         modes |= m << (5 * n);
     }
     memcpy(key, v->rc_cicw, 32);
@@ -1714,6 +1715,7 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v)
     key[35] = modes;
     /* render.scale changes at run time: each scale class has its own text */
     key[36] = nv2a_host_render_scale() > 1;
+    key[37] = inputs;
     if (memo.valid && !memcmp(memo.r, key, sizeof key))
         return memo.fn;
 
@@ -1722,6 +1724,9 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v)
                              v->rc_ctl, v->rc_fcw0, v->rc_fcw1, modes, &st);
     st.fog_input = 1;   /* FOG.a is the interpolated vertex fog factor */
     st.rect_snap = (int)key[36];   /* nv2a_snap_uv; in the hash via st */
+    for (n = 0; n < 4; n++)
+        st.tex_input[n] = (int)((inputs >> (4 * n)) & 0xF);
+    st.bump_on = 1;
     hash = fnv(&st, sizeof st);
     if (!s_fs && !(s_fs = (FsEntry *)calloc(FS_MAX, sizeof *s_fs)))
         return s_fs_basic;
@@ -1946,6 +1951,15 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             return;
         }
         build_stages();
+        {
+            static int bump_trace = -1;
+            if (bump_trace < 0)
+                bump_trace = recomp_env(RENV_BUMP_TRACE) != NULL;
+            /* Only a combiner draw samples a bump stage (the basic shader
+             * reads every stage as plain 2D), so only those are logged. */
+            if (bump_trace && v->rc_set && (v->rc_ctl & 0xFF))
+                nv2a_bump_trace(v, s_stage, g->flips);
+        }
         nv2a_ps_consts_fill(v, s_stage, &mpc.b);
         for (k = 0; k < 4; k++) {
             /* As the D3D11 MipLODBias: only a mipmapped stage has one. */

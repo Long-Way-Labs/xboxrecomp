@@ -231,8 +231,8 @@ presenters read them at start.
     only, and a golden run pins `RECOMP_RENDER_SCALE=1`.
 - **`render.aniso = N`** (2..16; 0 or 1 is off, the stock filtering;
   outside 0..16 it is clamped, with a line). D3D11 and Metal sample a
-  texture anisotropically when it has mip levels, its minification filters and it
-  is not a cube map: the world's surfaces, sharp at grazing angles. A
+  texture anisotropically when it has mip levels, its minification filters
+  and it is not a cube map: the world's surfaces, sharp at grazing angles. A
   texture without mips is left alone, since those are render targets read
   back (bloom, blur and composite passes), linear-format movie frames and
   lookup tables: screen-aligned or data, and they shimmer under it. Both

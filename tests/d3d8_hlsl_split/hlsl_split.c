@@ -147,6 +147,50 @@ static int snap_check(void)
     return bad;
 }
 
+/* BUMPENVMAP (bump_on): stage 1 in mode 6 reads stage 0, stage 2 in mode 7
+ * reads stage 1. The input's blue and green over 127, the matrix as the
+ * slots hold it (00 01 11 10: .xw and .yz), the offset before tex_scale,
+ * the luminance on the whole texel. Without bump_on the same modes are the
+ * plain 2D sample, so the hashed cases above stay the stock text. */
+static int bump_check(void)
+{
+    static const uint32_t zero[8];
+    static char text[256 * 1024];
+    NV2ACombinerState st;
+    int bad = 0, n;
+
+    memset(&st, 0, sizeof st);
+    d3d8_combiners_from_regs(zero, zero, zero, zero, 1u, 0u, 0u,
+                             1u | 6u << 5 | 7u << 10, &st);
+    st.fog_input = 1;
+    st.tex_input[1] = 0;
+    st.tex_input[2] = 1;
+    st.bump_on = 1;
+    if ((n = d3d8_combiners_generate_hlsl(&st, text, (int)sizeof text)) <= 0)
+        return 1;
+    if (!strstr(text, "float2 ds = round(x8.bg * 255.0);")
+            || !strstr(text, "float2 ds = round(x9.bg * 255.0);")
+            || !strstr(text, "ds = (ds >= 128.0 ? ds - 256.0 : ds) / 127.0;")
+            || !strstr(text, "ds = float2(dot(ds, bump[1].xw), dot(ds, bump[1].yz));")
+            || !strstr(text, "x9 = tex1.Sample(samp1, (i.tc1.xy + ds) * tex_scale[1].xy);")) {
+        printf("FAIL: the BUMPENVMAP stage 1 text\n");
+        bad = 1;
+    }
+    if (!strstr(text, "x10 *= x9.r * bumpls[2].x + bumpls[2].y;")
+            || strstr(text, "x9 *= x8.r")) {
+        printf("FAIL: the BUMPENVMAP_LUMINANCE stage 2 text\n");
+        bad = 1;
+    }
+    st.bump_on = 0;
+    if (d3d8_combiners_generate_hlsl(&st, text, (int)sizeof text) <= 0)
+        return 1;
+    if (strstr(text, "ds = ") || strstr(text, "bumpls[2].x")) {
+        printf("FAIL: BUMPENVMAP text without bump_on\n");
+        bad = 1;
+    }
+    return bad;
+}
+
 int main(void)
 {
     static uint32_t prog[NV2A_VS_MAX_INSTRUCTIONS * 4];
@@ -209,6 +253,8 @@ int main(void)
     if (texmode_check())
         return 1;
     if (snap_check())
+        return 1;
+    if (bump_check())
         return 1;
     if (s_bad) {
         printf("FAIL: %d of %d cases differ (HLSL_DUMP=<file> writes the text)\n",

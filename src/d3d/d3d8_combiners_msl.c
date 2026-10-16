@@ -125,6 +125,24 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
         if (m == NV2A_TEXMODE_3D || m == NV2A_TEXMODE_CUBEMAP) {
             EMIT("    x%d = tex%d.sample(samp%d, i.t%d.xyz, bias(pc.tex_bias[%d]));\n",
                  8 + i, i, i, i, i);
+        } else if (state->bump_on && (m == NV2A_TEXMODE_BUMPENVMAP
+                                      || m == NV2A_TEXMODE_BUMPENVMAP_LUM)) {
+            /* As the HLSL: the input's blue and green as signed bytes over
+             * 127 (xemu's sign3), the matrix as the slots hold it (00 01 11
+             * 10), the offset in the coordinate's own units before
+             * tex_scale; mode 7 scales the whole texel by the input's red. */
+            int in = state->tex_input[i];
+            EMIT("    {\n");
+            EMIT("        float2 ds = round(x%d.bg * 255.0);\n", 8 + in);
+            EMIT("        ds = select(ds, ds - 256.0, ds >= 128.0) / 127.0;\n");
+            EMIT("        ds = float2(dot(ds, pc.bump[%d].xw), dot(ds, pc.bump[%d].yz));\n",
+                 i, i);
+            EMIT("        x%d = tex%d.sample(samp%d, (i.t%d.xy + ds) * pc.tex_scale[%d].xy,"
+                 " bias(pc.tex_bias[%d]));\n", 8 + i, i, i, i, i, i);
+            if (m == NV2A_TEXMODE_BUMPENVMAP_LUM)
+                EMIT("        x%d *= x%d.r * pc.bumpls[%d].x + pc.bumpls[%d].y;\n",
+                     8 + i, 8 + in, i, i);
+            EMIT("    }\n");
         } else {
             EMIT("    {\n");
             EMIT("        float2 uv = i.t%d.xy;\n", i);

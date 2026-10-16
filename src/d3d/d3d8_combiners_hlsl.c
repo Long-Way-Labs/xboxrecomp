@@ -140,19 +140,23 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
         } else if (state->bump_on && (m == NV2A_TEXMODE_BUMPENVMAP
                                       || m == NV2A_TEXMODE_BUMPENVMAP_LUM)) {
             /* The input stage's blue and green are du and dv as signed
-             * bytes (xemu's sign3, over 128): textures arrive as unsigned
-             * BGRA8, so the byte is taken back to two's complement. The
-             * offset is added in the coordinate's own units, before
-             * tex_scale (texels for a linear-format texture). */
+             * bytes: textures arrive as unsigned BGRA8, so the byte is taken
+             * back to two's complement and over 127, as xemu's sign3. The
+             * matrix is bump[] as the slots hold it, 00 01 11 10
+             * (nv2a_ps_consts.bump). The offset is added in the
+             * coordinate's own units, before tex_scale (texels for a
+             * linear-format texture). */
             int in = state->tex_input[i];
             EMIT("    {\n");
             EMIT("        float2 ds = round(x%d.bg * 255.0);\n", 8 + in);
-            EMIT("        ds = (ds >= 128.0 ? ds - 256.0 : ds) / 128.0;\n");
+            EMIT("        ds = (ds >= 128.0 ? ds - 256.0 : ds) / 127.0;\n");
             EMIT("        ds = float2(dot(ds, bump[%d].xw), dot(ds, bump[%d].yz));\n", i, i);
             EMIT("        x%d = tex%d.Sample(samp%d, (i.tc%d.xy + ds) * tex_scale[%d].xy);\n",
                  8 + i, i, i, i, i);
-            if (m == NV2A_TEXMODE_BUMPENVMAP_LUM)   /* luminance: unsigned red */
-                EMIT("        x%d.rgb *= x%d.r * bumpls[%d].x + bumpls[%d].y;\n",
+            if (m == NV2A_TEXMODE_BUMPENVMAP_LUM)
+                /* luminance: the input's unsigned red; it scales the whole
+                 * texel, alpha too, as xemu's t = t * lum */
+                EMIT("        x%d *= x%d.r * bumpls[%d].x + bumpls[%d].y;\n",
                      8 + i, 8 + in, i, i);
             EMIT("    }\n");
         } else {

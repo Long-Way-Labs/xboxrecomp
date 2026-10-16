@@ -6,6 +6,8 @@
 #include "nv2a_tex_pack.h"
 
 #include <stdatomic.h>
+#include <stdio.h>
+#include <string.h>
 
 uint32_t nv2a_tex_extent(uint32_t fmt, uint32_t w, uint32_t h,
                          uint32_t pitch, uint32_t levels)
@@ -799,5 +801,55 @@ void nv2a_downscale_box32(const uint8_t *src, uint32_t src_pitch, uint32_t w, ui
             for (c = 0; c < 4; c++)
                 d[(size_t)x * 4u + c] = (uint8_t)((sum[c] + half) / nn);
         }
+    }
+}
+
+void nv2a_bump_trace(const struct nv2a_pb_vsh *v, const struct nv2a_stage st[4],
+                     uint32_t flip)
+{
+    /* Distinct configurations, by FNV-1a of their fields; past the table's
+     * end nothing more is printed (a title has a handful). */
+    static uint32_t seen[512];
+    static unsigned seen_n;
+    int n;
+
+    for (n = 1; n < 4; n++) {
+        const struct nv2a_stage *t = &st[n], *in;
+        uint32_t f[12], h = 0x811c9dc5u;
+        unsigned i, k;
+        int is;
+
+        if (t->mode != 6 && t->mode != 7)
+            continue;
+        is = nv2a_stage_input(n, v->other_stage_input);
+        in = &st[is];
+        f[0] = (uint32_t)n | (uint32_t)t->mode << 4 | (uint32_t)is << 8;
+        memcpy(&f[1], t->bump, 16);
+        memcpy(&f[5], &t->bump_scale, 4);
+        memcpy(&f[6], &t->bump_offset, 4);
+        f[7] = t->color;
+        f[8] = t->width | t->height << 16;
+        f[9] = in->color;
+        f[10] = in->width | in->height << 16;
+        f[11] = (uint32_t)in->mode;
+        for (i = 0; i < sizeof f; i++)
+            h = (h ^ ((const uint8_t *)f)[i]) * 0x01000193u;
+        for (k = 0; k < seen_n && seen[k] != h; k++)
+            ;
+        if (k < seen_n || seen_n == sizeof seen / sizeof seen[0])
+            continue;
+        seen[seen_n++] = h;
+        /* As stored, slots 00 01 11 10; m01 != m10 with both non-zero is
+         * what tells the transpose apart (a diagonal matrix only shows
+         * that slot 2 is m11). */
+        fprintf(stderr, "[BUMP] flip %u stage %d mode %d input %d (mode %d fmt 0x%02X %ux%u)"
+                " slots %g %g %g %g (m00 %g m01 %g m10 %g m11 %g)%s scale %g offset %g"
+                " fmt 0x%02X %ux%u\n", flip, n, t->mode, is, in->mode, in->color,
+                in->width, in->height, t->bump[0], t->bump[1], t->bump[2], t->bump[3],
+                t->bump[0], t->bump[1], t->bump[3], t->bump[2],
+                t->bump[1] == 0.0f && t->bump[3] == 0.0f ? " diagonal"
+                : t->bump[1] != t->bump[3] && t->bump[1] != 0.0f && t->bump[3] != 0.0f
+                    ? " transpose-telling" : "",
+                t->bump_scale, t->bump_offset, t->color, t->width, t->height);
     }
 }

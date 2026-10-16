@@ -2248,6 +2248,15 @@ static ID3D11PixelShader *setup_pixel(void)
     int n, textured = 0;
 
     build_stages();
+    {
+        static int bump_trace = -1;
+        if (bump_trace < 0)
+            bump_trace = recomp_env(RENV_BUMP_TRACE) != NULL;
+        /* Only a combiner draw samples a bump stage (the basic shader
+         * reads every stage as plain 2D), so only those are logged. */
+        if (bump_trace && v->rc_set && (v->rc_ctl & 0xFF))
+            nv2a_bump_trace(v, s_stage, nv2a_pb_gpu_state()->flips);
+    }
     nv2a_ps_consts_fill(v, s_stage, &pc);
     for (n = 0; n < 4; n++) {
         const Stage *t = &s_stage[n];
@@ -2303,17 +2312,10 @@ static ID3D11PixelShader *setup_pixel(void)
             /* Only 2D textures are bound: other sampling modes read 2D at
              * (s, t), as the CPU path does -- but BUMPENVMAP(_LUMINANCE),
              * which reads 2D at (s, t) moved by an earlier stage's texel,
-             * from stage 1 on. */
-            uint32_t m = (uint32_t)s_stage[n].mode;
-            if (s_stage[n].raw_mode == 5)
-                m = 5;      /* CLIPPLANE reads 0, not NONE's (0, 0, 0, 1) */
-            else if ((m == 6 || m == 7) && n > 0) {
-                /* OTHER_STAGE_INPUT: stage 1 reads stage 0; 2 and 3 name
-                 * theirs, an earlier one. */
-                uint32_t in = n == 1 ? 0
-                            : (v->other_stage_input >> (n == 2 ? 16 : 20)) & 0xF;
-                inputs |= (in < n ? in : n - 1) << (4 * n);
-            } else if (m && m != 4) m = 1;
+             * from stage 1 on (OTHER_STAGE_INPUT names the stage). */
+            uint32_t m = nv2a_stage_ps_mode(&s_stage[n], n);
+            if (m == 6 || m == 7)
+                inputs |= (uint32_t)nv2a_stage_input(n, v->other_stage_input) << (4 * n);
             modes |= m << (5 * n);
         }
         /* The registers and modes that make the state: the same as the last

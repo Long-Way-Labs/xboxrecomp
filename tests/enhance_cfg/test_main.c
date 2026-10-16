@@ -924,6 +924,7 @@ static void enhance_reset_env(void)
 {
     recomp_env_set(RENV_CONFIG, "none");
     recomp_env_set(RENV_RENDER_SCALE, NULL);
+    recomp_env_set(RENV_RENDER_ANISO, NULL);
     recomp_env_set(RENV_DISPLAY_ASPECT, NULL);
     recomp_env_set(RENV_PRESENT_FILTER, NULL);
     recomp_env_set(RENV_PRESENT_FULLSCREEN, NULL);
@@ -979,6 +980,33 @@ static void test_enhance_init(void)
     CHECK(xbox_enhance_init(".", NULL) == 0 && o->render_scale == 1);
     recomp_env_set(RENV_RENDER_SCALE, "-2");
     CHECK(xbox_enhance_init(".", NULL) == 0 && o->render_scale == 1);
+
+    /* render.aniso: unset and 1 are stock (0, no log), 2..16 pass, out of
+     * range clamps to 0..16 with a line saying so. */
+    {
+        const char *out;
+
+        recomp_env_set(RENV_RENDER_SCALE, NULL);
+        capture_begin();
+        CHECK(xbox_enhance_init(".", NULL) == 0 && o->aniso == 0);
+        recomp_env_set(RENV_RENDER_ANISO, "1");
+        CHECK(xbox_enhance_init(".", NULL) == 0 && o->aniso == 0);
+        out = capture_end();
+        CHECK(strstr(out, "out of range") == NULL);
+        recomp_env_set(RENV_RENDER_ANISO, "8");
+        CHECK(xbox_enhance_init(".", NULL) == 0 && o->aniso == 8);
+        capture_begin();
+        recomp_env_set(RENV_RENDER_ANISO, "32");
+        CHECK(xbox_enhance_init(".", NULL) == 0 && o->aniso == 16);
+        out = capture_end();
+        CHECK(strstr(out, "render.aniso=32 out of range 0..16; using 16") != NULL);
+        capture_begin();
+        recomp_env_set(RENV_RENDER_ANISO, "-1");
+        CHECK(xbox_enhance_init(".", NULL) == 0 && o->aniso == 0);
+        out = capture_end();
+        CHECK(strstr(out, "render.aniso=-1 out of range 0..16; using 0") != NULL);
+        recomp_env_set(RENV_RENDER_ANISO, NULL);
+    }
 
     /* A non-4:3 aspect is reported, nothing else changes. */
     recomp_env_set(RENV_RENDER_SCALE, NULL);

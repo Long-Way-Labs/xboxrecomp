@@ -1509,6 +1509,7 @@ static id<MTLSamplerState> sampler(const Stage *t)
     id<MTLSamplerState> st;
     uint32_t u = t->addr_u & 0xF, v = t->addr_v & 0xF;
     int mn, mg, mip, i;
+    unsigned an;
     uint64_t key;
 
     if (point < 0)
@@ -1516,7 +1517,11 @@ static id<MTLSamplerState> sampler(const Stage *t)
     mn = !point && filter_linear(t->filter, 0);
     mg = !point && filter_linear(t->filter, 1);
     mip = t->levels > 1 ? filter_mip(t->filter) : 0;
-    key = u | v << 4 | (uint64_t)mn << 8 | (uint64_t)mg << 9 | (uint64_t)mip << 10;
+    /* render.aniso, on the D3D11 sampler's rule and key bit: only a
+     * mipmapped texture that filters and is not a cube map. */
+    an = !point && mip && mn && !t->cube ? nv2a_host_opts()->aniso : 0;
+    key = u | v << 4 | (uint64_t)mn << 8 | (uint64_t)mg << 9 | (uint64_t)mip << 10
+        | (uint64_t)an << 35;
     if (mip)
         key |= (uint64_t)t->lod_min << 25 | (uint64_t)t->lod_max << 29;
     for (i = 0; i < s_smp_n; i++)
@@ -1532,6 +1537,14 @@ static id<MTLSamplerState> sampler(const Stage *t)
     sd.rAddressMode = MTLSamplerAddressModeClampToEdge;
     sd.lodMinClamp = mip ? (float)t->lod_min : 0.0f;
     sd.lodMaxClamp = mip ? (float)t->lod_max : 0.0f;
+    if (an) {
+        /* D3D11_FILTER_ANISOTROPIC filters min, mag and mip linearly; set
+         * the same here so both backends apply one filter. */
+        sd.minFilter = MTLSamplerMinMagFilterLinear;
+        sd.magFilter = MTLSamplerMinMagFilterLinear;
+        sd.mipFilter = MTLSamplerMipFilterLinear;
+        sd.maxAnisotropy = an;
+    }
     st = [s_dev newSamplerStateWithDescriptor:sd];
     [sd release];
     if (!st)

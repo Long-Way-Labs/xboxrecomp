@@ -230,13 +230,14 @@ presenters read them at start.
     size (1280x960 at 2x). Golden frames are compared at the stock size
     only, and a golden run pins `RECOMP_RENDER_SCALE=1`.
 - **`render.aniso = N`** (2..16; 0 or 1 is off, the stock filtering;
-  outside 0..16 it is clamped, with a line). D3D11 samples a texture
-  anisotropically when it has mip levels, its minification filters and it
+  outside 0..16 it is clamped, with a line). D3D11 and Metal sample a
+  texture anisotropically when it has mip levels, its minification filters and it
   is not a cube map: the world's surfaces, sharp at grazing angles. A
   texture without mips is left alone, since those are render targets read
   back (bloom, blur and composite passes), linear-format movie frames and
-  lookup tables: screen-aligned or data, and they shimmer under it. Read at
-  start; the CPU and Metal backends ignore it for now.
+  lookup tables: screen-aligned or data, and they shimmer under it. Both
+  backends filter min, mag and mip linearly under it. Read at start; the
+  CPU backend ignores it.
 - **`present.filter`.** `nearest` is the stock letterbox. `linear` is the
   same letterbox with bilinear filtering. `integer` shows the frame at the
   largest whole multiple that fits, centred on black; a frame larger than

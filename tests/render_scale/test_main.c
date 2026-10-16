@@ -214,7 +214,7 @@ int main(void)
         static struct nv2a_pb_vsh v;
         struct nv2a_stage st[4];
         struct nv2a_ps_consts pc;
-        struct nv2a_host_opts o = { 2, NV2A_PRESENT_NEAREST, 0, 0, 0 };
+        struct nv2a_host_opts o = { .render_scale = 2, .present_filter = NV2A_PRESENT_NEAREST };
         st[0] = stage(1, 0x12, 2u << 16 | 2u << 24);
         st[1] = stage(1, 0x06, 2u << 16 | 2u << 24);
         st[2] = stage(4, 0x12, 2u << 16 | 2u << 24);
@@ -284,7 +284,8 @@ int main(void)
 
     /* ---- the options round-trip; init picks the scale up ---- */
     {
-        struct nv2a_host_opts o = { 3, NV2A_PRESENT_INTEGER, 1, 0, 0 };
+        struct nv2a_host_opts o = { .render_scale = 3, .present_filter = NV2A_PRESENT_INTEGER,
+                                    .fullscreen = 1 };
         nv2a_host_opts_set(&o);
         CHECK(nv2a_host_render_scale() == 3);
         CHECK(nv2a_host_opts()->present_filter == NV2A_PRESENT_INTEGER && nv2a_host_opts()->fullscreen == 1);

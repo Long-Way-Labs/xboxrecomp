@@ -1130,6 +1130,27 @@ uint32_t nv2a_host_opts_gen(void);
 /* render_scale as a factor: 1 when unset. */
 unsigned nv2a_host_render_scale(void);
 
+/* The stages of a draw that a later BUMPENVMAP(_LUMINANCE) stage reads as its
+ * offset source (OTHER_STAGE_INPUT), as bits 1 << n; 0 for a draw without
+ * register combiners, whose basic shader samples every stage as plain 2D.
+ * combiner is v->rc_set && (v->rc_ctl & 0xFF). Only modes 6 and 7 are
+ * generated as dependent reads today; DOT_ST, DEPENDENT_AR/GB and the other
+ * dependent-read modes must be added here when they are generated. */
+unsigned nv2a_bump_sources(const struct nv2a_stage st[4], int combiner,
+                           uint32_t other_stage_input);
+/* render.aniso's max anisotropy for stage t's sampler, 0 = off: only a
+ * mipmapped texture that filters on minification (min_linear), is not a cube
+ * map and is not a bump source (bump_source: its bit in nv2a_bump_sources).
+ * Textures without mips are render targets read back (bloom, blur), linear-format movie
+ * frames and lookup tables, screen-aligned or data, which shimmer under it. A
+ * bump source's texels are offsets, not colour: at stock its mips average a
+ * ripple map to ~0 at a distance, so a far sea is calm; anisotropic filtering
+ * keeps the sharp ripple at grazing angles and scatters the dependent lookups
+ * into noise (BLiNX 2's stage 1 sea). Both GPU backends key their samplers
+ * on the result. */
+unsigned nv2a_stage_aniso(const struct nv2a_stage *t, int mip, int min_linear,
+                          int bump_source);
+
 /* Host size of a guest w x h target at `scale`: w*N x h*N, N lowered for
  * this target until both fit max_dim. Returns the N used (>= 1). */
 unsigned nv2a_host_size(uint32_t w, uint32_t h, unsigned scale, uint32_t max_dim,

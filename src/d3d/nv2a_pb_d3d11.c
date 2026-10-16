@@ -1859,7 +1859,7 @@ static struct { uint64_t key; ID3D11SamplerState *s; } s_smp[SMP_MAX];
 static int s_smp_n;
 static int s_smp_last[4];   /* per stage: the entry it got last */
 
-static ID3D11SamplerState *sampler(const Stage *t)
+static ID3D11SamplerState *sampler(const Stage *t, int bump_source)
 {
     static int point = -1;
     static ID3D11SamplerState *fallback;
@@ -1875,12 +1875,10 @@ static ID3D11SamplerState *sampler(const Stage *t)
     mn = !point && filter_linear(t->filter, 0);
     mg = !point && filter_linear(t->filter, 1);
     mip = t->levels > 1 ? filter_mip(t->filter) : 0;
-    /* render.aniso: anisotropic filtering, on mipmapped textures that
-     * filter -- the world's surfaces, seen at an angle. Not on a texture
-     * without mips (render targets read back: bloom, blur; linear-format
-     * movie frames and lookup tables), which are screen-aligned or data and
-     * shimmer under it, nor on a cube map. */
-    an = !point && mip && mn && !t->cube ? nv2a_host_opts()->aniso : 0;
+    /* render.aniso: anisotropic filtering on the world's surfaces, seen at
+     * an angle (nv2a_stage_aniso has the rule). In the key, so a stage that
+     * is a bump source in one draw and plain in the next gets its own. */
+    an = nv2a_stage_aniso(t, mip, mn, bump_source);
     key = u | v << 4 | (uint64_t)mn << 8 | (uint64_t)mg << 9
         | (uint64_t)mip << 10 | (uint64_t)an << 35;
     if (mip)
@@ -2246,8 +2244,11 @@ static ID3D11PixelShader *setup_pixel(void)
     D3D11_MAPPED_SUBRESOURCE m;
     PsConsts pc;
     int n, textured = 0;
+    unsigned bump_src;
 
     build_stages();
+    bump_src = nv2a_bump_sources(s_stage, v->rc_set && (v->rc_ctl & 0xFF),
+                                 v->other_stage_input);
     {
         static int bump_trace = -1;
         if (bump_trace < 0)
@@ -2280,7 +2281,7 @@ static ID3D11PixelShader *setup_pixel(void)
         } else {
             srv[n] = s_black_srv;
         }
-        smp[n] = sampler(t);
+        smp[n] = sampler(t, bump_src >> n & 1);
     }
     if (memo_on() && s_cb_ps_ok && !memcmp(&s_cb_ps_shadow, &pc, sizeof pc)) {
         /* the buffer already holds these bytes */

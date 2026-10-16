@@ -720,6 +720,30 @@ unsigned nv2a_host_render_scale(void)
     return s_host_opts.render_scale > 1 ? s_host_opts.render_scale : 1;
 }
 
+unsigned nv2a_bump_sources(const struct nv2a_stage st[4], int combiner,
+                           uint32_t other_stage_input)
+{
+    unsigned m = 0;
+    int n;
+
+    if (!combiner)
+        return 0;
+    for (n = 1; n < 4; n++) {
+        uint32_t mode = nv2a_stage_ps_mode(&st[n], n);
+        if (mode == 6 || mode == 7)
+            m |= 1u << nv2a_stage_input(n, other_stage_input);
+    }
+    return m;
+}
+
+unsigned nv2a_stage_aniso(const struct nv2a_stage *t, int mip, int min_linear,
+                          int bump_source)
+{
+    if (!mip || !min_linear || t->cube || bump_source)
+        return 0;
+    return s_host_opts.aniso;
+}
+
 unsigned nv2a_host_size(uint32_t w, uint32_t h, unsigned scale, uint32_t max_dim,
                         uint32_t *hw, uint32_t *hh)
 {

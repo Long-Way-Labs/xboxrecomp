@@ -1505,7 +1505,7 @@ static MTLSamplerAddressMode address_mode(uint32_t m)
 static struct { uint64_t key; id<MTLSamplerState> s; } s_smp[SMP_MAX];
 static int s_smp_n;
 
-static id<MTLSamplerState> sampler(const Stage *t)
+static id<MTLSamplerState> sampler(const Stage *t, int bump_source)
 {
     static int point = -1;
     MTLSamplerDescriptor *sd;
@@ -1520,9 +1520,9 @@ static id<MTLSamplerState> sampler(const Stage *t)
     mn = !point && filter_linear(t->filter, 0);
     mg = !point && filter_linear(t->filter, 1);
     mip = t->levels > 1 ? filter_mip(t->filter) : 0;
-    /* render.aniso, on the D3D11 sampler's rule and key bit: only a
-     * mipmapped texture that filters and is not a cube map. */
-    an = !point && mip && mn && !t->cube ? nv2a_host_opts()->aniso : 0;
+    /* render.aniso, on the D3D11 sampler's rule (nv2a_stage_aniso) and key
+     * bit: a bump source in one draw and plain in the next gets its own. */
+    an = nv2a_stage_aniso(t, mip, mn, bump_source);
     key = u | v << 4 | (uint64_t)mn << 8 | (uint64_t)mg << 9 | (uint64_t)mip << 10
         | (uint64_t)an << 35;
     if (mip)
@@ -1911,6 +1911,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
     float *vf;
     void *ip;
     int cull = 0, cull_all = 0;
+    unsigned bump_src;
     /* Stencil only on a Z24S8 zeta surface, as on the CPU. */
     int use_s = v->stencil_enable && ((g->format >> 4) & 0xF) == 2;
     int use_z = v->depth_enable || use_s;
@@ -1951,6 +1952,8 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             return;
         }
         build_stages();
+        bump_src = nv2a_bump_sources(s_stage, v->rc_set && (v->rc_ctl & 0xFF),
+                                     v->other_stage_input);
         {
             static int bump_trace = -1;
             if (bump_trace < 0)
@@ -2120,7 +2123,8 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         [s_enc setFragmentBytes:&mpc length:sizeof mpc atIndex:0];
         for (k = 0; k < 4; k++) {
             [s_enc setFragmentTexture:stex[k] atIndex:k];
-            [s_enc setFragmentSamplerState:sampler(&s_stage[k]) atIndex:k];
+            [s_enc setFragmentSamplerState:sampler(&s_stage[k], bump_src >> k & 1)
+                                     atIndex:k];
         }
         [s_enc drawIndexedPrimitives:ptype indexCount:nidx indexType:MTLIndexTypeUInt32
                          indexBuffer:s_ib indexBufferOffset:ib_off];

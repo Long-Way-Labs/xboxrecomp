@@ -1,8 +1,9 @@
 /* BUMPENVMAP in the code both GPU backends share: the stage decode of
  * SET_TEXTURE_SET_BUMP_ENV_MAT (0x1B28..0x1B34), BUMP_ENV_SCALE (0x1B38) and
  * BUMP_ENV_OFFSET (0x1B3C), as stored (slots 00 01 11 10); their copy into
- * nv2a_ps_consts; SET_SHADER_OTHER_STAGE_INPUT's stage selection; and the
- * generated HLSL and MSL for a mode-6 and a mode-7 stage. */
+ * nv2a_ps_consts; SET_SHADER_OTHER_STAGE_INPUT's stage selection; the bump
+ * sources render.aniso skips; and the generated HLSL and MSL for a mode-6 and
+ * a mode-7 stage. */
 #include <stdio.h>
 #include <string.h>
 #include "nv2a_backend_common.h"
@@ -88,6 +89,46 @@ int main(void)
         CHECK(nv2a_stage_ps_mode(&s0, 1) == 1);    /* other modes: 2D */
         s0.raw_mode = 5;
         CHECK(nv2a_stage_ps_mode(&s0, 1) == 5);    /* CLIPPLANE */
+    }
+
+    /* Bump sources: the stages a 6 or 7 stage reads, combiner draws only. */
+    CHECK(nv2a_bump_sources(st, 1, 1u << 16) == 0x3u);   /* 1 <- 0, 2 <- 1 */
+    CHECK(nv2a_bump_sources(st, 1, 0u) == 0x1u);         /* 1 and 2 <- 0 */
+    CHECK(nv2a_bump_sources(st, 0, 1u << 16) == 0u);     /* basic shader */
+    {
+        /* stage 3 in mode 6 reads stage 2 (bits 20-23): 1 and 2 <- 0, 3 <- 2 */
+        struct nv2a_stage c[4];
+        memcpy(c, st, sizeof c);
+        c[3].mode = 6;
+        CHECK(nv2a_bump_sources(c, 1, 2u << 20) == 0x5u);
+        /* stage 3 in mode 0 names stage 1, but a plain stage reads no
+         * offsets: stage 1 is not a source (only 0, from stages 1 and 2) */
+        c[3].mode = 0;
+        CHECK(nv2a_bump_sources(c, 1, 1u << 20) == 0x1u);
+    }
+
+    /* render.aniso skips a bump source (its texels are offsets: aniso keeps
+     * the ripple a mip would average away and the dependent lookups scatter
+     * into noise); a plain mipmapped stage keeps it, and the sampler key
+     * carries the result per draw. */
+    {
+        struct nv2a_host_opts o = *nv2a_host_opts();
+        unsigned src = nv2a_bump_sources(st, 1, 0u);
+        struct nv2a_stage c = st[3];
+        o.aniso = 16;
+        nv2a_host_opts_set(&o);
+        CHECK(nv2a_stage_aniso(&st[0], 2, 1, src >> 0 & 1) == 0);   /* source */
+        CHECK(nv2a_stage_aniso(&st[3], 2, 1, src >> 3 & 1) == 16);  /* plain */
+        CHECK(nv2a_stage_aniso(&st[1], 2, 1, src >> 1 & 1) == 16);  /* perturbed */
+        CHECK(nv2a_stage_aniso(&st[0], 2, 1,
+                               nv2a_bump_sources(st, 0, 0u) & 1) == 16);
+        CHECK(nv2a_stage_aniso(&st[3], 0, 1, 0) == 0);              /* no mips */
+        CHECK(nv2a_stage_aniso(&st[3], 2, 0, 0) == 0);              /* point */
+        c.cube = 1;
+        CHECK(nv2a_stage_aniso(&c, 2, 1, 0) == 0);                  /* cube */
+        o.aniso = 0;
+        nv2a_host_opts_set(&o);
+        CHECK(nv2a_stage_aniso(&st[3], 2, 1, 0) == 0);              /* stock */
     }
 
     /* The generated text: stage 1 mode 6 from stage 0, stage 2 mode 7 from

@@ -574,7 +574,8 @@ were found on other people's machines.*
 > always reserves the guest window as one placeholder (there is no
 > `RECOMP_WIN_PLACEHOLDER`), freed contiguous memory is always reused, and
 > every knob is read through `recomp_env` (the missing-file report is
-> `RECOMP_TRACE=missing`, not `RECOMP_MISSING_FILES`).
+> `RECOMP_TRACE=missing`; `RECOMP_MISSING_FILES` and
+> `RECOMP_MISSING_FILES_LIST` still work as old names).
 
 **Contributed: lifter and recompiler**
 

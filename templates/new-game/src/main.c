@@ -59,8 +59,10 @@
 
 /* xboxrecomp runtime headers */
 #include <xbox/xboxrecomp.h>
-#if !defined(_WIN32)
-#include "video/video_player.h"   /* xbox_HostWindowMain */
+#include "video/video_player.h"   /* xbox_HostWindowSetTitle, xbox_HostWindowMain */
+#ifdef RECOMP_ENV_HAVE_ENHANCE_KEYS   /* the toolkit's opt-in enhancements layer */
+#include "enhance.h"
+#include "enhance_cfg.h"
 #endif
 
 /*
@@ -102,6 +104,11 @@ extern ptrdiff_t g_xbox_mem_offset;
 /*
  * TODO: Set these from your xbe_parser output.
  * Run: py -3 -m tools.xbe_parser game/default.xbe
+ *
+ * YOUR_GAME_XBE_PATH and YOUR_GAME_DIR are the defaults for a developer run
+ * from the project root. An installed game's launcher sets RECOMP_GAME_FILES
+ * (the game files) and RECOMP_HDD_DIR (the emulated hard disk) instead, and
+ * those win (host_main, step 2).
  */
 #define YOUR_GAME_ENTRY_POINT   0x00000000  /* XBE entry point VA */
 #define YOUR_GAME_XBE_PATH      "game\\Your Game Title\\default.xbe"
@@ -693,11 +700,43 @@ static int host_main(void)
     /* Step 1: Crash diagnostics, before anything can fault */
     host_install_crash_handler();
 
-    /* Step 2: Load XBE */
-    if (!load_xbe(YOUR_GAME_XBE_PATH, &xbe_data, &xbe_size)) {
-        host_report_fatal("load XBE",
-                          "Failed to load default.xbe from " YOUR_GAME_XBE_PATH ".\n"
-                          "Place the game files in " YOUR_GAME_DIR ".");
+    /* Step 2: Load XBE. RECOMP_GAME_FILES and RECOMP_HDD_DIR move the game
+     * files and the emulated hard disk out of the working directory and the
+     * toolkit's default save root: the CLI's launchers set both, so an
+     * installed game keeps its saves outside the program files (and outside
+     * any Wine prefix, which Proton may recreate). Unset, the defaults above
+     * apply. */
+    const char *game_dir_env = recomp_env(RENV_GAME_FILES);
+    const char *hdd_dir = recomp_env(RENV_HDD_DIR);
+    const char *game_dir = YOUR_GAME_DIR;
+    char xbe_path[1024];
+    if (hdd_dir && !*hdd_dir)
+        hdd_dir = NULL;
+    if (game_dir_env && *game_dir_env) {
+        int n;
+        game_dir = game_dir_env;
+        n = snprintf(xbe_path, sizeof(xbe_path), "%s/default.xbe", game_dir);
+        if (n < 0 || (size_t)n >= sizeof(xbe_path)) {
+            /* A truncated path would open some other file, or none. */
+            host_report_fatal("load XBE",
+                              "the game files path (RECOMP_GAME_FILES) is too long");
+            return 1;
+        }
+    } else {
+        snprintf(xbe_path, sizeof(xbe_path), "%s", YOUR_GAME_XBE_PATH);
+    }
+    if (!load_xbe(xbe_path, &xbe_data, &xbe_size)) {
+        char detail[1400];
+        if (game_dir == game_dir_env)
+            snprintf(detail, sizeof(detail),
+                     "Failed to load %s (from RECOMP_GAME_FILES=%s).",
+                     xbe_path, game_dir_env);
+        else
+            snprintf(detail, sizeof(detail),
+                     "Failed to load default.xbe from %s.\n"
+                     "Place the game files in " YOUR_GAME_DIR
+                     ", or set RECOMP_GAME_FILES.", xbe_path);
+        host_report_fatal("load XBE", detail);
         return 1;
     }
     printf("XBE loaded: %zu bytes\n", xbe_size);
@@ -772,12 +811,12 @@ static int host_main(void)
     xbox_kernel_init();
 
     /* Step 5: Set game directory for file I/O path translation. A NULL save
-     * dir puts saves and partition images in the toolkit's default place
-     * (beside the game on Windows, $XDG_DATA_HOME or ~/.local/share
-     * elsewhere). */
+     * dir (RECOMP_HDD_DIR unset) puts saves and partition images in the
+     * toolkit's default place (beside the game on Windows, $XDG_DATA_HOME or
+     * ~/.local/share elsewhere). */
     {
         extern void xbox_path_init(const char *game_dir, const char *save_dir);
-        xbox_path_init(YOUR_GAME_DIR, NULL);
+        xbox_path_init(game_dir, hdd_dir);
     }
 
     /* Step 6: Initialize kernel bridge (thunk table in Xbox memory) */
@@ -885,6 +924,29 @@ static BOOL load_xbe(const char *path, void **out_data, size_t *out_size)
 
 /* ── Entry points ──────────────────────────────────────────── */
 
+/* The enhancements (render scale, present filter, fullscreen, pacing):
+ * config.default.toml beside the executable, config/config.toml over it,
+ * the environment over both, every key stock by default. The user root is
+ * the working directory: a developer runs from the project root, as
+ * YOUR_GAME_DIR already assumes, so their choices live in a gitignored
+ * config/config.toml and no source path is baked into the binary; a
+ * bundle's launcher names the file with RECOMP_CONFIG, so there the root
+ * is never used. Before any thread, so the backends, the window and the
+ * kernel read settled values. Without the layer (-DXBOXRECOMP_ENHANCE=OFF)
+ * this is nothing.
+ *
+ * A game's own keys (enhance_cfg_bind_env, enhance_cfg_choice, ...) are read
+ * between the two calls, so a file that sets one is not told the key is
+ * unknown. */
+static void host_enhance_init(void)
+{
+#ifdef RECOMP_ENV_HAVE_ENHANCE_KEYS
+    xbox_enhance_init(".", NULL);
+    enhance_cfg_report_unused();
+    fflush(stderr);
+#endif
+}
+
 #if defined(_WIN32)
 /* The Windows build links as a GUI-subsystem program, which starts here. */
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
@@ -896,7 +958,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     (void)nCmdShow;
     recomp_env_init();   /* the environment, read once, before any thread */
     host_stdio_setup();
+    host_enhance_init();
     xbox_log_thread_role("process-main", 0);
+    xbox_HostWindowSetTitle("YOUR_GAME_NAME");
     return host_main();
 }
 #endif
@@ -915,10 +979,13 @@ int main(int argc, char **argv)
     (void)argv;
     recomp_env_init();   /* the environment, read once, before any thread */
     host_stdio_setup();
+    host_enhance_init();
     /* The initial thread, named first: the toolkit leaves its OS name alone
      * (renaming it breaks pgrep/ps). host_main then logs guest-main, on this
      * thread when headless or on Windows, on its own pthread when windowed. */
     xbox_log_thread_role("process-main", 0);
+    /* The window's title bar; without it, the certificate's name. */
+    xbox_HostWindowSetTitle("YOUR_GAME_NAME");
 #if defined(_WIN32)
     return host_main();
 #else

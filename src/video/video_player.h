@@ -60,6 +60,11 @@ int  video_dump_frame_bmp(const char *path);
 /* Show the guest framebuffer in its own window (RECOMP_FB_WINDOW). Whatever
  * the title renders into guest RAM appears there; nothing else scans it out. */
 void xbox_FramebufferWindowStart(void);
+/* Whether that window opens for RECOMP_PB_BACKEND=backend (NULL when unset)
+ * and RECOMP_FB_WINDOW=fb_window: never without fb_window, and not beside
+ * the D3D11 backend (any case), which has its own window. Every host builds
+ * it (fb_window_wanted.c) so a ctest can pin the rule. */
+int  fb_window_wanted(const char *backend, int fb_window);
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 int  xbox_FramebufferDumpBmp(const char *path);
 /* Title bar: the game's name (window_title.h). The name is the certificate's

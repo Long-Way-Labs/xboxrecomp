@@ -421,6 +421,13 @@ void xbox_FramebufferWindowStart(void)
 
     if (!recomp_env(RENV_FB_WINDOW))
         return;
+    if (!fb_window_wanted(recomp_env(RENV_PB_BACKEND), 1)) {
+        static volatile LONG said;
+        if (InterlockedExchange(&said, 1) == 0)
+            fprintf(stderr, "  [FBWIN] RECOMP_FB_WINDOW ignored: the d3d11 "
+                            "backend presents in its own window\n");
+        return;
+    }
     if (InterlockedCompareExchange(&s_fb_running, 1, 0) != 0)
         return;
     th = CreateThread(NULL, 0, fb_thread, NULL, 0, NULL);

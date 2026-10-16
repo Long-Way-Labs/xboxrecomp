@@ -169,6 +169,13 @@ just those two under `<dir>` (created if missing; absolute, and under Wine a
 DOS path such as `Z:\home\me\run\save`), so a scripted run can start from an
 empty save without touching the rest of the save dir.
 
+Two toolkit config keys feed `xbox_path_init` from the game's `main.c` (the
+new-game template reads both): `RECOMP_GAME_FILES=<dir>` is the extracted
+game folder (`default.xbe` and the disc files; unset, the game's built-in
+default) and `RECOMP_HDD_DIR=<dir>` is the `save_dir` above (partition
+images, saves, caches; unset, the default place). A launcher sets them so an
+installed bundle finds the owner's files without a rebuild.
+
 ## Threading
 
 Xbox threads use `PsCreateSystemThreadEx` with NT-style parameters. We create Win32 threads with a wrapper that sets up the register context:

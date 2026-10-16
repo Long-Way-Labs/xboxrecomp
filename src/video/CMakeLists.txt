@@ -3,6 +3,7 @@ add_library(xbox_video STATIC
     video_player.c
     video_pump.c
     window_title.c
+    fb_window_wanted.c
 )
 # The framebuffer window: GDI on Windows; on POSIX an SDL2 window that owns
 # the process main thread (fb_present_sdl.c, xbox_HostWindowMain).

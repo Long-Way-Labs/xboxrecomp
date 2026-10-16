@@ -35,11 +35,13 @@ is_project() {
 }
 
 # Build phase, in parallel: prints "n/a"/"FAIL" lines, or "ok <name> <dir>"
-# for a dir whose tests should run.
+# for a dir whose tests should run. build_one NAME [SRC_DIR [CMAKE_ARGS...]]
+# builds a variant of another dir under its own name.
 build_one() {
-    local t=$1 d=$here/$1 log=$B/$1.cfg.log
+    local t=$1 d=$here/${2:-$1} log=$B/$1.cfg.log
+    shift; [ $# -gt 0 ] && shift
     gen=($gen_str)
-    if ! cmake -S "$d" -B "$B/$t" ${gen[@]+"${gen[@]}"} -DCMAKE_BUILD_TYPE=Release \
+    if ! cmake -S "$d" -B "$B/$t" ${gen[@]+"${gen[@]}"} -DCMAKE_BUILD_TYPE=Release "$@" \
             >"$log" 2>&1; then
         # n/a only when the one error is the harness's own refusal: an error
         # from a find module or the runtime's CMake is a broken host.
@@ -66,6 +68,11 @@ built=$B/built.txt
 for d in "$here"/*/; do
     [ -f "$d/CMakeLists.txt" ] && is_project "$d" && basename "$d"
 done | xargs -P "${JOBS:-6}" -I{} bash -c 'build_one "$@"' _ {} >"$built"
+# template_main once more with the enhancements layer in: the template starts
+# it only under XBOXRECOMP_ENHANCE, and a new game may build either way.
+if [ -f "$here/template_main/CMakeLists.txt" ]; then
+    build_one template_main_enhance template_main -DXBOXRECOMP_ENHANCE=ON >>"$built"
+fi
 for d in "$here"/*/; do
     [ -f "$d/CMakeLists.txt" ] || echo "n/a   $(basename "$d"): no CMakeLists.txt, not a ctest"
 done >>"$built"

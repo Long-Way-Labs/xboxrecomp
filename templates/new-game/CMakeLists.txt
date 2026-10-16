@@ -81,6 +81,32 @@ add_executable(${PROJECT_NAME} WIN32
 # Link against the xboxrecomp umbrella target (all 6 runtime libraries)
 target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
 
+# The toolkit's opt-in enhancements layer (render scale, present filter,
+# fullscreen; config/config.toml over config.default.toml beside the
+# executable). Configure with -DXBOXRECOMP_ENHANCE=ON to build it; main.c's
+# host_enhance_init then loads it, and without it main.c builds as before.
+if(TARGET xbox_enhance)
+    target_link_libraries(${PROJECT_NAME} PRIVATE xbox_enhance)
+endif()
+
+# The option defaults the layer reads beside the executable, once the game
+# has a packaging/config.default.toml (the template ships none). Copied at
+# build time, as a file that depends on packaging/config.default.toml, so a
+# developer build has the defaults layer and an edit of the file refreshes
+# it; a bundle stages the file itself (xbr package).
+if(EXISTS ${CMAKE_SOURCE_DIR}/packaging/config.default.toml)
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/config.default.toml
+        COMMAND ${CMAKE_COMMAND} -E copy
+                ${CMAKE_SOURCE_DIR}/packaging/config.default.toml
+                ${CMAKE_CURRENT_BINARY_DIR}/config.default.toml
+        DEPENDS ${CMAKE_SOURCE_DIR}/packaging/config.default.toml
+        COMMENT "config.default.toml beside ${PROJECT_NAME}")
+    add_custom_target(${PROJECT_NAME}_config_default ALL
+        DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/config.default.toml)
+    add_dependencies(${PROJECT_NAME} ${PROJECT_NAME}_config_default)
+endif()
+
 # Include paths for generated recomp headers
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src

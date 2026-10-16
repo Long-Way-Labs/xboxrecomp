@@ -44,6 +44,15 @@ extern "C" {
  * nor its old spelling is set, with RECOMP_ENV_GAME_DEFAULTS(D):
  *   #define RECOMP_ENV_GAME_DEFAULTS(D) D(APU_DSP_ACK, "auto")
  */
+/* GAME_FILES and HDD_DIR (RECOMP_GAME_FILES, RECOMP_HDD_DIR) are toolkit
+ * rows since b3-public-release; BLiNX 2 and Burnout 3 defined them as game
+ * keys before. A key defined twice does not compile, and a game's public
+ * build pins an older toolkit tag while its local build uses the toolkit
+ * checkout, so the game header keeps its two rows under
+ * #ifndef RECOMP_ENV_HAVE_FOLDER_ROWS until its pin is past this change.
+ * Defined before the game header is included, for that test. */
+#define RECOMP_ENV_HAVE_FOLDER_ROWS 1
+
 #ifdef RECOMP_ENV_HAVE_GAME_KEYS
 #include "recomp_env_game.h"
 #endif
@@ -86,7 +95,9 @@ extern "C" {
     X(WINDOW_SCALE,      CONFIG, "RECOMP_WINDOW_SCALE",      NULL, "window scale factor (SDL host, default 2)") \
     X(PRESENT_VSYNC,     CONFIG, "RECOMP_PRESENT_VSYNC",     NULL, "vsync: SDL host 0 = off (default on); D3D11 1 = on (default off)") \
     X(WINDOW_QUIT_AFTER, CONFIG, "RECOMP_WINDOW_QUIT_AFTER", NULL, "close the window after this many seconds") \
-    X(FB_WINDOW,         CONFIG, "RECOMP_FB_WINDOW",         NULL, "Windows: show the framebuffer window") \
+    X(FB_WINDOW,         CONFIG, "RECOMP_FB_WINDOW",         NULL, "Windows: show the framebuffer window (not beside the d3d11 backend)") \
+    X(GAME_FILES,        CONFIG, "RECOMP_GAME_FILES",        NULL, "game files directory; the launcher sets it, the game's main.c has the default") \
+    X(HDD_DIR,           CONFIG, "RECOMP_HDD_DIR",           NULL, "emulated hard disk: partition images, saves, caches") \
     X(SAVE_DIR,          CONFIG, "RECOMP_SAVE_DIR",          NULL, "root for the title's UDATA/TDATA") \
     X(AC97_READY,        CONFIG, "RECOMP_AC97_READY",        NULL, "emulated APU and audio; default on (x86-64 Windows/Proton, macOS/Linux arm64), 0: off") \
     X(VBLANK,            CONFIG, "RECOMP_VBLANK",            NULL, "deliver the vblank interrupt; =0 off") \

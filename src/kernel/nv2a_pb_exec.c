@@ -26,6 +26,7 @@
  */
 #include <math.h>
 #include "recomp_env.h"
+#include "recomp_exit_hook.h"
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -789,9 +790,10 @@ static int write_bmp_at(const char *path, const uint8_t *base, uint32_t pitch,
  *
  * The rule is size first. A surface is the colour offset plus the size the
  * clip gives it, as the draws and clears that used it saw it. The size wanted
- * is the display's: that of the surface at the address AvSetDisplayMode
- * scans out (the largest, if the title used it at more than one size), or,
- * with no display mode yet, of the largest surface seen; and the pitch is
+ * is the display's: that of the surfaces the title scans out -- the one at
+ * the address AvSetDisplayMode set and those the last present_stale flips
+ * presented (the largest, if the title used them at more than one size) --
+ * or, with no display mode yet, of the largest surface seen; and the pitch is
  * the display's too, once there is a display mode. A run of draws with the
  * clip at 640x480 but offset and pitch still those of the 320x240 target
  * (seen on the odd frame) is 640x480 but nothing the display could
@@ -828,8 +830,31 @@ static int write_bmp_at(const char *path, const uint8_t *base, uint32_t pitch,
  *    stale or later evicted; a mode set clears it, since buffers drawn
  *    before it say nothing about the new mode), a surface at twice it
  *    qualifies instead, with a warning the first time. The runtime does not interleave fields anywhere, so such a
- *    pick shows one field; it beats presenting the buffer about to be drawn. */
-#define PRESENT_MAX 16
+ *    pick shows one field; it beats presenting the buffer about to be drawn.
+ *
+ * The scanout set. A title that flips through the pushbuffer leaves the
+ * display address where AvSetDisplayMode put it and alternates its back
+ * buffers by PCRTC_START, which nothing here sees; with only the display
+ * address in the size scan, that one buffer had to carry every size alone.
+ * One title records each back buffer at three clips a frame (640x480 for a
+ * full-screen composite, 640x464 for the scene, 640x463 for its race-start
+ * card) and touches 13 offscreen targets besides: 19 entries in a 16-entry
+ * table, so a frame into the other buffer evicted the display buffer's
+ * 640x480 entry and the size alternated 480/464 flip by flip, which every
+ * scaling present showed as the picture jumping at 60 Hz. So the offsets
+ * the last present_stale flips presented (s_scanout, as physical addresses)
+ * set the size too, the set empties at a display-mode change as the field
+ * latch does, and when the table is full eviction takes an entry that is
+ * neither at a scanout offset nor at the display address (at the display or
+ * field pitch) first, plain LRU only once every entry is one. The table
+ * holds 32, so that frame fits outright; the protection is for a title with
+ * more targets than that. Which surface of the chosen size is presented is
+ * unchanged: the newest draw, as above. The set widens an old quirk of the
+ * size-first rule: a fresh larger entry at the display pitch held the
+ * screen when it sat at the display address, and now does at any offset in
+ * the set too, until it goes stale. */
+#define PRESENT_MAX 32
+#define SCANOUT_MAX 8
 /* The staleness window in flips: RECOMP_DEBUG=present_stale=n, default 120
  * (two seconds at 60 Hz: longer than a pause screen's idle back buffers
  * sit untouched, shorter than a mode change's leftovers should linger). */
@@ -850,13 +875,161 @@ static struct {
 static uint64_t s_psurf_seq, s_psurf_flip_seq;
 static struct nv2a_pb_present s_present;
 
+/* The scanout set: the physical form of each offset a flip presented (the
+ * compare the display address uses) and the flip that last presented it.
+ * Fed by present_pick; an entry not presented for present_stale flips no
+ * longer counts, and a display-mode change (s_scanout_gen) empties it.
+ * phys 0 marks an empty slot: physical page 0 is never a framebuffer. */
+static struct { uint32_t phys, last_flip; } s_scanout[SCANOUT_MAX];
+static uint32_t s_scanout_gen;
+static uint32_t s_present_want;     /* the pitch the last pick wanted, 0 without a mode */
+
 /* RECOMP_PRESENT_TRACE=1: the order this frame used its surfaces in (runs of
  * draws and clears per surface), printed at a flip whose pick is not the
  * surface picked two flips before -- a double-buffered title alternates, so
- * that is the flip worth explaining. */
+ * that is the flip worth explaining. With it, the scanout set at that flip,
+ * the first evictions the scanout protection decided, and every 1000 flips
+ * and at exit how often it did: whether the protection was ever the deciding
+ * factor in a run. */
 #define PTRACE_MAX 48
 static struct { uint32_t offset, w, h, pitch, draws, clears; } s_ptrace[PTRACE_MAX];
 static int s_ptrace_n, s_ptrace_on = -1;
+static uint32_t s_evict_n, s_evict_spared, s_evict_protected;
+
+static void present_trace_line(const char *why)
+{
+    fprintf(stderr, "[PRESENT] summary (%s): %u flips, %u evictions, %u spared a"
+            " scanout entry, %u with all %d entries protected (plain LRU)\n",
+            why, s_gpu.flips, s_evict_n, s_evict_spared, s_evict_protected,
+            PRESENT_MAX);
+    fflush(stderr);
+}
+
+static void present_trace_summary(const char *why)
+{
+    static int done;
+    if (!__atomic_exchange_n(&done, 1, __ATOMIC_ACQ_REL))
+        present_trace_line(why);
+}
+
+/* For the backend smoke test (declared there): the eviction counters the
+ * summary prints. Counted with or without the trace. */
+void nv2a_pb_exec_present_stats(uint32_t *evictions, uint32_t *spared, uint32_t *protected_)
+{
+    if (evictions) *evictions = s_evict_n;
+    if (spared) *spared = s_evict_spared;
+    if (protected_) *protected_ = s_evict_protected;
+}
+
+static void present_trace_at_exit(void)
+{
+    present_trace_summary("exit");
+}
+
+/* A mode set says nothing about the buffers presented before it (the reason
+ * the field latch resets there too). */
+static void scanout_sync_gen(uint32_t gen)
+{
+    if (gen != s_scanout_gen) {
+        s_scanout_gen = gen;
+        memset(s_scanout, 0, sizeof s_scanout);
+    }
+}
+
+/* In use (phys 0 is an empty slot) and presented within present_stale
+ * flips, with the same <= as present_fresh. */
+static int scanout_live(int k)
+{
+    return s_scanout[k].phys
+        && s_gpu.flips - s_scanout[k].last_flip <= present_stale_flips();
+}
+
+/* Whether physical address `phys` is the display's (disp_phys, 0 without a
+ * mode) or a live scanout entry. */
+static int present_scanout(uint32_t phys, uint32_t disp_phys)
+{
+    int k;
+    if (disp_phys && phys == disp_phys)
+        return 1;
+    for (k = 0; k < SCANOUT_MAX; k++)
+        if (s_scanout[k].phys == phys && scanout_live(k))
+            return 1;
+    return 0;
+}
+
+/* The table is full and s_psurf[lru] is the plain LRU victim: take the LRU
+ * of the entries the display could not be scanning out instead. Protected is
+ * at the display address or a scanout offset and at the display pitch, or at
+ * the field pitch while the last pick wanted it, so a stray entry at a back
+ * buffer's offset with an offscreen pitch is not. The display pitch stays
+ * protected under the field latch: the first pick after every mode set wants
+ * the field pitch (no surface has had the display's yet), and the frame
+ * after it draws the display buffer at the display pitch. Without a display
+ * mode nothing is protected: the pick then never consults the scanout set.
+ * Plain LRU when every entry is protected, so the table never starves. Only
+ * on this path is dma_resolve paid per entry. */
+static int present_victim(int lru)
+{
+    uint32_t disp_pitch = 0, disp = xbox_GetDisplayFramebuffer(&disp_pitch);
+    uint32_t disp_phys = disp & 0x0FFFFFFFu;
+    int i, v = -1;
+
+    if (!disp) {
+        s_evict_n++;
+        return lru;
+    }
+    scanout_sync_gen(xbox_DisplayModeGeneration());
+    for (i = 0; i < PRESENT_MAX; i++) {
+        uint32_t pitch = s_psurf[i].pitch;
+        if ((pitch == disp_pitch
+                    || (s_present_want == disp_pitch << 1 && pitch == s_present_want))
+                && present_scanout(dma_resolve(s_psurf[i].offset) & 0x0FFFFFFFu,
+                                   disp_phys))
+            continue;
+        if (v < 0 || s_psurf[i].last_use < s_psurf[v].last_use)
+            v = i;
+    }
+    s_evict_n++;
+    if (v == lru)
+        return v;
+    if (v >= 0)
+        s_evict_spared++;
+    else
+        s_evict_protected++;
+    if (s_ptrace_on > 0 && s_evict_spared + s_evict_protected <= 20)
+        fprintf(stderr, "[PRESENT] flip %u: table full, %s 0x%08X %ux%u pitch %u"
+                " (LRU 0x%08X %ux%u pitch %u)\n", s_gpu.flips,
+                v >= 0 ? "spared a scanout entry, evicting" : "all protected, evicting",
+                s_psurf[v >= 0 ? v : lru].offset, s_psurf[v >= 0 ? v : lru].w,
+                s_psurf[v >= 0 ? v : lru].h, s_psurf[v >= 0 ? v : lru].pitch,
+                s_psurf[lru].offset, s_psurf[lru].w, s_psurf[lru].h,
+                s_psurf[lru].pitch);
+    return v >= 0 ? v : lru;
+}
+
+/* After a pick: add or refresh its offset, else take an empty slot (phys
+ * 0), evicting the entry presented longest ago when the set is full. */
+static void scanout_note(uint32_t offset)
+{
+    uint32_t phys = dma_resolve(offset) & 0x0FFFFFFFu;
+    int k, slot = -1;
+
+    for (k = 0; k < SCANOUT_MAX && slot < 0; k++)
+        if (s_scanout[k].phys == phys)
+            slot = k;
+    for (k = 0; k < SCANOUT_MAX && slot < 0; k++)
+        if (!s_scanout[k].phys)
+            slot = k;
+    if (slot < 0) {
+        slot = 0;
+        for (k = 1; k < SCANOUT_MAX; k++)
+            if (s_gpu.flips - s_scanout[k].last_flip
+                    > s_gpu.flips - s_scanout[slot].last_flip)
+                slot = k;
+    }
+    s_scanout[slot].phys = phys;
+    s_scanout[slot].last_flip = s_gpu.flips;
+}
 
 /* A draw (clear = 0) or colour clear (clear = 1) into the current surface. */
 static void present_note(int clear)
@@ -876,7 +1049,8 @@ static void present_note(int clear)
             lru = i;
     }
     if (e < 0) {
-        e = lru;
+        /* A free slot has last_use 0, so lru is one while any is left. */
+        e = s_psurf[lru].offset ? present_victim(lru) : lru;
         memset(&s_psurf[e], 0, sizeof s_psurf[e]);
         s_psurf[e].offset = s_gpu.color_offset;
         s_psurf[e].w = w;
@@ -886,8 +1060,13 @@ static void present_note(int clear)
     s_psurf[e].format = s_gpu.format;
     s_psurf[e].last_flip = s_gpu.flips;
     s_psurf[e].last_use = ++s_psurf_seq;
-    if (s_ptrace_on < 0)
+    if (s_ptrace_on < 0) {
         s_ptrace_on = recomp_env(RENV_PRESENT_TRACE) != NULL;
+        if (s_ptrace_on) {
+            atexit(present_trace_at_exit);
+            recomp_exit_hook_add(present_trace_summary);   /* the windows' ExitProcess */
+        }
+    }
     if (s_ptrace_on) {
         int n = s_ptrace_n;
         if (!n || s_ptrace[n - 1].offset != s_gpu.color_offset
@@ -945,6 +1124,10 @@ static void present_pick(void)
         s_mode_flip = s_gpu.flips;
         s_pitch_seen = 0;
     }
+    scanout_sync_gen(gen);
+    for (i = 0; i < SCANOUT_MAX; i++)
+        if (!scanout_live(i))
+            s_scanout[i].phys = 0;
     for (i = 0; i < PRESENT_MAX && disp_pitch && s_pitch_seen != disp_pitch; i++)
         if (s_psurf[i].offset && s_psurf[i].pitch == disp_pitch
                 && s_psurf[i].last_flip >= s_mode_flip)
@@ -952,13 +1135,16 @@ static void present_pick(void)
     if (disp_pitch && s_pitch_seen != disp_pitch)
         want = disp_pitch << 1;
 
-    /* Size, pass 0: the largest fresh surface at the display address, else
-     * the largest stale one there (which leaves no candidate). */
+    s_present_want = disp ? want : 0;
+
+    /* Size, pass 0: the largest fresh surface at the display address or a
+     * scanout offset, else the largest stale one there (which leaves no
+     * candidate). */
     for (i = 0; disp && i < PRESENT_MAX; i++) {
         uint64_t a = (uint64_t)s_psurf[i].w * s_psurf[i].h;
         if (!present_pitch_ok(i, want)
-                || (dma_resolve(s_psurf[i].offset) & 0x0FFFFFFFu)
-                   != (disp & 0x0FFFFFFFu))
+                || !present_scanout(dma_resolve(s_psurf[i].offset) & 0x0FFFFFFFu,
+                                    disp & 0x0FFFFFFFu))
             continue;
         if (present_fresh(i)) {
             if (a > area) {
@@ -978,8 +1164,8 @@ static void present_pick(void)
         tw = stale_w;
         th = stale_h;
     }
-    /* Pass 1, only with nothing at the display address: the largest fresh
-     * surface anywhere. */
+    /* Pass 1, only with nothing at the display address or a scanout offset
+     * (always, without a display mode): the largest fresh surface anywhere. */
     for (i = 0; !at_disp && i < PRESENT_MAX; i++) {
         uint64_t a = (uint64_t)s_psurf[i].w * s_psurf[i].h;
         if (a > area && present_pitch_ok(i, want) && present_fresh(i)) {
@@ -1020,10 +1206,20 @@ static void present_pick(void)
                 fprintf(stderr, "[PRESENT]   0x%08X %ux%u pitch %u: %u draws %u clears\n",
                         s_ptrace[i].offset, s_ptrace[i].w, s_ptrace[i].h,
                         s_ptrace[i].pitch, s_ptrace[i].draws, s_ptrace[i].clears);
+            fprintf(stderr, "[PRESENT]   scanout set (phys, last flip):");
+            for (i = 0; i < SCANOUT_MAX; i++)
+                if (s_scanout[i].phys)
+                    fprintf(stderr, " 0x%08X@%u", s_scanout[i].phys,
+                            s_scanout[i].last_flip);
+            fputc('\n', stderr);
         }
         pick[0] = pick[1];
         pick[1] = now;
         s_ptrace_n = 0;
+        /* Benches and goldens stop the game with SIGINT, which never reaches
+         * atexit, so the counts also print as the run goes. */
+        if (s_gpu.flips % 1000 == 0)
+            present_trace_line("running");
     }
     if (best >= 0) {
         /* One assignment, so the pick is never half old, half new (see the
@@ -1033,6 +1229,7 @@ static void present_pick(void)
             s_psurf[best].pitch, s_psurf[best].format,
         };
         s_present = pick;
+        scanout_note(pick.offset);
     }
     s_psurf_flip_seq = s_psurf_seq;
 }

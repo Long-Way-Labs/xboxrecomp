@@ -54,6 +54,13 @@
  * ARRAY_ELEMENT32 index past 0xFFFF is counted. Read back through
  * nv2a_pb_exec_idx_stats, the summary line's counters.
  *
+ * Last, the present pick with a display mode (present-scanout), CPU path: a
+ * double-buffered title whose frames record each back buffer at three clips
+ * among 19 offscreen targets presents 640x480 on every flip; a mode change
+ * empties the scanout set; a single-buffered title keeps its size with 19
+ * and with 40 targets (the second past the table, so the eviction
+ * protection is what holds it); a table of protected entries still evicts.
+ *
  * The CPU and GPU paths both draw the walker's index list, so a batch the
  * walker cut short gives two identical, equally wrong frames. bigidx and
  * elem32 therefore also check the colour of a pixel inside a quad past
@@ -1132,6 +1139,252 @@ static int overflow_case(void)
     return f;
 }
 
+/* ---- scanout set (present-scanout) ------------------------------------------ */
+
+/* The present pick's size scan and eviction with a display mode set, on the
+ * CPU path: Burnout 3's race-start card, reduced to what the surface table
+ * sees. The display stays at SC_A (AvSetDisplayMode's address) while the
+ * title flips between SC_A and SC_B; each frame records its back buffer at
+ * three clips (640x480 composite, 640x464 scene, 640x463 card text) and
+ * clears 19 offscreen targets, one 640x480 at the display pitch. Run last:
+ * the cases set a display mode, which every case before runs without, and
+ * leave the table full of their entries. The first flip after a mode set
+ * keeps the screen (no surface since the set has had the display pitch yet,
+ * the field rule), so each case flips once before it checks. */
+#define SC_A     0x03000000u
+#define SC_B     0x0312C000u
+#define SC_C     0x03258000u
+#define SC_OFF   0x03384000u    /* the 640x480 offscreen target */
+#define SC_SMALL 0x034B0000u    /* 128x128 targets at pitch 512, 64 KB apart */
+#define SC_D     0x038C0000u    /* cases 3 and 4: a display SC_A's leftovers miss */
+#define SC_PITCH (W * 4u)
+
+void nv2a_pb_exec_present_stats(uint32_t *evictions, uint32_t *spared, uint32_t *protected_);
+
+static void sc_surf(uint32_t buf, uint32_t w, uint32_t h, uint32_t pitch)
+{
+    M(0x0200, w << 16);
+    M(0x0204, h << 16);
+    M(0x0208, 0x00000128u);
+    M(0x020C, pitch);
+    M(0x0210, buf);
+    M(0x0214, 0x02400000u);
+}
+
+/* A draw: only the clip extent matters to the table, so a 2x2 quad. */
+static void sc_draw(uint32_t buf, uint32_t w, uint32_t h)
+{
+    static const uint32_t c[4] = {0xFF00FF00u, 0xFF00FF00u, 0xFF00FF00u, 0xFF00FF00u};
+    sc_surf(buf, w, h, SC_PITCH);
+    quad_uv(0.0f, 0.0f, 2.0f, 2.0f, c, NULL);
+}
+
+/* The offscreen targets: SC_OFF at 640x480 and the display pitch, then
+ * n - 1 128x128 ones, each cleared once. */
+static void sc_offscreen(int n)
+{
+    int t;
+    sc_surf(SC_OFF, W, H, SC_PITCH);
+    clear_to(0xFF000000u);
+    for (t = 0; t < n - 1; t++) {
+        sc_surf(SC_SMALL + (uint32_t)t * 0x10000u, 128, 128, 512);
+        clear_to(0xFF000000u);
+    }
+}
+
+/* The XDK's swap: the colour offset moves to the next back buffer, then
+ * FLIP_INCREMENT_WRITE (the walker's flip count) and FLIP_STALL (the pick). */
+static void sc_flip(uint32_t next)
+{
+    M(0x0210, next);
+    M(0x012C, 0);
+    M(0x0130, 0);
+}
+
+static int sc_check(const char *what, int flip, uint32_t off, uint32_t w, uint32_t h)
+{
+    const struct nv2a_pb_present *p = nv2a_pb_present_state();
+    int ok = p->offset == off && p->w == w && p->h == h && p->pitch == SC_PITCH;
+    if (!ok)
+        fprintf(stderr, "[backend-smoke] scanout: %s flip %d presents 0x%08X %ux%u pitch %u"
+                " (want 0x%08X %ux%u pitch %u)\n", what, flip, p->offset, p->w, p->h,
+                p->pitch, off, w, h, SC_PITCH);
+    return ok;
+}
+
+static void sc_display(uint32_t buf)
+{
+    /* The address the AvSetDisplayMode bridge records: the resolved form. */
+    xbox_SetDisplayFramebuffer(buf ? 0x80000000u | buf : 0, buf ? SC_PITCH : 0);
+    xbox_DisplayModeBump();
+}
+
+/* Returns the failures. */
+static int scanout_cases(void)
+{
+    static const uint32_t back[2] = {SC_A, SC_B};
+    uint32_t ev0, sp0, pr0, ev, sp, pr;
+    int k, a, ok, f = 0;
+
+    nv2a_pb_set_backend(nv2a_pb_cpu_backend());
+    M(0x0304, 0);
+    M(0x1B0C, 0);
+    clear_rect(0, 0, 4095, 4095);
+    for (a = 0; a < 16; a++)
+        M(0x1760 + 4 * a, a == 0 ? 0x42u : a == 3 ? 0x40u : 0x02u);
+
+    /* 1. Double-buffered card: 2 x 3 + 19 = 25 entries, over the old table's
+     * 16. Before the scanout set this stream holds 640x464 on every flip;
+     * Burnout 3's own frame (13 targets) alternated 480/464 instead, which
+     * this case does not reproduce: either way the size is not 640x480. */
+    sc_display(SC_A);
+    ok = 1;
+    for (k = 0; k < 10; k++) {
+        uint32_t cur = back[k & 1];
+        sc_draw(cur, W, H);
+        sc_offscreen(19);
+        sc_draw(cur, W, 464);
+        sc_draw(cur, W, 463);
+        sc_flip(back[(k + 1) & 1]);
+        if (k >= 2)
+            ok &= sc_check("double-buffered", k + 1, cur, W, H);
+    }
+    fprintf(stderr, "[backend-smoke] scanout: double-buffered card, 8 flips at 640x480 %s\n",
+            ok ? "PASS" : "FAIL");
+    f += !ok;
+
+    /* 1b. The same card with 40 offscreen targets, over the new table's 32:
+     * the other back buffer's 640x480 entry survives only as a scanout
+     * offset, so this fails when present_scanout ignores the set. The first
+     * two frames have 19, as case 1: a buffer never presented is in no set,
+     * and with 40 targets a frame its entry is evicted before the flip. */
+    sc_display(SC_A);
+    ok = 1;
+    for (k = 0; k < 10; k++) {
+        uint32_t cur = back[k & 1];
+        sc_draw(cur, W, H);
+        sc_offscreen(k < 2 ? 19 : 40);
+        sc_draw(cur, W, 464);
+        sc_draw(cur, W, 463);
+        sc_flip(back[(k + 1) & 1]);
+        if (k >= 2)
+            ok &= sc_check("double-buffered x40", k + 1, cur, W, H);
+    }
+    fprintf(stderr, "[backend-smoke] scanout: double-buffered card, 40 targets, 8 flips at"
+            " 640x480 %s\n", ok ? "PASS" : "FAIL");
+    f += !ok;
+
+    /* 2. A mode change empties the set: SC_A's larger entry no longer sets
+     * the size. Without the clear it would be the pick, at 1280x720. */
+    sc_display(SC_C);
+    for (k = 0; k < 2; k++) {
+        sc_draw(SC_A, 1280, 720);
+        sc_draw(SC_C, W, H);
+        sc_flip(SC_A);
+    }
+    ok = sc_check("mode change", 2, SC_C, W, H);
+    fprintf(stderr, "[backend-smoke] scanout: mode change clears the set %s\n",
+            ok ? "PASS" : "FAIL");
+    f += !ok;
+
+    /* 3. Single-buffered with 19 offscreen targets: 21 entries a frame, over
+     * the old 16, so the 640x480 entry was the oldest and evicted. */
+    sc_display(SC_D);
+    ok = 1;
+    for (k = 0; k < 9; k++) {
+        sc_draw(SC_D, W, H);
+        sc_offscreen(19);
+        sc_draw(SC_D, W, 464);
+        sc_flip(SC_D);
+        if (k)
+            ok &= sc_check("single-buffered", k + 1, SC_D, W, H);
+    }
+    fprintf(stderr, "[backend-smoke] scanout: single-buffered, 19 targets, 8 flips at"
+            " 640x480 %s\n", ok ? "PASS" : "FAIL");
+    f += !ok;
+
+    /* 3b. The same with 40 offscreen targets, over the new table's 32: the
+     * protection, not the table size, keeps the 640x480 entry. */
+    nv2a_pb_exec_present_stats(&ev0, &sp0, NULL);
+    ok = 1;
+    for (k = 0; k < 8; k++) {
+        sc_draw(SC_D, W, H);
+        sc_offscreen(40);
+        sc_draw(SC_D, W, 464);
+        sc_flip(SC_D);
+        ok &= sc_check("single-buffered x40", k + 1, SC_D, W, H);
+    }
+    nv2a_pb_exec_present_stats(&ev, &sp, NULL);
+    ok &= ev > ev0 && sp > sp0;
+    fprintf(stderr, "[backend-smoke] scanout: single-buffered, 40 targets, 8 flips at"
+            " 640x480 (%u evictions, %u spared a scanout entry) %s\n", ev - ev0, sp - sp0,
+            ok ? "PASS" : "FAIL");
+    f += !ok;
+
+    /* 3c. 3b right after a mode set. The first pick after it wants the field
+     * pitch (no surface has had the display's yet); the display buffer's
+     * entries at the display pitch must stay protected through the next
+     * frame, or 40 targets evict its 640x480 entry and flip 2 shows 464. */
+    sc_display(SC_D);
+    ok = 1;
+    for (k = 0; k < 8; k++) {
+        sc_draw(SC_D, W, H);
+        sc_offscreen(40);
+        sc_draw(SC_D, W, 464);
+        sc_flip(SC_D);
+        if (k)
+            ok &= sc_check("mode set x40", k + 1, SC_D, W, H);
+    }
+    fprintf(stderr, "[backend-smoke] scanout: mode set, then 40 targets, flips 2-8 at"
+            " 640x480 %s\n", ok ? "PASS" : "FAIL");
+    f += !ok;
+
+    /* 4. Every entry protected: 40 clips at SC_D, then 640x480. Plain LRU
+     * takes over; the newest entries survive and nothing stalls. */
+    nv2a_pb_exec_present_stats(NULL, NULL, &pr0);
+    for (k = 0; k < 40; k++)
+        sc_draw(SC_D, W, 100u + (uint32_t)k);
+    sc_draw(SC_D, W, H);
+    sc_flip(SC_D);
+    nv2a_pb_exec_present_stats(NULL, NULL, &pr);
+    ok = sc_check("all protected", 1, SC_D, W, H) && pr > pr0;
+    fprintf(stderr, "[backend-smoke] scanout: table of protected entries still evicts"
+            " (%u took a protected entry) %s\n", pr - pr0, ok ? "PASS" : "FAIL");
+    f += !ok;
+
+    /* 5. Ageing out of the set. SC_C is presented once (the newest draw of
+     * the size SC_D sets), then only SC_D for n flips; then SC_C is drawn
+     * larger. An offset presented present_stale (120) flips ago is still in
+     * the set and its larger entry sets the size; one more flip and it is
+     * not, so SC_D's frame shows. Pins scanout_live's <= from both sides. */
+    for (a = 0; a < 2; a++) {
+        uint32_t n = 119u + (uint32_t)a;     /* present_stale is the default 120 */
+        sc_display(SC_D);
+        sc_draw(SC_D, W, H);
+        sc_flip(SC_D);                          /* the field latch holds */
+        sc_draw(SC_D, W, H);
+        sc_draw(SC_C, W, H);
+        sc_flip(SC_D);
+        ok = sc_check("ageing, SC_C presented", 2, SC_C, W, H);
+        for (k = 0; k < (int)n; k++) {
+            sc_draw(SC_D, W, H);
+            sc_flip(SC_D);
+        }
+        sc_draw(SC_D, W, H);
+        sc_draw(SC_C, 1280, 720);
+        sc_flip(SC_D);
+        ok &= a ? sc_check("ageing, aged out", (int)n + 3, SC_D, W, H)
+                : sc_check("ageing, still live", (int)n + 3, SC_C, 1280, 720);
+        fprintf(stderr, "[backend-smoke] scanout: SC_C presented %u flips ago %s the size"
+                " %s\n", n + 1u, a ? "no longer sets" : "still sets", ok ? "PASS" : "FAIL");
+        f += !ok;
+    }
+
+    sc_display(0);
+    nv2a_pb_set_backend(NULL);
+    return f;
+}
+
 /* The absolute checks of bigidx and elem32, on one path's frame. */
 static int probes_ok(int sc, const char *path, const uint32_t *px)
 {
@@ -1196,6 +1449,7 @@ int main(int argc, char **argv)
     if (!gpu) {
         fprintf(stderr, "[backend-smoke] no backend '%s' on this host: GPU scenes"
                 " skipped\n", which);
+        failures += scanout_cases();
         return failures ? 1 : 77;
     }
     cpu_px = (uint32_t *)malloc(W * H * 4);
@@ -1267,6 +1521,8 @@ int main(int argc, char **argv)
         failures += f;
     }
 #endif
+    /* Last: they set a display mode and fill the table (scanout_cases). */
+    failures += scanout_cases();
     if (failures) {
         fprintf(stderr, "[backend-smoke] FAIL: %d of %d scenes\n", failures, SC_COUNT);
         return 1;

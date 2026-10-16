@@ -438,11 +438,40 @@ void nv2a_occ_init(struct nv2a_occ *o, const struct nv2a_occ_ops *ops,
     o->ops = ops;
     o->mem = mem;
     o->scale = nv2a_host_render_scale();
+    o->settle_us = NV2A_OCC_SETTLE_US;
+}
+
+static void occ_put_all(struct nv2a_occ *o, struct nv2a_occ_report *p)
+{
+    int i;
+    for (i = 0; i < p->n; i++)
+        o->ops->put(o->ops->ctx, p->q[i]);
+    p->n = 0;
 }
 
 void nv2a_occ_set_scale(struct nv2a_occ *o, unsigned scale)
 {
+    int i;
+    for (i = 0; i < o->nret; i++)
+        occ_put_all(o, &o->retired[i]);
+    o->ret_drop += (uint64_t)o->nret;
+    o->nret = 0;
     o->scale = scale;
+}
+
+void nv2a_occ_set_delay(struct nv2a_occ *o, uint64_t us)
+{
+    o->delay_us = us;
+}
+
+void nv2a_occ_set_settle(struct nv2a_occ *o, uint64_t us)
+{
+    o->settle_us = us;
+}
+
+void nv2a_occ_set_trace(struct nv2a_occ *o, int on)
+{
+    o->trace = on;
 }
 
 uint32_t nv2a_occ_scale_count(uint64_t samples, unsigned scale)
@@ -480,12 +509,15 @@ static void occ_end(struct nv2a_occ *o)
     o->open = 0;
 }
 
-/* 1 when every query of the report has its result (summed into *count). */
+/* 1 when every query of the report has its result (summed into *count).
+ * delay_us holds a result back as a slow host GPU would. */
 static int occ_ready(struct nv2a_occ *o, const struct nv2a_occ_report *p,
-                     int flush, uint32_t *count)
+                     int flush, uint64_t now, uint32_t *count)
 {
     uint64_t sum = 0;
     int i;
+    if (o->delay_us && now - p->t0 < o->delay_us)
+        return 0;
     for (i = 0; i < p->n; i++) {
         uint64_t v = 0;
         if (!o->ops->result(o->ops->ctx, p->q[i], flush, &v))
@@ -496,22 +528,78 @@ static int occ_ready(struct nv2a_occ *o, const struct nv2a_occ_report *p,
     return 1;
 }
 
+/* A result taken at `now`: its age in the histogram, its count as the
+ * address's last unless a newer report's is there already. */
+static void occ_result_in(struct nv2a_occ *o, const struct nv2a_occ_report *p,
+                          uint64_t now, uint32_t count)
+{
+    static const uint64_t edge[NV2A_OCC_AGES - 1] = {
+        1000, 2000, 4000, 8000, 16000, 33000, 66000
+    };
+    uint64_t age = now - p->t0;
+    struct nv2a_occ_last *l;
+    int b, i;
+
+    for (b = 0; b < NV2A_OCC_AGES - 1 && age >= edge[b]; b++)
+        ;
+    o->age[b]++;
+    for (i = 0; i < o->nlast; i++)
+        if (o->last[i].va == p->va) {
+            if (o->last[i].t0 <= p->t0) {
+                o->last[i].count = count;
+                o->last[i].t0 = p->t0;
+            }
+            return;
+        }
+    /* A fixed set of report slots per device (the XDK recycles them), so
+     * this is a bound, not a model: the oldest entry goes when full. */
+    if (o->nlast < NV2A_OCC_LAST) {
+        l = &o->last[o->nlast++];
+    } else {
+        l = &o->last[o->last_next];
+        o->last_next = (o->last_next + 1) % NV2A_OCC_LAST;
+    }
+    l->va = p->va;
+    l->count = count;
+    l->t0 = p->t0;
+}
+
 static void occ_finish(struct nv2a_occ *o, struct nv2a_occ_report *p,
                        uint32_t count)
 {
-    int i;
     nv2a_report_write(o->mem, p->va, count);
     o->vis += count != 0;
-    for (i = 0; i < p->n; i++)
-        o->ops->put(o->ops->ctx, p->q[i]);
-    p->n = 0;
+    occ_put_all(o, p);
+}
+
+/* Settled reports: a result refreshes the last count and frees the queries,
+ * writing nothing; one never answered within NV2A_OCC_LATE_US is dropped.
+ * Never with a flush: nothing waits on these, and every ack pass polls
+ * them (a flushing GetData, or a Metal commit, at tens of kHz). */
+static void occ_poll_retired(struct nv2a_occ *o, uint64_t now)
+{
+    int i, j;
+    for (i = j = 0; i < o->nret; i++) {
+        struct nv2a_occ_report *p = &o->retired[i];
+        uint32_t count;
+        if (occ_ready(o, p, 0, now, &count)) {
+            occ_result_in(o, p, now, count);
+            occ_put_all(o, p);
+        } else if (now - p->t0 > NV2A_OCC_LATE_US) {
+            o->ret_drop++;
+            occ_put_all(o, p);
+        } else {
+            o->retired[j++] = *p;
+        }
+    }
+    o->nret = j;
 }
 
 void nv2a_occ_poll(struct nv2a_occ *o, int flush)
 {
     uint64_t now;
     int i, j;
-    if (!o->npend)
+    if (!o->npend && !o->nret)
         return;
     now = o->ops->now_us(o->ops->ctx);
     for (i = j = 0; i < o->npend; i++) {
@@ -519,7 +607,8 @@ void nv2a_occ_poll(struct nv2a_occ *o, int flush)
         uint32_t count;
         if (p->overflow) {
             occ_finish(o, p, NV2A_OCC_VISIBLE);
-        } else if (occ_ready(o, p, flush, &count)) {
+        } else if (occ_ready(o, p, flush, now, &count)) {
+            occ_result_in(o, p, now, count);
             occ_finish(o, p, count);
         } else if (now - p->t0 > NV2A_OCC_LATE_US) {
             o->late++;
@@ -529,6 +618,97 @@ void nv2a_occ_poll(struct nv2a_occ *o, int flush)
         }
     }
     o->npend = j;
+    occ_poll_retired(o, now);
+}
+
+void nv2a_occ_flip(struct nv2a_occ *o)
+{
+    o->flips++;
+    nv2a_occ_settle(o);
+    o->frame_wait_us = 0;
+}
+
+void nv2a_occ_settle(struct nv2a_occ *o)
+{
+    uint64_t now;
+    int i, k;
+
+    if (!o->npend) {
+        nv2a_occ_poll(o, 0);
+        return;
+    }
+    nv2a_occ_poll(o, 1);
+    /* One budget a frame, not a walk: a title testing a dozen times a frame
+     * on a host far behind would otherwise wait a dozen times over. */
+    if (o->npend && o->frame_wait_us < o->settle_us) {
+        uint64_t left = o->settle_us - o->frame_wait_us, w;
+        uint64_t t = o->ops->now_us(o->ops->ctx);
+        while (o->npend && o->ops->now_us(o->ops->ctx) - t < left)
+            nv2a_occ_poll(o, 1);
+        w = o->ops->now_us(o->ops->ctx) - t;
+        o->frame_wait_us += w;
+        o->settle_wait_us += w;
+    }
+    if (!o->npend)
+        return;
+    now = o->ops->now_us(o->ops->ctx);
+    for (i = 0; i < o->npend; i++) {
+        struct nv2a_occ_report *p = &o->pend[i];
+        uint32_t count = NV2A_OCC_VISIBLE;
+        int have = 0;
+        /* A last count older than NV2A_OCC_LATE_US belongs to another
+         * screen (BLiNX 2's LOAD GAME reuses a slot its boot tested, with
+         * count 0 then): no history, visible. */
+        for (k = 0; k < o->nlast; k++)
+            if (o->last[k].va == p->va
+                    && now - o->last[k].t0 <= NV2A_OCC_LATE_US) {
+                count = o->last[k].count;
+                have = 1;
+                break;
+            }
+        nv2a_report_write(o->mem, p->va, count);
+        o->vis += count != 0;
+        o->settled++;
+        if (have)
+            o->stale++;
+        else
+            o->first++;
+        if (o->trace && o->trace_n < 64) {
+            o->trace_n++;
+            fprintf(stderr, "[OCC] settle (flip %llu) va 0x%08X count %u (%s) age %llu us\n",
+                    (unsigned long long)o->flips, p->va, count,
+                    have ? "stale" : "first",
+                    (unsigned long long)(now - p->t0));
+        }
+        if (o->nret >= NV2A_OCC_PENDING) {
+            o->ret_drop++;
+            occ_put_all(o, &o->retired[0]);
+            memmove(&o->retired[0], &o->retired[1],
+                    (size_t)(--o->nret) * sizeof o->retired[0]);
+        }
+        o->retired[o->nret++] = *p;     /* the queries move with it */
+        p->n = 0;
+    }
+    o->npend = 0;
+}
+
+void nv2a_occ_summary(const struct nv2a_occ *o, const char *tag)
+{
+    fprintf(stderr, "%s occ totals: %llu reports, %llu visible, %llu late,"
+            " %llu superseded, settled %llu (stale %llu, first %llu),"
+            " %llu retired dropped, settle wait %llu us\n", tag,
+            (unsigned long long)o->reports, (unsigned long long)o->vis,
+            (unsigned long long)o->late, (unsigned long long)o->super,
+            (unsigned long long)o->settled, (unsigned long long)o->stale,
+            (unsigned long long)o->first, (unsigned long long)o->ret_drop,
+            (unsigned long long)o->settle_wait_us);
+    if (o->trace)
+        fprintf(stderr, "%s occ result age: <1ms %llu <2 %llu <4 %llu <8 %llu"
+                " <16 %llu <33 %llu <66 %llu >=66 %llu\n", tag,
+                (unsigned long long)o->age[0], (unsigned long long)o->age[1],
+                (unsigned long long)o->age[2], (unsigned long long)o->age[3],
+                (unsigned long long)o->age[4], (unsigned long long)o->age[5],
+                (unsigned long long)o->age[6], (unsigned long long)o->age[7]);
 }
 
 void nv2a_occ_zpass(struct nv2a_occ *o, int enable)
@@ -559,12 +739,11 @@ void nv2a_occ_report(struct nv2a_occ *o, uint32_t va, int sync)
 
     occ_end(o);
     /* Supersede a report still pending at this va before any poll: a poll
-     * here could finish the old one over the title's reset. */
+     * here could finish the old one over the title's reset. Since every walk
+     * ends in a settle, this happens within a walk only. */
     for (i = 0; i < o->npend; i++)
         if (o->pend[i].va == va) {
-            int k;
-            for (k = 0; k < o->pend[i].n; k++)
-                o->ops->put(o->ops->ctx, o->pend[i].q[k]);
+            occ_put_all(o, &o->pend[i]);
             memmove(&o->pend[i], &o->pend[i + 1],
                     (size_t)(o->npend - i - 1) * sizeof o->pend[0]);
             o->npend--;
@@ -596,10 +775,10 @@ void nv2a_occ_report(struct nv2a_occ *o, uint32_t va, int sync)
     o->ovf = 0;
     o->reports++;
     if (sync) {
-        uint64_t t = o->ops->now_us(o->ops->ctx);
+        uint64_t t = o->ops->now_us(o->ops->ctx), now = t;
         uint32_t count;
-        while (!occ_ready(o, p, 1, &count)
-               && o->ops->now_us(o->ops->ctx) - t < NV2A_OCC_LATE_US)
+        while (!occ_ready(o, p, 1, now, &count)
+               && (now = o->ops->now_us(o->ops->ctx)) - t < NV2A_OCC_LATE_US)
             ;
         o->sync_us += o->ops->now_us(o->ops->ctx) - t;
         nv2a_occ_poll(o, 1);

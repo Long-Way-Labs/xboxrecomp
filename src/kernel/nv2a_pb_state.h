@@ -311,10 +311,14 @@ struct nv2a_pb_backend {
      * backend without these). on_zpass: SET_ZPASS_PIXEL_COUNT_ENABLE;
      * on_zpass_clear: CLEAR_REPORT_VALUE. on_report: GET_REPORT for the
      * 16-byte report at guest address va; returning 1 means the backend
-     * writes it -- {timestamp, count, status 0} -- now or later, and until it
-     * does the status keeps the 0xFFFFFFFF D3D put there (TESTINCOMPLETE).
-     * on_poll: called on the ack thread every pass of its loop, pushbuffer
-     * or not, so a report can complete while the title spins on it. */
+     * writes it -- {timestamp, count, status 0} -- now or later, and no
+     * later than the next on_poll returns; until it does the status keeps
+     * the 0xFFFFFFFF D3D put there (TESTINCOMPLETE).
+     * on_poll: called on the ack thread, inside the walk before a
+     * BACK_END_WRITE_SEMAPHORE_RELEASE that follows an on_report returning
+     * 1, at the end of every walk before GET moves (the title can read a
+     * test once either reaches it), and every pass of the ack loop,
+     * pushbuffer or not. */
     void (*on_zpass)(int enable);
     void (*on_zpass_clear)(void);
     int  (*on_report)(uint32_t va);

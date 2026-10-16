@@ -220,6 +220,8 @@ extern "C" {
     X(METAL_WRITEBACK,   DEBUG, "metal_writeback", NULL,                       "=lazy|always: Metal writes guest memory when a dump reads it (default) or at every flip") \
     X(METAL_FB_GUARD,    DEBUG, "metal_fb_guard",  NULL,                       "trap title reads of the last Metal present surface; a read switches to metal_writeback=always") \
     X(METAL_OCC,         DEBUG, "metal_occ",       "RECOMP_METAL_OCC",         "=sync|fixed: Metal occlusion mode") \
+    X(OCC_DELAY_US,      DEBUG, "occ_delay_us",    NULL,                       "=us: hold every visibility result back this long (test hook)") \
+    X(OCC_SETTLE_US,     DEBUG, "occ_settle_us",   NULL,                       "=us: per-frame wait for pending visibility results before settling them at a walk end, semaphore release or flip (8000; 0 none)") \
     X(RT_ALIAS_CHECK,    DEBUG, "rt_alias_check",  NULL,                       "=0: Metal and D3D11 keep render targets whose guest memory the title rewrote (before rt-stale-alias)") \
     X(FB_VA,             DEBUG, "fb_va",           "RECOMP_FB_VA",             "=va: framebuffer window shows that address") \
     X(USB,               DEBUG, "ohci",            "RECOMP_USB",               "emulated OHCI/XID USB (unused path)") \

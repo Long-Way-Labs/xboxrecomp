@@ -121,8 +121,18 @@ static uint32_t s_surf_base = 0x01000000u;
 /* Four 16-byte visibility-test reports: GET_REPORT takes a 24-bit offset, so
  * the first free 64 KB below 16 MB. */
 static uint32_t s_report_guest;
-static int      s_vis_failures, s_vis_late, s_cross_live, s_cross_vacuous;
+static int      s_vis_failures, s_vis_late;
+static int      s_cross_exact, s_cross_stale, s_cross_first, s_cross_bad;
+/* Report 3's push time by frame parity, and the push time of the frame
+ * whose count it last read: the tracker forgets an address's count
+ * NV2A_OCC_LATE_US (250 ms) after that report's push. */
+static DWORD    s_cross_push[2], s_cross_hist_ms;
 #define REPORT_GUEST s_report_guest
+/* Report 3's open test covers 100 pixels on even frames and 200 on odd ones,
+ * so a count read a frame later tells the frame's own result (exact) from
+ * the address's last one (stale, settled at the flip) apart. */
+#define CROSS_COUNT(f) ((f) & 1 ? 200u : 100u)
+#define OCC_VISIBLE    0x10000u    /* NV2A_OCC_VISIBLE: no history yet */
 
 /* Visibility test: CLEAR_REPORT_VALUE, ZPASS count on, a quad, count off,
  * GET_REPORT into report k. EndVisibilityTest sets the status to 0xFFFFFFFF
@@ -834,29 +844,36 @@ int main(int argc, char **argv)
         float t = (float)(f % 120) / 120.0f;
         float x = 80.0f + 320.0f * t, y = 120.0f;
         uint32_t clear = 0xFF000000u | ((uint32_t)(255 * t) << 16) | 0x30u;
-        uint32_t cross_early = 0xFFFFFFFFu;
-
-        /* Cross-frame reuse of report 3: the last frame pushed an open test
-         * (100) into it and did not wait. The flip's only poll runs before
-         * Present (without a flush), so the old report is normally still
-         * pending here, and ready by now. Push an empty test (0) into it
-         * first thing: a poll at GET_REPORT ahead of the supersede would
-         * finish the old one over the reset, done with 100 right here. If
-         * the old one is already done (always so in sync mode) the case
-         * proves nothing; that is counted, and in deferred mode a run where
-         * it never ran live fails. It runs live only because the smoke is
-         * single-threaded: no ack thread ticks on_poll during the Sleep(16),
-         * as one would in a title, so nothing finishes the old report
-         * between the flip and this push. */
+        /* Report 3 across the flip: the last frame pushed an open test into
+         * it and did not wait. The flip settles every report still pending,
+         * so here, before any poll, it is complete:
+         * that frame's count (exact), the frame before's (stale: the
+         * address's last count), or visible while the address has no
+         * count younger than 250 ms (first). Never TESTINCOMPLETE, which a
+         * title reading last frame's test takes as hidden. It runs without a poll between
+         * the flip and this read because the smoke is single-threaded: no
+         * ack thread ticks on_poll during the Sleep(16). */
         if (have_reports && f > 0) {
             volatile uint32_t *r = (volatile uint32_t *)(uintptr_t)REPORT_GUEST;
-            if (r[15] == 0xFFFFFFFFu)
-                s_cross_live++;
-            else
-                s_cross_vacuous++;
-            vis_test(3, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
-            if (!r[15])
-                cross_early = r[14];
+            /* First-time: no count read yet, or the last one is older
+             * than the tracker keeps (a hitch over 250 ms). */
+            int no_hist = (!s_cross_exact && !s_cross_stale)
+                       || GetTickCount() - s_cross_hist_ms > 250;
+            if (r[15] == 0 && r[14] == CROSS_COUNT(f - 1)) {
+                s_cross_exact++;
+                s_cross_hist_ms = s_cross_push[(f - 1) & 1];
+            } else if (r[15] == 0 && f > 1 && r[14] == CROSS_COUNT(f - 2)) {
+                s_cross_stale++;
+                s_cross_hist_ms = s_cross_push[(f - 2) & 1];
+            } else if (r[15] == 0 && r[14] == OCC_VISIBLE && no_hist) {
+                s_cross_first++;
+            } else {
+                s_cross_bad++;
+                fprintf(stderr, "[backend-smoke] frame %d cross-frame report FAIL:"
+                        " count %u status 0x%08X after the flip (want %u, %u or"
+                        " first-time 0x%X, status 0)\n", f - 1, r[14], r[15],
+                        CROSS_COUNT(f - 1), CROSS_COUNT(f - 2), OCC_VISIBLE);
+            }
         }
 
         M(0x0200, 640u << 16);                 /* SURFACE_CLIP_HORIZONTAL */
@@ -989,7 +1006,9 @@ int main(int argc, char **argv)
         /* Two visibility tests, colour writes off: a 100x60 quad at z 0.75
          * wholly behind the green one (count 0) and a 10x10 one at z 0.5 in
          * the open (count 100). The reports arrive a little later: the
-         * previous frame's are printed at the top of the next. */
+         * previous frame's are printed at the top of the next. A report
+         * settled at the flip before its result came reads the address's
+         * last count, the same here, or visible while there is none. */
         if (have_reports) {
             volatile uint32_t *r = (volatile uint32_t *)(uintptr_t)REPORT_GUEST;
             /* Spin on the status as a title would, ticking on_poll the way
@@ -1001,27 +1020,28 @@ int main(int argc, char **argv)
                 const struct nv2a_pb_backend *b = nv2a_pb_get_backend();
                 DWORD t0 = GetTickCount();
                 int spins = 0;
-                uint32_t reuse_first = 0xFFFFFFFFu, cross_first = cross_early;
+                uint32_t reuse_first = 0xFFFFFFFFu;
+                /* No history yet, or none younger than 250 ms (judged by
+                 * report 3's): a settle reads visible (first-time). */
+                int fresh = (!s_cross_exact && !s_cross_stale)
+                         || GetTickCount() - s_cross_hist_ms > 250;
                 int bad, late;
                 while ((r[3] || r[7] || r[11] || r[15]) && GetTickCount() - t0 < 300) {
                     if (b->on_poll)
                         b->on_poll();
                     if (reuse_first == 0xFFFFFFFFu && !r[11])
                         reuse_first = r[10];   /* the first count seen done */
-                    if (cross_first == 0xFFFFFFFFu && !r[15])
-                        cross_first = r[14];
                     spins++;
                 }
                 if (b->on_poll)
                     b->on_poll();
                 if (reuse_first == 0xFFFFFFFFu && !r[11])
                     reuse_first = r[10];
-                if (cross_first == 0xFFFFFFFFu && !r[15])
-                    cross_first = r[14];
                 /* Wrong: a report done with the wrong count. */
-                bad = (!r[3] && r[2] != 0) || (!r[7] && r[6] != 100)
-                   || (reuse_first != 0xFFFFFFFFu && reuse_first != 0)
-                   || (cross_first != 0xFFFFFFFFu && cross_first != 0);
+                bad = (!r[3] && r[2] != 0 && !(fresh && r[2] == OCC_VISIBLE))
+                   || (!r[7] && r[6] != 100 && !(fresh && r[6] == OCC_VISIBLE))
+                   || (reuse_first != 0xFFFFFFFFu && reuse_first != 0
+                       && !(fresh && reuse_first == OCC_VISIBLE));
                 late = r[3] || r[7] || r[11] || r[15];
                 if (bad)
                     s_vis_failures++;
@@ -1031,12 +1051,11 @@ int main(int argc, char **argv)
                     fprintf(stderr, "[backend-smoke] frame %d visibility%s: occluded"
                             " count %u status 0x%08X, open count %u status 0x%08X,"
                             " reused slot first count %u status 0x%08X, cross-frame"
-                            " reuse first count %u%s status 0x%08X (want 0, 100, 0, 0)"
+                            " count %u status 0x%08X (want 0, 100, 0, %u)"
                             " (%d polls, %lu ms)\n", f - 1,
                             bad ? " FAIL" : late ? " LOST" : "",
-                            r[2], r[3], r[6], r[7], reuse_first, r[11], cross_first,
-                            cross_early != 0xFFFFFFFFu ? " (done at push)" : "",
-                            r[15], spins, GetTickCount() - t0);
+                            r[2], r[3], r[6], r[7], reuse_first, r[11],
+                            r[14], r[15], CROSS_COUNT(f - 1), spins, GetTickCount() - t0);
             }
             M(0x0358, 0);                      /* COLOR_MASK: none */
             M(0x0354, 0x201);                  /* DEPTH_FUNC: LESS */
@@ -1047,8 +1066,10 @@ int main(int argc, char **argv)
              * the same report. Only the second may ever show. */
             vis_test(2, 300.0f, 300.0f, 310.0f, 310.0f, 8388608.0f);
             vis_test(2, 450.0f, 380.0f, 550.0f, 440.0f, 12582912.0f);
-            /* Report 3: an open test, not waited for (see the frame top). */
-            vis_test(3, 300.0f, 300.0f, 310.0f, 310.0f, 8388608.0f);
+            /* Report 3: an open test, not waited for (see the frame top);
+             * 10x10 on even frames, 10x20 on odd ones (CROSS_COUNT). */
+            vis_test(3, 300.0f, 300.0f, 310.0f, f & 1 ? 320.0f : 310.0f, 8388608.0f);
+            s_cross_push[f & 1] = GetTickCount();
             M(0x0358, 0x01010101u);
         }
         M(0x030C, 0);                          /* depth test off */
@@ -1241,7 +1262,8 @@ int main(int argc, char **argv)
     }
     if (have_reports && frames > 0) {
         /* The last frame's reports: spin and check them too (report 2 was
-         * superseded by the occluded test, report 3 holds an open one). */
+         * superseded by the occluded test, report 3 holds an open one, exact
+         * or settled stale at the last flip). */
         volatile uint32_t *r = (volatile uint32_t *)(uintptr_t)REPORT_GUEST;
         const struct nv2a_pb_backend *b = nv2a_pb_get_backend();
         DWORD t0 = GetTickCount();
@@ -1254,29 +1276,32 @@ int main(int argc, char **argv)
             s_vis_late++;
             fprintf(stderr, "[backend-smoke] last frame visibility LOST: status"
                     " 0x%08X 0x%08X 0x%08X 0x%08X\n", r[3], r[7], r[11], r[15]);
-        } else if (r[2] != 0 || r[6] != 100 || r[10] != 0 || r[14] != 100) {
+        } else if (r[2] != 0 || r[6] != 100 || r[10] != 0
+                   || (r[14] != CROSS_COUNT(frames - 1)
+                       && (frames < 2 || r[14] != CROSS_COUNT(frames - 2)))) {
             s_vis_failures++;
             fprintf(stderr, "[backend-smoke] last frame visibility FAIL: counts"
-                    " %u %u %u %u (want 0, 100, 0, 100)\n", r[2], r[6], r[10], r[14]);
+                    " %u %u %u %u (want 0, 100, 0, %u)\n", r[2], r[6], r[10], r[14],
+                    CROSS_COUNT(frames - 1));
         }
     }
     if (have_reports) {
-        const char *occ = recomp_env(RENV_D3D11_OCC);
-        int deferred = !occ || (_stricmp(occ, "sync") && _stricmp(occ, "fixed"));
         fprintf(stderr, "[backend-smoke] visibility over %d frames and the last:"
-                " %d wrong, %d lost; cross-frame reuse live in %d of %d, vacuous"
-                " in %d\n", frames > 0 ? frames - 1 : 0, s_vis_failures,
-                s_vis_late, s_cross_live, frames > 0 ? frames - 1 : 0,
-                s_cross_vacuous);
+                " %d wrong, %d lost; cross-frame report complete after the flip"
+                " in %d of %d (exact %d, stale %d, first %d)\n",
+                frames > 0 ? frames - 1 : 0, s_vis_failures, s_vis_late,
+                s_cross_exact + s_cross_stale + s_cross_first,
+                frames > 0 ? frames - 1 : 0, s_cross_exact, s_cross_stale,
+                s_cross_first);
         if (s_vis_failures || s_vis_late) {
             fprintf(stderr, "[backend-smoke] FAIL: %d frames with a wrong visibility"
                     " result, %d frames with a report the backend lost\n",
                     s_vis_failures, s_vis_late);
             return 1;
         }
-        if (deferred && frames > 1 && !s_cross_live) {
-            fprintf(stderr, "[backend-smoke] FAIL: cross-frame reuse case never"
-                    " ran\n");
+        if (s_cross_bad) {
+            fprintf(stderr, "[backend-smoke] FAIL: %d frames where report 3 was not"
+                    " complete after the flip that ended its frame\n", s_cross_bad);
             return 2;
         }
     }

@@ -2548,10 +2548,22 @@ static void guard_flip(uint32_t addr, uint32_t len)
  * comes from the count come out too bright. A slot freed while
  * its command buffer is still in flight retires until the flip's wait.
  *
+ * At the end of each walk, before a semaphore release that follows a
+ * report (both on_poll) and at the flip after its wait, nv2a_occ_settle
+ * waits for the results while the frame's RECOMP_DEBUG=occ_settle_us budget
+ * lasts (8000 by default; a query still in the open s_cmd is committed by
+ * occ_result's flush), then settles whatever is still pending with the
+ * report address's last count (visible the first time), so the title never
+ * reads a test as incomplete (nv2a_backend_common.h). At stock
+ * almost nothing is left to settle: the reports' command buffers were
+ * committed at GET_REPORT. occ_delay_us holds every result back (a test
+ * hook for a slow GPU).
+ *
  * RECOMP_METAL_OCC=sync waits at GET_REPORT; =fixed leaves reports to the
  * walker (RECOMP_ZPASS_FIXED, every test visible). */
 #define OCC_QSLOTS 16
-#define OCC_POOL   (NV2A_OCC_PENDING * 2 + NV2A_OCC_SEG)
+/* Pending and retired reports, a query each at least, and the open ones. */
+#define OCC_POOL   (NV2A_OCC_PENDING * 3 + NV2A_OCC_SEG)
 typedef struct OccQuery {
     int                   slot[OCC_QSLOTS];
     id<MTLCommandBuffer>  cmd[OCC_QSLOTS];   /* retained */
@@ -2715,12 +2727,23 @@ static const struct nv2a_occ_ops s_occ_ops = {
     occ_get, occ_put, occ_begin, occ_end, occ_result, occ_now_us, NULL
 };
 
+static uint64_t occ_env_us(recomp_env_id id, uint64_t def)
+{
+    long v = recomp_env_int(id, (long)def);
+    return v > 0 ? (uint64_t)v : 0;
+}
+
 static int occ_ready_on(void)
 {
     if (occ_mode() == 2 || !init())
         return 0;
-    if (!s_occ.ops)
+    if (!s_occ.ops) {
         nv2a_occ_init(&s_occ, &s_occ_ops, (uint8_t *)xbox_GetMemoryOffset());
+        nv2a_occ_set_delay(&s_occ, occ_env_us(RENV_OCC_DELAY_US, 0));
+        nv2a_occ_set_settle(&s_occ, occ_env_us(RENV_OCC_SETTLE_US,
+                                               NV2A_OCC_SETTLE_US));
+        nv2a_occ_set_trace(&s_occ, recomp_env(RENV_ZPASS_TRACE) != NULL);
+    }
     return 1;
 }
 
@@ -2780,16 +2803,21 @@ static int metal_on_report(uint32_t va)
     return 1;
 }
 
+static void occ_settle(int flip);
+
+/* At the end of a walk, before a semaphore release after a report, and
+ * every ack pass (retired queries only, unflushed, when nothing is
+ * pending). */
 static void metal_on_poll(void)
 {
-    if (s_occ.npend) {
+    if (s_occ.npend || s_occ.nret) {
         @autoreleasepool {
-            nv2a_occ_poll(&s_occ, 1);
+            occ_settle(0);
         }
     }
 }
 
-/* After the flip's wait every command buffer is done: retired slots free. */
+/* After a wait every command buffer is done: retired slots free. */
 static void occ_after_wait(void)
 {
     while (s_nretire)
@@ -2798,11 +2826,27 @@ static void occ_after_wait(void)
         nv2a_occ_poll(&s_occ, 0);
 }
 
+/* At the end of a walk, before a semaphore release after a report, and at
+ * the flip after its wait. Not in occ_after_wait, which also runs at the
+ * waits inside a walk (a full ring, a readback), where the title cannot
+ * read yet. */
+static void occ_settle(int flip)
+{
+    if (!s_occ.ops)
+        return;
+    if (flip)
+        nv2a_occ_flip(&s_occ);
+    else
+        nv2a_occ_settle(&s_occ);
+}
+
 static void flip_log(uint32_t surface_offset, RenderTarget *rt)
 {
     static int on = -1;
     static uint64_t p_draws, p_prog, p_skip, p_cull, p_clears, p_tex, p_up,
-                    p_chg, p_re, p_fl, p_occ, p_vis, p_late, p_super, p_sync, p_ovf;
+                    p_chg, p_re, p_fl, p_occ, p_vis, p_late, p_super, p_sync, p_ovf,
+                    p_set, p_stale, p_first;
+    static int zt = -1;
     /* With a pack, its hit count every 600 flips, flip trace or not. */
     if (nv2a_tex_pack_count() && s_presents % 600 == 0) {
         fprintf(stderr, LOGP "textures.pack: %llu hits so far\n",
@@ -2810,14 +2854,21 @@ static void flip_log(uint32_t surface_offset, RenderTarget *rt)
         if (recomp_env(RENV_TEX_PACK_TRACE))
             nv2a_tex_pack_print_misses();
     }
-    if (on < 0)
+    if (on < 0) {
         on = recomp_env(RENV_FLIP_LOG) != NULL;
+        zt = recomp_env(RENV_ZPASS_TRACE) != NULL;
+    }
+    /* The visibility totals so far: a run killed by its timeout has no
+     * exit to print them at, so the last of these is the run's. */
+    if ((on || zt) && s_occ.reports && s_presents % 300 == 0)
+        nv2a_occ_summary(&s_occ, "[METAL]");
     if (!on)
         return;
     fprintf(stderr, "[METAL] flip %llu batches %llu prog %llu skipped %llu"
             " culled %llu clears %llu tex %llu uploads %llu changed %llu rehash %llu"
             " flushes %llu occ %llu (visible %llu, pending %d, late %llu, superseded %llu,"
-            " sync %llu us, slot overflow %llu) present 0x%08X walker 0x%08X\n",
+            " settled %llu (stale %llu, first %llu), sync %llu us, slot overflow %llu)"
+            " present 0x%08X walker 0x%08X\n",
             (unsigned long long)s_presents,
             (unsigned long long)(s_draws - p_draws),
             (unsigned long long)(s_draws_prog - p_prog),
@@ -2833,11 +2884,15 @@ static void flip_log(uint32_t surface_offset, RenderTarget *rt)
             (unsigned long long)(s_occ.vis - p_vis), s_occ.npend,
             (unsigned long long)(s_occ.late - p_late),
             (unsigned long long)(s_occ.super - p_super),
+            (unsigned long long)(s_occ.settled - p_set),
+            (unsigned long long)(s_occ.stale - p_stale),
+            (unsigned long long)(s_occ.first - p_first),
             (unsigned long long)(s_occ.sync_us - p_sync),
             (unsigned long long)(s_occ_ovf - p_ovf),
             rt ? rt->offset : 0, surface_offset);
     p_occ = s_occ.reports; p_vis = s_occ.vis; p_late = s_occ.late;
     p_super = s_occ.super; p_sync = s_occ.sync_us; p_ovf = s_occ_ovf;
+    p_set = s_occ.settled; p_stale = s_occ.stale; p_first = s_occ.first;
     p_draws = s_draws; p_prog = s_draws_prog; p_skip = s_draws_skipped;
     p_cull = s_draws_culled; p_clears = s_clears; p_tex = s_draws_tex;
     p_up = s_tex_uploads; p_chg = s_tex_changed; p_re = s_tex_rehash;
@@ -2911,6 +2966,7 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
                 rt_managed_sync(rt);
             t = prof_t();
             flush(1);
+            occ_settle(1);
             prof_add(&s_pa.wait, t);
             if (layer) {
                 /* After the wait, in a command buffer of its own that nobody
@@ -2975,7 +3031,8 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
                 (unsigned long long)s_tex_uploads, (unsigned long long)s_tex_rehash,
                 (unsigned long long)s_writebacks, always ? "always" : "lazy",
                 (unsigned long long)s_decode_syncs, (unsigned long long)s_stale_drops,
-                (unsigned long long)s_evict_lost, (unsigned long long)s_grows, (unsigned long long)s_partial_clears,
+                (unsigned long long)s_evict_lost, (unsigned long long)s_grows,
+                (unsigned long long)s_partial_clears,
                 (unsigned long long)s_vs_compiled, (unsigned long long)s_fs_compiled,
                 (unsigned long long)s_compile_errors,
                 (unsigned long long)s_zclears, (unsigned long long)s_draws_z,
@@ -3070,9 +3127,12 @@ static void scale_drop(void)
         }
     }
     /* Queries issued at the old scale are read at it: a count taken at 2x
-     * divided by 1 would report four times the samples. */
+     * divided by 1 would report four times the samples. Retired results go
+     * unread (nv2a_occ_set_scale). */
     if (s_occ.ops) {
-        nv2a_occ_poll(&s_occ, 1);
+        @autoreleasepool {
+            occ_settle(0);
+        }
         nv2a_occ_set_scale(&s_occ, nv2a_host_render_scale());
     }
     fprintf(stderr, LOGP "render.scale=%u from this flip: targets and textures dropped\n",

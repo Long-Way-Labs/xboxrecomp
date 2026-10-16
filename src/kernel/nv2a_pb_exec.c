@@ -5589,6 +5589,27 @@ static const struct nv2a_pb_backend s_cpu_backend = {
     cpu_on_flip,                         /* on_flip   */
 };
 static const struct nv2a_pb_backend *s_backend = &s_cpu_backend;
+/* A GET_REPORT the backend took and has not been polled for since. */
+static int s_report_owed;
+
+/* The title can read a deferred report as soon as the walker hands back
+ * anything it waits on: a semaphore release, GET at the end of the walk.
+ * On the console the count is written ahead of both, so the backend's
+ * on_poll settles it here (nv2a_backend_common.h). */
+static void reports_settle(void)
+{
+    if (s_report_owed) {
+        s_report_owed = 0;
+        if (s_backend->on_poll)
+            s_backend->on_poll();
+    }
+}
+
+/* nv2a_pb_scan, at the end of each walk, before GET is stored. */
+void nv2a_pb_exec_walk_end(void)
+{
+    reports_settle();
+}
 
 static void get_report(uint32_t param)
 {
@@ -5616,6 +5637,7 @@ static void get_report(uint32_t param)
     }
     if (!fixed_set && s_backend->on_report && s_backend->on_report(va)) {
         s_reports++;                       /* the backend completes it */
+        s_report_owed = 1;
         return;
     }
     value = (fixed_set || s_backend != &s_cpu_backend) ? fixed : s_zpass_count;
@@ -6421,6 +6443,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                         va, s_gpu.sema_offset);
             return;
         }
+        reports_settle();  /* the release orders after the reports */
         *(volatile uint32_t *)(mem + va) = param;
         s_sema_last_va = va;
         s_sema_last_value = param;

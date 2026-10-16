@@ -3364,7 +3364,9 @@ static void flip_log(uint32_t surface_offset)
     static int on = -1;
     static uint64_t p_draws, p_prog, p_tex, p_rtt, p_clears, p_up, p_chg,
                     p_re, p_vn, p_ve, p_skip, p_cull, p_self, p_mip,
-                    p_occ, p_occ_vis, p_occ_us, p_occ_late, p_occ_super;
+                    p_occ, p_occ_vis, p_occ_us, p_occ_late, p_occ_super,
+                    p_occ_set, p_occ_stale, p_occ_first;
+    static int zt = -1;
     /* With a pack, its hit count every 600 flips, flip trace or not. */
     if (nv2a_tex_pack_count() && s_presents % 600 == 0) {
         fprintf(stderr, LOGP "textures.pack: %llu hits so far\n",
@@ -3372,13 +3374,20 @@ static void flip_log(uint32_t surface_offset)
         if (recomp_env(RENV_TEX_PACK_TRACE))
             nv2a_tex_pack_print_misses();
     }
-    if (on < 0)
+    if (on < 0) {
         on = recomp_env(RENV_FLIP_LOG) != NULL;
+        zt = recomp_env(RENV_ZPASS_TRACE) != NULL;
+    }
+    /* The visibility totals so far: a run killed by its timeout has no
+     * exit to print them at, so the last of these is the run's. */
+    if ((on || zt) && s_occ.reports && s_presents % 300 == 0)
+        nv2a_occ_summary(&s_occ, "[D3D11]");
     if (!on)
         return;
     fprintf(stderr, "[D3D11] flip %llu batches %llu prog %llu tex %llu rtt %llu (self %llu)"
             " skipped %llu culled %llu clears %llu uploads %llu (mip %llu) changed %llu rehash %llu"
-            " vb %llu/%llu bytes occ %llu (visible %llu, pending %d, late %llu, superseded %llu, sync %llu us)"
+            " vb %llu/%llu bytes occ %llu (visible %llu, pending %d, late %llu, superseded %llu,"
+            " settled %llu (stale %llu, first %llu), sync %llu us)"
             " present 0x%08X walker 0x%08X\n",
             (unsigned long long)s_presents,
             (unsigned long long)(s_draws - p_draws),
@@ -3399,6 +3408,9 @@ static void flip_log(uint32_t surface_offset)
             (unsigned long long)(s_occ.vis - p_occ_vis), s_occ.npend,
             (unsigned long long)(s_occ.late - p_occ_late),
             (unsigned long long)(s_occ.super - p_occ_super),
+            (unsigned long long)(s_occ.settled - p_occ_set),
+            (unsigned long long)(s_occ.stale - p_occ_stale),
+            (unsigned long long)(s_occ.first - p_occ_first),
             (unsigned long long)(s_occ.sync_us - p_occ_us),
             s_drawn ? s_drawn->offset : 0, surface_offset);
     p_draws = s_draws; p_prog = s_draws_prog; p_tex = s_draws_tex;
@@ -3408,6 +3420,7 @@ static void flip_log(uint32_t surface_offset)
     p_mip = s_tex_mip_uploads;
     p_occ = s_occ.reports; p_occ_vis = s_occ.vis; p_occ_us = s_occ.sync_us;
     p_occ_late = s_occ.late; p_occ_super = s_occ.super;
+    p_occ_set = s_occ.settled; p_occ_stale = s_occ.stale; p_occ_first = s_occ.first;
 }
 
 /* ---- present: the scaling blit and the resize (E1) ------------------------
@@ -3722,6 +3735,11 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
         fprintf(stderr, LOGP "Present hr=0x%08lX\n", (unsigned long)hr);
     /* FLIP_DISCARD unbinds the back buffer; the next frame rebinds its own
      * render target anyway. */
+    /* The title may read this frame's visibility tests from here on: settle
+     * what is still pending. After Present, which submitted the frame's
+     * queries; a flushing GetData before it would be the first submission. */
+    if (s_occ.ops)
+        nv2a_occ_flip(&s_occ);
     flip_log(surface_offset);
     if (s_presents == 1 || (s_presents % 300) == 0)
         fprintf(stderr, LOGP "present #%llu: surface 0x%08X (walker said 0x%08X),"
@@ -3740,7 +3758,8 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
                 (unsigned long long)s_rc_compiles,
                 (unsigned long long)s_zclears, (unsigned long long)s_draws_z,
                 (unsigned long long)s_rtt_binds, (unsigned long long)s_stale_drops,
-                (unsigned long long)s_evict_lost, (unsigned long long)s_grows, (unsigned long long)s_partial_clears);
+                (unsigned long long)s_evict_lost, (unsigned long long)s_grows,
+                (unsigned long long)s_partial_clears);
     if (s_presents == 1 || (s_presents % 300) == 0)
         fprintf(stderr, LOGP "blend: %llu draws with a constant factor,"
                 " %u SET_BLEND_COLOR writes (last 0x%08X)\n",
@@ -3776,9 +3795,10 @@ static void scale_drop(void)
     s_cur = NULL;
     memset(s_stage_rt, 0, sizeof s_stage_rt);
     /* Queries issued at the old scale are read at it: a count taken at 2x
-     * divided by 1 would report four times the samples. */
+     * divided by 1 would report four times the samples. Retired results go
+     * unread (nv2a_occ_set_scale). */
     if (s_occ.ops) {
-        nv2a_occ_poll(&s_occ, 1);
+        nv2a_occ_settle(&s_occ);
         nv2a_occ_set_scale(&s_occ, nv2a_host_render_scale());
     }
     fprintf(stderr, LOGP "render.scale=%u from this flip: targets and textures dropped\n",
@@ -3812,24 +3832,29 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
  * CPU path's put_pixel count.
  *
  * Latency: a report is not completed at GET_REPORT. Its queries go on a
- * pending list, polled (GetData without a flush) at every batch and flip
- * and, with a flush, on the ack thread's idle tick (on_poll), so a title
- * spinning on the result still gets one. Until then the status keeps D3D's
- * 0xFFFFFFFF, which GetVisibilityTestResult reads as D3DERR_TESTINCOMPLETE.
- * When done, count then status 0 are written. RECOMP_D3D11_OCC=sync waits
- * for the result at GET_REPORT instead (the stall the flip log's "occ"
- * shows), =fixed leaves reports to the walker (RECOMP_ZPASS_FIXED, every
- * test visible). A report still pending after 250 ms, or one with too many
- * stretches, completes as visible (0x10000); the flip log's "visible"
+ * pending list, polled (GetData without a flush) at every batch. Until then
+ * the status keeps D3D's 0xFFFFFFFF, which GetVisibilityTestResult reads as
+ * D3DERR_TESTINCOMPLETE. When done, count then status 0 are written. At the
+ * end of each walk, before a semaphore release that follows a report (both
+ * on_poll) and at the flip after Present, nv2a_occ_settle waits for the
+ * results while the frame's RECOMP_DEBUG=occ_settle_us budget lasts (8000
+ * by default), then settles whatever is still pending with the report
+ * address's last count (visible the first time), so the title never reads a
+ * test as incomplete (nv2a_backend_common.h). occ_delay_us holds
+ * every result back (a test hook for a slow GPU). RECOMP_D3D11_OCC=sync
+ * waits for the result at GET_REPORT instead (the stall the flip log's
+ * "occ" shows), =fixed leaves reports to the walker (RECOMP_ZPASS_FIXED,
+ * every test visible). A report still pending after 250 ms, or one with too
+ * many stretches, completes as visible (0x10000); the flip log's "visible"
  * (s_occ_vis) counts those fallbacks too.
  *
  * Reused reports: the XDK recycles its report slots, so a GET_REPORT can name
  * a va that still has a report pending. The new one supersedes it, before
- * anything is polled: the old
- * queries go back to the pool unread and nothing is written for the old
- * test, so its late completion cannot land over the title's reset status or
- * the new count. */
-#define OCC_POOL    (NV2A_OCC_PENDING * 2 + NV2A_OCC_SEG)
+ * anything is polled: the old queries go back to the pool unread and nothing
+ * is written for the old test, so its late completion cannot land over the
+ * title's reset status or the new count. */
+/* Pending and retired reports, a query each at least, and the open ones. */
+#define OCC_POOL    (NV2A_OCC_PENDING * 3 + NV2A_OCC_SEG)
 static ID3D11Query *s_occ_pool[OCC_POOL];
 static int          s_occ_pool_n, s_occ_made;
 static int          s_occ_mode = -1;         /* 0 defer, 1 sync, 2 fixed */
@@ -3908,13 +3933,24 @@ static const struct nv2a_occ_ops s_occ_ops = {
     occ_get, occ_put, occ_begin, occ_end, occ_result, occ_now_us, NULL
 };
 
+static uint64_t occ_env_us(recomp_env_id id, uint64_t def)
+{
+    long v = recomp_env_int(id, (long)def);
+    return v > 0 ? (uint64_t)v : 0;
+}
+
 /* The tracker, set up on first use (init() has made the device). */
 static int occ_ready_on(void)
 {
     if (occ_mode() == 2 || !init())
         return 0;
-    if (!s_occ.ops)
+    if (!s_occ.ops) {
         nv2a_occ_init(&s_occ, &s_occ_ops, (uint8_t *)xbox_GetMemoryOffset());
+        nv2a_occ_set_delay(&s_occ, occ_env_us(RENV_OCC_DELAY_US, 0));
+        nv2a_occ_set_settle(&s_occ, occ_env_us(RENV_OCC_SETTLE_US,
+                                               NV2A_OCC_SETTLE_US));
+        nv2a_occ_set_trace(&s_occ, recomp_env(RENV_ZPASS_TRACE) != NULL);
+    }
     return 1;
 }
 
@@ -3938,10 +3974,13 @@ static int d3d11_on_report(uint32_t va)
     return 1;
 }
 
+/* At the end of a walk, before a semaphore release after a report, and
+ * every ack pass (retired queries only, unflushed, when nothing is
+ * pending). */
 static void d3d11_on_poll(void)
 {
-    if (s_occ.npend && s_dev)
-        nv2a_occ_poll(&s_occ, 1);
+    if ((s_occ.npend || s_occ.nret) && s_dev)
+        nv2a_occ_settle(&s_occ);
 }
 
 static const struct nv2a_pb_backend s_d3d11_backend = {

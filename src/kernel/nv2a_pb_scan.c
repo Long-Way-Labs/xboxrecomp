@@ -204,9 +204,10 @@ void nv2a_pb_scan_report(void)
     fflush(stderr);
 }
 
-/* Once per pass of the ack thread's loop: the backend's on_poll, so a
- * deferred visibility-test report can complete while no pushbuffer comes
- * (a title spinning on GetVisibilityTestResult submits nothing). */
+/* Once per pass of the ack thread's loop: the backend's on_poll, so the
+ * queries of reports already settled can come back to the pool while no
+ * pushbuffer comes. The walk itself settles its reports
+ * (nv2a_pb_exec_walk_end). */
 void nv2a_pb_poll(void)
 {
     const struct nv2a_pb_backend *b;
@@ -386,6 +387,12 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
         break;
     }
     s_in_call = 0;
+    /* The walk's reports, before GET moves or a stop's salvage releases a
+     * semaphore: the title may read them once either happens. */
+    if (s_exec_enabled) {
+        extern void nv2a_pb_exec_walk_end(void);
+        nv2a_pb_exec_walk_end();
+    }
     if (why) {
         static unsigned said;
         extern void nv2a_pb_exec_flip_cancel(void);

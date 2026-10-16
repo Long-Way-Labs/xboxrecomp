@@ -1017,11 +1017,42 @@ void nv2a_report_set_pending(uint8_t *mem, uint32_t va);
  * more than NV2A_OCC_SEG stretches, completes as visible (NV2A_OCC_VISIBLE).
  * A GET_REPORT naming a va that still has one pending supersedes it: the old
  * queries go back unread, and nothing is written for the old test. The
- * backend supplies the queries through nv2a_occ_ops; handles are opaque. */
+ * backend supplies the queries through nv2a_occ_ops; handles are opaque.
+ *
+ * Settled before the title can read (nv2a_occ_settle): a report still pending
+ * there is written complete with the last completed count for its address,
+ * or NV2A_OCC_VISIBLE when the address has none younger than
+ * NV2A_OCC_LATE_US. The executor has the backend settle (its on_poll) at the
+ * end of each walk, before GET is stored, and before a semaphore release
+ * that follows a GET_REPORT; the backend settles again at the flip
+ * (nv2a_occ_flip). On the console the GPU writes a test's count ahead of
+ * anything later in the stream, so the title never reads one incomplete;
+ * BLiNX 2's LOAD GAME screen reads its two tests 4-12 ms after their
+ * GET_REPORT, in the same frame, and skips its characters on an incomplete
+ * one. A host GPU slower than that lost them on every late frame.
+ * The title can read once the walker hands back GET or a semaphore it waits
+ * on, so those are the last points before a read; the flip alone is too
+ * late. Before settling, the tracker waits for the results, up to settle_us
+ * a frame in all (NV2A_OCC_SETTLE_US; 0: no wait), so a host that keeps up
+ * gives exact counts and one far behind pays at most that per frame. 8 ms,
+ * as Metal's stage1 results often land 2-8 ms after the walk and D3D11's
+ * within 2 ms; the wait ends when they do. The address's last count is what
+ * a lagging GPU can give: at most one frame stale. A settled report keeps its queries on retired[]; a late result
+ * there only updates the address's last count and is never written, so a
+ * slot the title has since reset for its next test stays reset.
+ * One window is accepted: a title that reset the slot for frame N+1 before
+ * frame N's report settles reads frame N's count where the console would
+ * read incomplete; the next GET_REPORT makes it pending again.
+ *
+ * Everything here runs on the NV2A ack thread; the title's reads see a
+ * report through nv2a_report_write()'s release store. */
 #define NV2A_OCC_SEG      8         /* stretches per report */
 #define NV2A_OCC_PENDING  128
 #define NV2A_OCC_VISIBLE  0x10000u
 #define NV2A_OCC_LATE_US  250000u
+#define NV2A_OCC_LAST     64        /* report addresses with a last count */
+#define NV2A_OCC_AGES     8         /* result-age histogram buckets */
+#define NV2A_OCC_SETTLE_US 8000u    /* settle wait budget a frame, default */
 
 struct nv2a_occ_ops {
     void *(*get)(void *ctx);                        /* NULL if none */
@@ -1041,6 +1072,14 @@ struct nv2a_occ_report {
     void    *q[NV2A_OCC_SEG];
 };
 
+/* The last completed count at a report address, guest size (after the
+ * render-scale division), and the push time of the report it came from, so
+ * a late result never replaces a newer one. */
+struct nv2a_occ_last {
+    uint32_t va, count;
+    uint64_t t0;
+};
+
 struct nv2a_occ {
     const struct nv2a_occ_ops *ops;
     uint8_t *mem;                       /* guest memory base */
@@ -1048,13 +1087,34 @@ struct nv2a_occ {
     int      nseg, open, en, ovf;
     struct nv2a_occ_report pend[NV2A_OCC_PENDING];
     int      npend;
+    /* Settled, their queries still out: a result updates last[] only. The
+     * oldest is dropped unread when full. */
+    struct nv2a_occ_report retired[NV2A_OCC_PENDING];
+    int      nret;
+    struct nv2a_occ_last last[NV2A_OCC_LAST];
+    int      nlast, last_next;          /* filled, next to replace when full */
     /* For the flip log: reports, completed visible (count != 0, fallbacks
-     * included), late fallbacks, superseded, and microseconds waited in
-     * sync mode. */
+     * and settles included), late fallbacks, superseded, and microseconds
+     * waited in sync mode. */
     uint64_t reports, vis, late, super, sync_us;
+    /* Settled (stale: with the address's last count; first: no count yet,
+     * visible), retired results dropped unread, and microseconds waited
+     * before settling (settle_us), in all and in the current frame. */
+    uint64_t settled, stale, first, ret_drop, settle_wait_us, frame_wait_us;
+    /* nv2a_occ_flip calls, and the age (GET_REPORT to the poll that found
+     * it) of every result taken: <1, <2, <4, <8, <16, <33, <66, >=66 ms. */
+    uint64_t flips, age[NV2A_OCC_AGES];
     /* Render scale of the targets counted (0 or 1 = guest size): a count
      * is samples, N*N of them per guest pixel, so it is divided back. */
     unsigned scale;
+    /* Test hook: a result is not taken before it is delay_us old. The
+     * settles of one frame wait up to settle_us in all for results (0: no
+     * wait; NV2A_OCC_SETTLE_US from nv2a_occ_init). */
+    uint64_t delay_us, settle_us;
+    /* RECOMP_TRACE=zpass: print the first 64 settles and, in the summary,
+     * the age histogram. */
+    int      trace;
+    unsigned trace_n;
 };
 
 void nv2a_occ_init(struct nv2a_occ *o, const struct nv2a_occ_ops *ops,
@@ -1064,8 +1124,25 @@ void nv2a_occ_zpass_clear(struct nv2a_occ *o);
 /* GET_REPORT at va; sync waits (up to NV2A_OCC_LATE_US) for the result. */
 void nv2a_occ_report(struct nv2a_occ *o, uint32_t va, int sync);
 void nv2a_occ_poll(struct nv2a_occ *o, int flush);
-/* nv2a_occ_init takes the scale from nv2a_host_opts(); this overrides it. */
+/* Take every result that is in (with a flush), wait for the rest while the
+ * frame's settle_us lasts, then settle each report still pending (see
+ * above). After it nothing is pending. With nothing pending it only polls
+ * retired[], without a flush. The backends call it from on_poll. */
+void nv2a_occ_settle(struct nv2a_occ *o);
+/* The same at the flip, once the frame is submitted; counts the flip and
+ * starts the next frame's wait budget. */
+void nv2a_occ_flip(struct nv2a_occ *o);
+/* nv2a_occ_init takes the scale from nv2a_host_opts(); this overrides it.
+ * Retired reports are dropped unread: a result counted at the old scale and
+ * divided at the new one would be off by the square of the ratio. Call
+ * nv2a_occ_settle first, so nothing pending is read at the new scale either. */
 void nv2a_occ_set_scale(struct nv2a_occ *o, unsigned scale);
+void nv2a_occ_set_delay(struct nv2a_occ *o, uint64_t us);
+void nv2a_occ_set_settle(struct nv2a_occ *o, uint64_t us);
+void nv2a_occ_set_trace(struct nv2a_occ *o, int on);
+/* The running totals under `tag` ("[D3D11]"), and with trace the age
+ * histogram: what a run states of its GPU latency. */
+void nv2a_occ_summary(const struct nv2a_occ *o, const char *tag);
 /* A summed sample count at `scale` as the guest-size count: / scale^2,
  * rounded, a non-zero count staying >= 1 (visible never turns hidden),
  * saturated to 32 bits. */

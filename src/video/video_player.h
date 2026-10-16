@@ -66,6 +66,8 @@ void xbox_FramebufferWindowStart(void);
  * it (fb_window_wanted.c) so a ctest can pin the rule. */
 int  fb_window_wanted(const char *backend, int fb_window);
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
+/* Rows per displayed row: 2 for a 2x2 anti-aliased surface, else 1. */
+void xbox_FramebufferWindowSetAA(uint32_t sy);
 int  xbox_FramebufferDumpBmp(const char *path);
 /* Title bar: the game's name (window_title.h). The name is the certificate's
  * UTF-16 title (40 chars max), unless the title set its own with
@@ -92,6 +94,16 @@ void xbox_HostWindowSetTitle(const char *title);
  * runs on a thread of its own (fb_present_sdl.c). Returns guest_main's exit
  * code. */
 int xbox_HostWindowMain(int (*guest_main)(void));
+#endif
+
+#if !defined(_WIN32)
+/* POSIX hosts: the framebuffer window needs the process main thread (AppKit
+ * on macOS), so a title that wants it calls this from main() with its boot
+ * sequence. With RECOMP_FB_WINDOW set it opens the window, runs guest_main on
+ * a pthread and pumps events until guest_main returns (its value is returned)
+ * or the window is closed (the process exits). Otherwise, or headless, it
+ * just calls guest_main. */
+int  xbox_HostWindowMain(int (*guest_main)(void));
 #endif
 
 #endif /* BURNOUT3_VIDEO_PLAYER_H */

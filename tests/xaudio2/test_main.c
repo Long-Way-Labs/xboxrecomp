@@ -119,6 +119,12 @@ static void put_env(const char *assignment)
     recomp_env_reload();
 }
 
+/* xa2_init reads the buffer variables on each call. */
+static void put_env(const char *assignment)
+{
+    _putenv(assignment);
+}
+
 static void reset(void)
 {
     /* Fake resources are static, so even a broken cleanup can be reset. */

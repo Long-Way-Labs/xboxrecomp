@@ -1429,17 +1429,18 @@ int xbox_OhciOwnsAddress(uint32_t xbox_va)
     return hc_for(xbox_va) != NULL;
 }
 
-#if defined(OHCI_TRAP_POSIX_A64)
-/* The A64 decoder hands over 8-byte accesses (ldr/str x, a d register) whole;
- * the registers are 32-bit, so an 8-byte access is two of them. */
-static uint64_t ohci_read_a64(void *dev, uint32_t off, int size)
+#if defined(OHCI_TRAP_POSIX_A64) || defined(OHCI_TRAP_WIN32)
+/* Both decoders hand over 8-byte accesses whole (ldr/str x or a d register
+ * on A64, a REX.W mov on x86-64); the registers are 32-bit, so an 8-byte
+ * access is two of them. */
+static uint64_t ohci_read_split(void *dev, uint32_t off, int size)
 {
     if (size == 8)
         return ohci_read(dev, off, 4) | (ohci_read(dev, off + 4, 4) << 32);
     return ohci_read(dev, off, size);
 }
 
-static void ohci_write_a64(void *dev, uint32_t off, uint64_t val, int size)
+static void ohci_write_split(void *dev, uint32_t off, uint64_t val, int size)
 {
     if (size == 8) {
         ohci_write(dev, off, (uint32_t)val, 4);
@@ -1460,7 +1461,8 @@ int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
     if (!hc)
         return 0;
     ok = mmio_emulate_a64(uc, xbox_va - hc->base, hc,
-                          ohci_read_a64, ohci_write_a64);
+                          ohci_read_split, ohci_write_split);
+    /* stdio in a signal handler, deliberately: see apu_mmio_hook.c. */
     if (!ok && hc->decode_fail++ < 20) {
         fprintf(stderr, "  [OHCI%d] undecoded access at +0x%03X: insn %08X\n",
                 hc->index, xbox_va - hc->base,
@@ -1475,7 +1477,7 @@ int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
     if (!hc)
         return 0;
     ok = mmio_emulate((PCONTEXT)ctx, xbox_va - hc->base, hc,
-                      ohci_read, ohci_write);
+                      ohci_read_split, ohci_write_split);
     if (!ok && hc->decode_fail++ < 20) {
         const uint8_t *ip = (const uint8_t *)((PCONTEXT)ctx)->Rip;
         fprintf(stderr, "  [OHCI%d] undecoded access at +0x%03X: "

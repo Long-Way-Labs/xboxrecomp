@@ -13,6 +13,8 @@
 #include "recomp_env.h"
 
 #include <math.h>
+
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -154,7 +156,7 @@ static void voice_trace_case(void)
     snprintf(path, sizeof(path), "apu_monitor_trace_%s.txt",
              g_mode);
     fflush(stderr);
-    if (!freopen("apu_monitor_trace.txt", "w", stderr)) { failures++; return; }
+    if (!freopen(path, "w", stderr)) { failures++; return; }
     for (int fr = 0; fr < 120; fr++) {
         memset(mixbins, 0, sizeof(mixbins));
         mcpx_apu_vp_frame(d, mixbins);
@@ -164,7 +166,7 @@ static void voice_trace_case(void)
     mcpx_apu_vp_trace_flush();
     fflush(stderr);
 
-    f = fopen("apu_monitor_trace.txt", "r");
+    f = fopen(path, "r");
     while (f && fgets(line, sizeof line, f))
         if (n < 4 && sscanf(line, "[APU] voice %u pos=%u/%u", &v, &pos[n], &len[n]) == 3
                 && v == 0)
@@ -441,6 +443,7 @@ static void pacing_case(void)
         }
         d->ep_frame_div = 7;
         mcpx_apu_monitor_frame(d);
+        mcpx_apu_pace_rendered(d);
         seq += PERIOD;
         periods++;
         if (now >= stall_from && now < stall_from + stall_us)
@@ -466,6 +469,160 @@ static void pacing_case(void)
           && dev_tail == 1000ull * PERIOD);
     CHECK("runs at the device rate (1000 periods ~ 5.33 s)",
           now > 5200000 + stall_us - 100000 && now < 5500000 + stall_us);
+    dev_model = 0;
+    free(d);
+}
+
+/* ---- the frame loop around the pacer ----
+ * One frame-thread pass at a period boundary, as mcpx_apu_frame_thread runs
+ * it: throttle (pace_step until it says go), then, unless the front end is
+ * trapped, render and submit a period and charge it (pace_rendered). A
+ * trapped pass renders nothing, charges nothing and waits a millisecond. Sample k of the stream carries k (as the fake checks)
+ * counted from what the device was given, so dropped periods are not gaps. */
+struct loop_stats {
+    int periods, submits, underruns, minq, maxq;
+    int trapped_passes, trapped_charges;
+};
+
+static void consume(int64_t now, int64_t stall_from, int64_t stall_us,
+                    struct loop_stats *st)
+{
+    uint64_t c = sim_consumed_at(now, stall_from, stall_us, NULL);
+    if (c > dev_tail) {                      /* ran dry: plays silence */
+        st->underruns++;
+        dev_head = dev_tail;
+    } else {
+        dev_head = c > dev_head ? c : dev_head;
+    }
+}
+
+static int64_t loop_pass(MCPXAPUState *d, int64_t now, int64_t stall_from,
+                         int64_t stall_us, struct loop_stats *st)
+{
+    bool trapped = (d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) != 0;
+    int64_t sched = d->next_frame_time_us;
+
+    d->ep_frame_div = 0;
+    for (;;) {                               /* throttle */
+        consume(now, stall_from, stall_us, st);
+        int64_t w = mcpx_apu_pace_step(d, now);
+        if (w <= 0) break;
+        now += w;
+    }
+    if (trapped) {
+        st->trapped_passes++;
+        if (d->next_frame_time_us != sched)
+            st->trapped_charges++;
+        return now + 1000;
+    }
+    int tail0 = (int)dev_tail;
+    for (int i = 0; i < PERIOD; i++) {
+        uint64_t k = dev_tail + (uint64_t)i;
+        d->monitor.frame_buf[i][0] = (int16_t)(k & 0x7FFF);
+        d->monitor.frame_buf[i][1] = (int16_t)(uint16_t)(k >> 15);
+    }
+    d->ep_frame_div = 7;
+    mcpx_apu_monitor_frame(d);
+    mcpx_apu_pace_rendered(d);
+    st->periods++;
+    if ((int)dev_tail != tail0)
+        st->submits++;
+    return now;
+}
+
+static MCPXAPUState *loop_device(void)
+{
+    MCPXAPUState *d = (MCPXAPUState *)calloc(1, sizeof(*d));
+    if (!d) return NULL;
+    d->monitor.queued_bytes_low  = 4 * PERIOD * 4;   /* granules, as above */
+    d->monitor.queued_bytes_high = 8 * PERIOD * 4;
+    /* XCNTMODE on, front end free running. */
+    d->regs[NV_PAPU_SECTL] = 1u << 3;
+    dev_model = 1; dev_tail = dev_head = 0; dev_seq_errors = 0;
+    return d;
+}
+
+/* A trap that starts on a period boundary must not spend pacing credit:
+ * the trapped loop passes once a millisecond, and each pass used to advance
+ * the schedule a whole period, so the lead the queue had built drained
+ * after the trap. Here a 10 ms trap begins at a boundary every 60 ms. */
+static void trapped_case(void)
+{
+    MCPXAPUState *d = loop_device();
+    struct loop_stats st = { 0, 0, 0, 1 << 30, 0, 0, 0 };
+    int64_t now = 0, trap_end = 0, next_trap = 500000;
+
+    if (!d) { failures++; return; }
+    while (now < 4000000) {
+        if (!trap_end && now >= next_trap) {
+            d->regs[NV_PAPU_FECTL] |= NV_PAPU_FECTL_FEMETHMODE_TRAPPED;
+            trap_end = now + 10000;
+        } else if (trap_end && now >= trap_end) {
+            d->regs[NV_PAPU_FECTL] &= ~NV_PAPU_FECTL_FEMETHMODE_TRAPPED;
+            trap_end = 0;
+            next_trap = now + 60000;
+        }
+        now = loop_pass(d, now, 1LL << 60, 0, &st);
+        if (now > 300000) {
+            int q = xa2_queued_samples() / PERIOD;
+            if (q < st.minq) st.minq = q;
+            if (q > st.maxq) st.maxq = q;
+        }
+    }
+    printf("trapped: %d periods, %d trapped passes, %d charged, queue %d..%d,"
+           " %d underruns\n", st.periods, st.trapped_passes,
+           st.trapped_charges, st.minq, st.maxq, st.underruns);
+    CHECK("traps happened", st.trapped_passes > 100);
+    CHECK("a trapped pass spends no pacing credit", st.trapped_charges == 0);
+    CHECK("queue never drains across a trap", st.underruns <= 1 && st.minq >= 1);
+    CHECK("no sample dropped or duplicated", dev_seq_errors == 0);
+    dev_model = 0;
+    free(d);
+}
+
+/* A device that stops consuming for good must not stop the APU clock: after
+ * the queue has sat at high for 200 ms the host clock paces, periods are
+ * dropped rather than queued, and when the device drains again the queue
+ * paces once more. Here the device stops at 2 s and resumes at 3 s. */
+static void stall_fallback_case(void)
+{
+    MCPXAPUState *d = loop_device();
+    struct loop_stats st = { 0, 0, 0, 1 << 30, 0, 0, 0 };
+    const int64_t stall_from = 2000000, stall_us = 1000000;
+    int64_t now = 0;
+    int in_stall_periods = 0, in_stall_submits = 0, after_underruns = 0;
+    int periods0, submits0, underruns0, max_q = 0;
+
+    if (!d) { failures++; return; }
+    while (now < 5000000) {
+        periods0 = st.periods; submits0 = st.submits; underruns0 = st.underruns;
+        int64_t t = now;
+        now = loop_pass(d, now, stall_from, stall_us, &st);
+        if (t >= stall_from + 250000 && now < stall_from + stall_us) {
+            in_stall_periods += st.periods - periods0;
+            in_stall_submits += st.submits - submits0;
+        }
+        if (t >= stall_from + stall_us)
+            after_underruns += st.underruns - underruns0;
+        if (t >= stall_from + stall_us + 300000) {
+            int q = xa2_queued_samples() / PERIOD;
+            if (q < st.minq) st.minq = q;
+            if (q > st.maxq) st.maxq = q;
+        }
+        if (xa2_queued_samples() / PERIOD > max_q)
+            max_q = xa2_queued_samples() / PERIOD;
+    }
+    printf("stall fallback: %d periods rendered and %d submitted in the last"
+           " 750 ms of a 1 s stall; after it queue %d..%d, %d underruns;"
+           " queue %d at most\n", in_stall_periods, in_stall_submits,
+           st.minq, st.maxq, after_underruns, max_q);
+    CHECK("stalled device: the clock keeps running (~140 periods)",
+          in_stall_periods > 120 && in_stall_periods < 160);
+    CHECK("stalled device: periods are dropped, not queued", in_stall_submits == 0);
+    CHECK("queue never grows past high + one period", max_q <= 9);
+    CHECK("device back: the queue paces again", st.minq >= 4 && st.maxq <= 8);
+    CHECK("device back: no underrun", after_underruns == 0);
+    CHECK("no sample dropped or duplicated", dev_seq_errors == 0);
     dev_model = 0;
     free(d);
 }
@@ -553,6 +710,8 @@ int main(int argc, char **argv)
 
     free(d);
     pacing_case();
+    trapped_case();
+    stall_fallback_case();
     starve_case();
     switch_case();
     voice_trace_case();                      /* last: they redirect stderr */

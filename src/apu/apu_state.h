@@ -490,11 +490,19 @@ struct MCPXAPUState {
 
     uint32_t regs[0x20000];
 
+    /* The sequencer's sample counter (what XGSCNT reads back). Resets when
+     * the title writes XGSCNT; advances 48 kHz while the sequencer runs. */
+    uint64_t sample_count;
+
     int ep_frame_div;
     int sleep_acc_us;
     int frame_count;
     int64_t frame_count_time_ms;
     int64_t next_frame_time_us;
+    int pace_q_seen;            /* device queue at the last pacing decision */
+    int64_t pace_drain_us;      /* when that queue last fell or sat below high */
+    bool pace_stalled;          /* device stopped consuming: host-clock pacing,
+                                 * periods dropped (mcpx_apu_pace_step) */
 
     struct {
         struct {
@@ -536,6 +544,7 @@ void mcpx_apu_dsp_finalize(MCPXAPUState *d);
 void mcpx_apu_update_dsp_preference(MCPXAPUState *d);
 void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
 void mcpx_apu_dsp_ack_poll(MCPXAPUState *d);
+void mcpx_apu_dsp_gprst_write(uint32_t val);
 
 /* Monitor (host output): call after each 32-sample frame; on the last frame
  * of an EP period it adds the software mixer and test tone to frame_buf and
@@ -545,6 +554,9 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d);
 /* Frame-thread pacing at an EP-period boundary: 0 = render the next period
  * now, else microseconds to wait before asking again. See apu_core.c. */
 int64_t mcpx_apu_pace_step(MCPXAPUState *d, int64_t now_us);
+/* The period pace_step admitted was rendered: spend its credit. A pass that
+ * renders nothing (front end trapped) spends none. */
+void mcpx_apu_pace_rendered(MCPXAPUState *d);
 
 /* Host starvation accounting (RECOMP_AUDIO_HOST; see apu_core.c). The
  * deficit is the wall clock since the baseline, in samples, less what the

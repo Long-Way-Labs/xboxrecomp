@@ -274,6 +274,7 @@ uint64_t xa2_samples_played(void)
 
 #else /* !_WIN32: apu_sdl2.c implements the same contract over SDL2 */
 
+/* ISO C wants at least one declaration in a translation unit. */
 typedef int apu_xaudio2_posix_unused;
 
 #endif /* _WIN32 */

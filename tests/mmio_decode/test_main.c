@@ -199,7 +199,7 @@ int main(void)
     { const uint8_t c3[] = { 0x89, 0x0C, 0x18 };
       CHECK("SIB handled", run(c3, sizeof c3, &ctx)); }
 
-    /* --- The ALU and TEST-immediate forms (audio task 2.5) --- */
+    /* --- The ALU and TEST-immediate forms --- */
 
     /* test dword [rsi+rax+0xFE1FF0], 0x00100000 -- F7 84 06 F0 1F FE 00 00 10
      * 00: ModRM, SIB, disp32 and imm32 in one, the exact instruction DirectSound
@@ -264,6 +264,16 @@ int main(void)
       CHECK("add r32,m32 handled", run_rd(c, sizeof c, &ctx, 0x10));
       CHECK_U64("add r32 result zero-extends", ctx.Rcx, 0x11);
       CHECK("add r,m never writes", dev.reads == 1 && dev.writes == 0); }
+
+    /* and edx, [rax+rcx] -- 23 14 08: a USB driver masks a status register
+     * into a register this way. SIB, register destination, no write. */
+    { const uint8_t c[] = { 0x23, 0x14, 0x08 };
+      ctx.Rdx = 0xFFFFFFFF000000F0ULL;
+      CHECK("and r32,m32 handled", run_rd(c, sizeof c, &ctx, 0x30));
+      CHECK_U64("and r32 result zero-extends", ctx.Rdx, 0x30);
+      CHECK("and r,m never writes", dev.reads == 1 && dev.writes == 0);
+      run_rd(c, sizeof c, &ctx, 0x0F);
+      CHECK("and r,m zero -> ZF", (ctx.EFlags & 0x40) != 0); }
 
     /* cmp ecx, [rax] -- 3B 08: leaves the register alone. */
     { const uint8_t c[] = { 0x3B, 0x08 };

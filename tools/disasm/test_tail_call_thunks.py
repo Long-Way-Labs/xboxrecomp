@@ -1,17 +1,11 @@
-"""Two ways a function only ever exists as a value.
+"""An immediate naming a body that ends in a tail jump rather than a ret.
 
-1. An immediate naming a body that ends in a tail jump rather than a ret.
-   Every C++ EH handler thunk is `mov eax, <FuncInfo>; jmp __CxxFrameHandler`,
-   and the function's SEH prologue pushes its address. The imm-ref pass asked
-   for a ret and refused them. A tail jump to the exact start of a known
-   function is now accepted. A jump that lands anywhere else is not.
-
-2. A code pointer in a data table whose function needs more than 64
-   instructions to reach its first terminator. The data-pointer pass capped
-   its walk at 64, because a long walk through junk finds a jmp eventually.
-   The cap is raised only when there is more evidence: a known function start
-   beside the pointer in its table, and a ret, tail jmp or int3 right in front
-   of the target.
+Every C++ EH handler thunk is `mov eax, <FuncInfo>; jmp __CxxFrameHandler`,
+and the function's SEH prologue pushes its address. The imm-ref pass took a
+closed callback body, a vcall thunk, or a target that is itself a jmp, and
+refused these: the jmp is the second instruction. A straight-line body that
+tail-jumps to the exact start of a known function is now accepted. A jump
+that lands anywhere else is not, nor is a walk that started in int3 padding.
 
 Fixtures are synthetic: hand-assembled bytes, no game data.
 """
@@ -130,60 +124,3 @@ def test_an_immediate_naming_padding_before_a_thunk_is_refused():
     det = _detect(code)
     assert named not in det.functions
 
-
-# --- 2. data-table pointers that need a long probe ----------------------------
-
-LONG = 70           # instructions before the first terminator: over 64
-
-
-def _table_image(neighbour=True, after=b""):
-    """
-        TEXT+0x00: call KNOWN ; ret                    makes KNOWN a function
-        TEXT+0x10: KNOWN: xor eax, eax ; ret
-        TEXT+0x13: <after>                             nothing, or a nop
-        TARGET:    inc eax x LONG ; ret
-        .data:     KNOWN, TARGET, 0, 0x28              a handler record
-    TARGET opens with `inc eax`, which is no prologue the gap pass knows.
-    """
-    known = TEXT + 0x10
-    code = b"\xe8" + struct.pack("<i", known - (TEXT + 5)) + b"\xc3"
-    code += b"\x90" * (0x10 - len(code))
-    code += b"\x31\xc0\xc3" + after
-    target = TEXT + len(code)
-    code += b"\x40" * LONG + b"\xc3" + b"\xcc" * 16
-    first = known if neighbour else 0x7
-    data = struct.pack("<IIII", first, target, 0, 0x28)
-    return code, data, target
-
-
-def test_a_long_handler_beside_a_known_function_is_found():
-    code, data, target = _table_image()
-    det = _detect(code, data)
-    assert target in det.functions, sorted(hex(a) for a in det.functions)
-
-
-def test_without_a_known_neighbour_the_cap_stays():
-    code, data, target = _table_image(neighbour=False)
-    det = _detect(code, data)
-    assert target not in det.functions
-
-
-def test_without_a_boundary_in_front_the_cap_stays():
-    # A data word that lands in zero-filled or table bytes inside a code
-    # section has no ret in front of it. Same neighbour, same body.
-    code, data, target = _table_image(after=b"\x90")
-    det = _detect(code, data)
-    assert target not in det.functions
-
-
-def test_a_short_handler_needs_no_context():
-    # Pre-existing behaviour: within 64 instructions, no neighbour needed.
-    known = TEXT + 0x10
-    code = b"\xe8" + struct.pack("<i", known - (TEXT + 5)) + b"\xc3"
-    code += b"\x90" * (0x10 - len(code))
-    code += b"\x31\xc0\xc3"
-    target = TEXT + len(code)
-    code += b"\x40" * 8 + b"\xc3" + b"\xcc" * 16
-    data = struct.pack("<IIII", 0x7, target, 0, 0x28)
-    det = _detect(code, data)
-    assert target in det.functions

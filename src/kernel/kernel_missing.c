@@ -7,12 +7,12 @@
  * a loose-file layout it never shipped. On one title every one of those is a
  * [FILE] ... FAILED line on a complete dump. So a miss is only a read-only
  * FILE_OPEN of a file, by absolute name, in the game-files tree -- and it is
- * "high confidence" only when the directory it should be in exists. In the
- * missing-assets spike (ten runs with files removed) that split named exactly
- * the removed files and put every probe in the low bucket.
+ * "high confidence" only when the directory it should be in exists. In runs
+ * with files removed from a dump, that split named exactly the removed files
+ * and put every probe in the low bucket.
  *
  * Repeats. A looping stream re-opens its missing file every loop (97 FAILED
- * lines in 100 s in the spike). Once a path has its "[FILE] missing" line,
+ * lines in 100 s on one title). Once a path has its "[FILE] missing" line,
  * the bridge asks xbox_missing_is_reported before printing FAILED again and
  * leaves it out; the summary counts what was left out. Verbose prints every
  * attempt, and off prints exactly what it did before this report existed.
@@ -53,7 +53,7 @@ static SRWLOCK      s_lock = SRWLOCK_INIT;
 /* Lock-free counters: the watchdog and the crash handler read them while the
  * thread they report on may be inside the lock. */
 static volatile LONG s_high, s_low, s_other, s_probe;
-static volatile LONG s_attempts;    /* failed game-tree opens, D1 1-7 */
+static volatile LONG s_attempts;    /* failed game-tree opens */
 static volatile LONG s_repeats;     /* FAILED lines left out */
 static volatile LONG s_unnamed;     /* misses past the table */
 static volatile LONG s_cap_said, s_summary_done, s_list_done, s_atexit_set;

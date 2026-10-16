@@ -123,9 +123,9 @@ static DWORD xbox_share_to_win32(ULONG Share)
  * An overwrite open (FILE_SUPERSEDE, FILE_OVERWRITE, FILE_OVERWRITE_IF) of an
  * existing file sets its size to 0 on FATX, but FATX keeps no valid-data
  * length, so a later SetEndOfFile that grows the file brings back the bytes
- * already on disk. A utility-drive texture cache can depend on it: it writes x.tmp,
- * reopens it with CREATE_ALWAYS, only sets the end of file to the true size,
- * and renames it to x.dat. CREATE_ALWAYS / TRUNCATE_EXISTING on NTFS (and
+ * already on disk. A title's z: texture cache can depend on it: it writes
+ * x.tmp, reopens it with CREATE_ALWAYS, only sets the end of file to the true
+ * size, and renames it to x.dat. CREATE_ALWAYS / TRUNCATE_EXISTING on NTFS (and
  * Wine's ftruncate) zero-fill on the regrow, so every cache file came out as
  * zeros of the right length.
  *
@@ -304,15 +304,24 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         if (defer) {
             h = CreateFileW(win_path, access, xbox_share_to_win32(ShareAccess),
                 NULL, OPEN_EXISTING, flags_and_attrs, NULL);
+            if (h != INVALID_HANDLE_VALUE)
+                overwrite_take(h);          /* a stale mark; see below */
             if (h != INVALID_HANDLE_VALUE && !overwrite_mark(h))
                 truncate_to_zero(h);        /* no slot to defer in */
             else if (h != INVALID_HANDLE_VALUE)
                 XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile: overwrite of %S deferred", win_path);
         }
-        if (h == INVALID_HANDLE_VALUE)      /* not deferred, or it vanished */
+        if (h == INVALID_HANDLE_VALUE) {    /* not deferred, or it vanished */
             h = CreateFileW(win_path, access,
                 xbox_share_to_win32(ShareAccess), NULL,
                 xbox_disposition_to_win32(CreateDisposition), flags_and_attrs, NULL);
+            /* A HANDLE value is reused once closed, and a pending handle
+             * closed by DuplicateHandle(DUPLICATE_CLOSE_SOURCE) never went
+             * through xbox_NtClose, so its mark may still be in the table.
+             * Clear it, or this unrelated file is truncated on first use. */
+            if (h != INVALID_HANDLE_VALUE)
+                overwrite_take(h);
+        }
     }
 
     if (h == INVALID_HANDLE_VALUE) {
@@ -879,8 +888,8 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
 
 /* Rename an open file. See the POSIX version for the cases; this one asks
  * the handle to do it (FileRenameInfo), which needs DELETE access, and falls
- * back to MoveFileExW on the path the handle names.
- * ponytail: untested on a Windows host. */
+ * back to MoveFileExW on the path the handle names. Tested under Proton
+ * only. */
 NTSTATUS __stdcall xbox_RenameFileByHandle(
     HANDLE FileHandle, PXBOX_OBJECT_ATTRIBUTES NewName, BOOLEAN ReplaceIfExists)
 {
@@ -971,7 +980,7 @@ static int posix_open_flags(ACCESS_MASK access, ULONG disposition)
  * An overwrite open (FILE_SUPERSEDE, FILE_OVERWRITE, FILE_OVERWRITE_IF) of an
  * existing file sets its size to 0 on FATX, but FATX keeps no valid-data
  * length: growing the file again with SetEndOfFile, without writing, brings
- * back the bytes already on disk. A title can rely on this to build a
+ * back the bytes already on disk. A title can rely on this when it builds a
  * utility-drive texture cache:
  *
  *   CreateFile(x.tmp, CREATE_ALWAYS, NO_BUFFERING|OVERLAPPED)
@@ -1115,7 +1124,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         if (defer)
             flags &= ~O_TRUNC;
         fd = open(host_path, flags, 0644);
-            if (fd >= 0 && fd < FATX_PENDING_MAX)
+        if (fd >= 0 && fd < FATX_PENDING_MAX)
             s_overwrite_pending[fd] = (unsigned char)defer;
         else if (fd >= 0 && defer && ftruncate(fd, 0) != 0) {
             /* no slot to defer in: truncate now */
@@ -1354,14 +1363,9 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             return STATUS_SUCCESS;
         }
         case XboxFileAllocationInformation: {
-            /* Reserve space before writing. The Win32 backend has handled this
-             * since Halo's save path needed it; POSIX fell through to
-             * STATUS_NOT_IMPLEMENTED. Titles call it on
-             * a z:\ .tmp file as they copy textures into the
-             * utility-drive cache. (That
-             * failure was not what stopped it there -- the D3DX JPEG loader's
-             * setjmp was, see translator._func_has_offset_frame -- but the
-             * call should succeed as it does on Win32.)
+            /* Reserve space before writing. The Win32 backend already handles
+             * this; POSIX fell through to STATUS_NOT_IMPLEMENTED. A title calls it as it copies textures
+             * into the utility-drive cache.
              *
              * NT semantics: an allocation below the end of file truncates to
              * it; one above only reserves space and leaves the size alone.
@@ -1407,10 +1411,9 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
 
 /* Rename an open file (NtSetInformationFile, FileRenameInformation).
  *
- * A title may build each utility-drive texture cache as z:\...\name.tmp,
- * rename it to its final name (a game archive file, name.dat here), and
- * later open that. With this class unimplemented the rename failed, so
- * every open of the final name failed with
+ * A title can build each utility-drive cache file as z:\...\name.tmp, then
+ * rename it to name.dat and later open the .dat. With this class
+ * unimplemented the rename failed, so every .dat open failed with
  * STATUS_OBJECT_NAME_NOT_FOUND and the title rebuilt the cache instead.
  *
  * The new name is resolved the way NT does:

@@ -2,8 +2,8 @@
  *
  * Here the contiguous window and RAM below 64 MB are separate storage, and the
  * heap's physical numbers (MmGetPhysicalAddress is the identity outside the
- * window) overlap the numbers the window arena hands out. Burnout 3 loads its
- * sound effects into the heap and gives DirectSound those physical numbers;
+ * window) overlap the numbers the window arena hands out. A title that loads
+ * its sound effects into the heap gives DirectSound those physical numbers;
  * the APU used to resolve every page the arena had allocated to the window,
  * and played whatever the window held there as the effect.
  *

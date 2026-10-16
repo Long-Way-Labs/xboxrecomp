@@ -135,6 +135,11 @@ int xa2_init(void)
         fprintf(stderr, "[SDL2] device buffer is %d samples (asked %d)\n",
                 have.samples, g_buf_samples);
         g_buf_samples = have.samples;
+        /* The queue marks and the pacer's stall window assume buffers no
+         * larger than the env limit. A driver that grants more is still
+         * fed, against marks sized for the limit, and may underrun. */
+        if (g_buf_samples > SDLA_BUF_SAMPLES_MAX)
+            g_buf_samples = SDLA_BUF_SAMPLES_MAX;
     }
 
     g_frames_written = 0;

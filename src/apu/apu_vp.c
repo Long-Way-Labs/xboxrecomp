@@ -21,6 +21,7 @@
 
 #include "apu_state.h"
 #include "recomp_env.h"
+#include "apu.h"
 #include "fpconv.h"
 #include <stdarg.h>
 
@@ -845,6 +846,7 @@ static int s_vstat_on = -1;
 static int s_vdump_voice = -1;      /* -2: every voice, one file each */
 static FILE *s_vdump;
 static FILE *s_vdump_all[MCPX_HW_MAX_VOICES];
+static uint8_t s_vdump_failed[MCPX_HW_MAX_VOICES]; /* open failed: no retry */
 static char s_vdump_prefix[512];
 static unsigned s_vstat_frames, s_vstat_secs;
 
@@ -873,8 +875,8 @@ static void vp_stat_init(void)
     }
 }
 
-static void vp_stat_samples(MCPXAPUState *d, uint32_t v, const float samples[][2],
-                            int n, hwaddr first_addr, uint32_t fmt)
+static void vp_stat_samples(uint32_t v, const float samples[][2], int n,
+                            hwaddr first_addr, uint32_t fmt)
 {
     struct VpVoiceStat *s = &s_vstat[v];
     if (s_vstat_on < 0) vp_stat_init();
@@ -892,16 +894,20 @@ static void vp_stat_samples(MCPXAPUState *d, uint32_t v, const float samples[][2
         s->last = x;
     }
     s->frames += (uint32_t)n;
-    if (s_vdump_voice == -2 && !s_vdump_all[v]) {
+    if (s_vdump_voice == -2 && !s_vdump_all[v] && !s_vdump_failed[v]) {
         char name[600];
         snprintf(name, sizeof(name), "%s.%u.raw", s_vdump_prefix, (unsigned)v);
         s_vdump_all[v] = fopen(name, "wb");
+        s_vdump_failed[v] = s_vdump_all[v] == NULL;
     }
     {
         FILE *df = s_vdump_voice == -2 ? s_vdump_all[v]
                  : (int)v == s_vdump_voice ? s_vdump : NULL;
         int16_t out[NUM_SAMPLES_PER_FRAME * 2];
-        for (int i = 0; df && i < n && i < NUM_SAMPLES_PER_FRAME; i++) {
+        int m = n < NUM_SAMPLES_PER_FRAME ? n : NUM_SAMPLES_PER_FRAME;
+        if (!df)
+            return;
+        for (int i = 0; i < m; i++) {
             for (int c = 0; c < 2; c++) {
                 float x = samples[i][c] * 32767.0f;
                 if (x > 32767.0f) x = 32767.0f;
@@ -909,16 +915,20 @@ static void vp_stat_samples(MCPXAPUState *d, uint32_t v, const float samples[][2
                 out[2 * i + c] = (int16_t)x;
             }
         }
-        if (df)
-            fwrite(out, sizeof(int16_t) * 2, (size_t)(n < NUM_SAMPLES_PER_FRAME ? n : NUM_SAMPLES_PER_FRAME), df);
+        fwrite(out, sizeof(int16_t) * 2, (size_t)m, df);
     }
-    (void)d;
 }
 
 static void vp_stat_report(void)
 {
-    if (s_vstat_on <= 0) return;
+    if (s_vstat_on <= 0 && s_vdump_voice == -1) return;
     if (++s_vstat_frames % 1500) return;
+    /* Flush the dumps once a second, trace or not: a watchdog _exit or a
+     * crash skips the stdio buffers. */
+    if (s_vdump) fflush(s_vdump);
+    for (unsigned v = 0; v < MCPX_HW_MAX_VOICES; v++)
+        if (s_vdump_all[v]) fflush(s_vdump_all[v]);
+    if (s_vstat_on <= 0) return;
     s_vstat_secs++;
     for (unsigned v = 0; v < MCPX_HW_MAX_VOICES; v++) {
         struct VpVoiceStat *s = &s_vstat[v];
@@ -937,9 +947,6 @@ static void vp_stat_report(void)
                 sqrt(s->sq / s->frames) * 32768.0, (double)s->zc / s->frames);
         s->frames = 0; s->zc = 0; s->sq = 0;
     }
-    if (s_vdump) fflush(s_vdump);
-    for (unsigned v = 0; v < MCPX_HW_MAX_VOICES; v++)
-        if (s_vdump_all[v]) fflush(s_vdump_all[v]);
 }
 
 /* ============================================================
@@ -1257,7 +1264,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
     hwaddr stat_addr = 0;
     for (; (sample_count < num_samples_requested) && (cbo <= ebo);
          sample_count++, cbo++) {
-        if (sample_count == 0) {
+        if (sample_count == 0 && s_vstat_on != 0) {
             uint32_t lin = adpcm ? (cbo / ADPCM_SAMPLES_PER_BLOCK) * (uint32_t)block_size
                                  : cbo * (uint32_t)block_size;
             stat_addr = stream ? segment_offset + lin
@@ -1339,7 +1346,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         }
     }
 
-    vp_stat_samples(d, v, samples, sample_count, stat_addr,
+    vp_stat_samples(v, samples, sample_count, stat_addr,
                     voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_CFG_FMT,
                                    0xFFFFFFFF));
     if (!stream && loop && !adpcm && sample_count > 0)
@@ -1410,6 +1417,9 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
 
     if (!f->rs_have) {
         got = voice_get_samples(d, v, src, 2);
+        /* A first fetch that gets one sample returns no output and drops
+         * that sample: the next call fetches two afresh. A voice whose
+         * stream starts one sample at a time loses its first sample. */
         if (got < 2) return got < 0 ? got : 0;
         f->rs_last[0] = src[0][0]; f->rs_last[1] = src[0][1];
         f->rs_next[0] = src[1][0]; f->rs_next[1] = src[1][1];
@@ -1423,9 +1433,10 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
      * output's own step is left pending in rs_pos for the next call, so
      * nothing fetched here goes unused -- fetching floor(rs_pos + n * step)
      * instead over-read by up to one sample a frame, which was dropped: the
-     * music came out 3 % fast. A rate far below 1 (a deep pitch bend) would
-     * want more than the buffer holds; make fewer outputs rather than lose
-     * source. */
+     * music came out 3 % fast. A step above about 4.2 (rate below 0.24, a
+     * voice pitched more than two octaves up) wants more than the 130-frame
+     * buffer holds over 31 steps; make fewer outputs rather than lose
+     * source, so such a voice comes out short (and late) each frame. */
     for (;;) {
         need = (int)floorf(f->rs_pos + (float)(requested_num - 1) * step);
         if (need <= max_src || requested_num <= 1) break;
@@ -1588,10 +1599,12 @@ static void voice_process(MCPXAPUState *d,
         dbg->bin[i] = (uint8_t)bin[i];
         dbg->vol[i] = vol[i];
     }
-    s_vstat[v].ea = ea_value;
-    s_vstat[v].rate = rate;
-    s_vstat[v].vol0 = vol[0]; s_vstat[v].vol1 = vol[1];
-    s_vstat[v].bin0 = (uint8_t)bin[0]; s_vstat[v].bin1 = (uint8_t)bin[1];
+    if (s_vstat_on > 0) {
+        s_vstat[v].ea = ea_value;
+        s_vstat[v].rate = rate;
+        s_vstat[v].vol0 = vol[0]; s_vstat[v].vol1 = vol[1];
+        s_vstat[v].bin0 = (uint8_t)bin[0]; s_vstat[v].bin1 = (uint8_t)bin[1];
+    }
 
     if (voice_should_mute(v)) return;
 
@@ -1789,6 +1802,7 @@ void mcpx_apu_vp_finalize(MCPXAPUState *d)
         free(s_ring[v]);
         s_ring[v] = NULL;
     }
+    memset(s_vdump_failed, 0, sizeof(s_vdump_failed));
     memset(s_vstat, 0, sizeof(s_vstat));
     s_vstat_on = -1;
     s_vdump_voice = -1;

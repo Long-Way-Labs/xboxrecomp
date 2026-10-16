@@ -12,6 +12,9 @@
  * 4. Set memory protection (read-only for .rdata)
  */
 
+#if !defined(_WIN32) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE   /* glibc declares dladdr/Dl_info (RECOMP_WATCH) only under it */
+#endif
 #include "xbox_memory_layout.h"
 #include "recomp_env.h"
 #include "kernel.h"
@@ -165,7 +168,7 @@ static HANDLE g_contig_mapping = NULL;
  * (VirtualAlloc2), both with MEM_REPLACE_PLACEHOLDER. Nothing else in the
  * process can be placed inside the window in between. One exception, opt-in:
  * under RECOMP_EXT_VMA the range above the mirrors is released outright for
- * upstream's guest_vmem, which reserves it with a plain VirtualAlloc. Another
+ * guest_vmem, which reserves it with a plain VirtualAlloc. Another
  * thread could take it in that gap; guest_vmem then reports the reservation
  * failed and stays off, which is detectable, not corrupting.
  *
@@ -263,7 +266,7 @@ static void win_settle_placeholders(void)
 }
 #endif /* _WIN32 */
 
-/* RECOMP_EXT_VMA (upstream guest_vmem): the guest range from the top of the
+/* RECOMP_EXT_VMA (guest_vmem): the guest range from the top of the
  * RAM mirrors to GUEST_VMEM_TOP, or 0 when the switch is off or the mirrors
  * already reach past it. Only when this is non-zero does the layout below
  * differ from the stock one. */
@@ -657,13 +660,10 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-/* Arm the trap. Called once the MCPX aperture exists, and only alongside the
- * rest of RECOMP_AC97_READY: a title that never gets as far as resetting a
- * channel has nothing to gain from it, and the page fault costs something. */
 #if !defined(_WIN32) && defined(__aarch64__)
 #include "../platform/mmio_decode_a64.h"
-#include <unistd.h>
 #include <sys/mman.h>
+#include <unistd.h>
 static size_t g_ac97_hsize;    /* host page: 16 KB on arm64 Darwin */
 
 static uint64_t ac97_posix_rd(void *dev, uint32_t off, int size)
@@ -679,10 +679,11 @@ static void ac97_posix_wr(void *dev, uint32_t off, uint64_t v, int size)
 }
 
 /* POSIX arm64 half of the AC'97 write trap: the page is PROT_READ, so a
- * write arrives as SIGBUS; the game target's handler calls this before
- * reporting. The store is emulated onto the page (open for the moment),
- * the controller's reaction applied, and the page closed again. Returns 1
- * when the fault was this trap and the access was serviced. */
+ * write arrives as SIGBUS/SIGSEGV; the title's fault handler reaches this
+ * through xbox_PosixMmioFault before reporting. The store is emulated onto
+ * the page (open for the moment), the controller's reaction applied, and the
+ * page closed again. Returns 1 when the fault was this trap and the access
+ * was serviced. */
 static volatile int g_ac97_posix_lock;
 
 int xbox_Ac97PosixFault(void *ucv, uintptr_t fault)
@@ -703,7 +704,12 @@ int xbox_Ac97PosixFault(void *ucv, uintptr_t fault)
      * DirectSound's single-threaded init never does. */
     while (__atomic_exchange_n(&g_ac97_posix_lock, 1, __ATOMIC_ACQUIRE))
         ;
-    mprotect(g_ac97_page, g_ac97_hsize, PROT_READ | PROT_WRITE);
+    /* Not opened: the emulated store would fault again on this thread,
+     * which holds the lock it would then spin on. Let it be reported. */
+    if (mprotect(g_ac97_page, g_ac97_hsize, PROT_READ | PROT_WRITE) != 0) {
+        __atomic_store_n(&g_ac97_posix_lock, 0, __ATOMIC_RELEASE);
+        return 0;
+    }
     ok = mmio_emulate_a64((ucontext_t *)ucv, (uint32_t)(fault - (uintptr_t)g_ac97_page),
                           g_ac97_page, ac97_posix_rd, ac97_posix_wr);
     if (ok)
@@ -714,12 +720,23 @@ int xbox_Ac97PosixFault(void *ucv, uintptr_t fault)
 }
 #endif
 
+/* Arm the trap. Called once the MCPX aperture exists, and only alongside the
+ * rest of RECOMP_AC97_READY: a title that never gets as far as resetting a
+ * channel has nothing to gain from it, and the page fault costs something. */
 static void ac97_arm_write_trap(void)
 {
     DWORD old;
 
     if (!g_mcpx_memory || g_ac97_page)
         return;
+#if !defined(_WIN32) && !defined(__aarch64__)
+    /* No POSIX decoder for this host's stores: a trapped write would be a
+     * fault nothing services. Leave the page writable. */
+    (void)old;
+    fprintf(stderr, "  AC97: bus-master write trap not available on this"
+                    " host; a channel reset will spin\n");
+    return;
+#endif
     g_ac97_page = (char *)g_mcpx_memory + AC97_NABM_OFFSET;
 #if !defined(_WIN32) && defined(__aarch64__)
     (void)old;
@@ -762,12 +779,11 @@ static void ac97_arm_write_trap(void)
  *
  * Three models answer hardware registers by faulting on them -- the APU, the
  * AC'97 bus-master page and the USB OHCI controllers -- and each has its own
- * handler. A title's fault handler used to call them one by one, and a title
- * whose handler missed one (OHCI, on POSIX) died at that device's first
- * register access. These route the fault to whichever model owns the address
- * and return 1 when it was serviced, so the caller resumes the thread instead
- * of reporting a crash. They only re-route: each model's own handler does the
- * work, unchanged.
+ * handler. A title's fault handler had to call them one by one, and one whose
+ * handler missed a model died at that device's first register access. These
+ * route the fault to whichever model owns the address and return 1 when it
+ * was serviced, so the caller resumes the thread instead of reporting a
+ * crash. They only re-route: each model's own handler does the work.
  */
 #include "apu/apu.h"
 #include "usb/ohci.h"
@@ -2246,6 +2262,7 @@ int g_force_return = 0;
 /* x87 control and status. The reset default masks every exception and
  * rounds to nearest, which is what the CRT expects before _control87. */
 RECOMP_TLS uint16_t g_fp_control_word = 0x037Fu;
+RECOMP_TLS uint32_t g_mxcsr = 0x1F80u;
 RECOMP_TLS int g_fp_cmp = 0;
 RECOMP_TLS uint16_t g_fp_cc = 0x4000;
 
@@ -2598,7 +2615,7 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
 /* POSIX: no single-step from a signal handler on arm64, so the trap is
  * "fault, unprotect, re-protect later". The fault names the writer: lifted
  * calls are native calls, so the host stack at the fault is the guest call
- * chain (sub_XXXXXXXX frames). A helper thread re-protects the page a moment
+ * chain (the lifted functions' frames). A helper thread re-protects the page a moment
  * later and prints which watched dwords changed in that window. A write by
  * another thread inside the window is seen in the diff but not attributed.
  *
@@ -4661,8 +4678,8 @@ void xbox_FreeThreadStack(uint32_t stack_top)
  * GetVisibilityTestResult read its results through a NULL page.
  *
  * Allocating from the top would match the console, but it would move every
- * surface and buffer this toolkit's logs and tools name by address (a title's
- * back buffers, for one). Keeping one megabyte back
+ * surface and buffer the logs and tools name by address (a title's back
+ * buffers, for one). Keeping one megabyte back
  * changes nothing that is placed below 15 MB. A request whose range ends
  * below 16 MB can use the reserve; any other request skips it. */
 #define CONTIG_LOW_RESERVE_START ((15u << 20) / CONTIG_PAGE)
@@ -4670,15 +4687,14 @@ void xbox_FreeThreadStack(uint32_t stack_top)
 
 /* Physical page 0 is never handed out. The real kernel keeps it, and the
  * XDK's USB stack relies on that: XPP carves its host controller structures
- * from a private 0xFE0-byte arena ending at 0x80001000 (seen in Burnout
- * 3), with no allocation call at all. Handing that page to the
+ * from a private 0xFE0-byte arena ending at 0x80001000, with no allocation
+ * call at all. Handing that page to the
  * title's first MmAllocateContiguousMemory -- XAPI's launch data page --
  * let whichever wrote last win, and the pad enumerated or not depending on
  * timing. Page 0 starts marked CONTIG_RESERVED: no allocation, claim or
  * range request (lowest=0 included) gets it, and the page map still reports
  * it as window memory, which is what a device resolving XPP's physical
- * addresses needs. Upstream 423263b; there the bump allocator starts one
- * page in. */
+ * addresses needs. */
 #define CONTIG_RESERVED   2u
 
 static uint8_t  g_contig_used[CONTIG_PAGES] = { CONTIG_RESERVED };
@@ -4816,11 +4832,13 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 
 /* A block the caller placed itself (MmAllocateContiguousMemoryEx with a range
  * exactly one allocation wide). Recorded so nothing else is handed the same
- * pages and so the matching free releases them; pages already in use are
- * left alone, since the caller has been given them regardless. */
+ * pages and so the matching free releases them. Pages already in use are
+ * left to their owner, since the caller has been given them regardless; each
+ * run of pages still free is claimed as its own block, so a partly overlapped
+ * placement still keeps the rest from being handed out again. */
 void xbox_ContiguousClaim(uint32_t va, uint32_t size)
 {
-    uint32_t first, n, q;
+    uint32_t first, n, q, run;
 
     if (va < XBOX_CONTIG_BASE || size == 0)
         return;
@@ -4830,12 +4848,13 @@ void xbox_ContiguousClaim(uint32_t va, uint32_t size)
     if ((uint64_t)first + n > CONTIG_PAGES)
         return;
     contig_lock();
-    for (q = first; q < first + n && !g_contig_used[q]; q++)
-        ;
-    if (q == first + n) {
-        contig_take(first, n);
+    for (q = first; q < first + n; q += run) {
+        if (g_contig_used[q]) { run = 1; continue; }
+        for (run = 0; q + run < first + n && !g_contig_used[q + run]; run++)
+            ;
+        contig_take(q, run);
         g_contig_allocs++;
-        contig_report("claim", XBOX_CONTIG_BASE + first * CONTIG_PAGE, n);
+        contig_report("claim", XBOX_CONTIG_BASE + q * CONTIG_PAGE, run);
     }
     contig_unlock();
 }
@@ -4927,14 +4946,13 @@ uint32_t xbox_ContiguousInUseBytes(void)
  *
  * On the console a physical page is one page of RAM. Here the window and the
  * RAM below 64 MB are separate storage, and the arena above hands out
- * physical numbers that the heap (0x01000000 up) and the image also use. So
- * one number can name two different pages, and a device given only the
- * number cannot tell which the title meant. Burnout 3 loads its sound effects
- * and its music stream into the heap, and DirectSound puts each page's
- * MmGetPhysicalAddress into the voice's scatter-gather list. Those pages fall
- * inside a 26 MB block the arena handed out at 0x81000000, so the APU's page
- * map sent them to the window and every effect played whatever the window
- * held there as PCM: fizz on the menu, noise on the turbo.
+ * physical numbers that the heap and the image also use. So one number can
+ * name two different pages, and a device given only the number cannot tell
+ * which the title meant. A title that loads its sound effects and music
+ * stream into the heap has DirectSound put each page's MmGetPhysicalAddress
+ * into the voice's scatter-gather list; when those numbers fall inside a
+ * block the arena has handed out, the APU read the window copy and played
+ * whatever the window held there as PCM.
  *
  * MmGetPhysicalAddress is the one moment the runtime sees which copy the title
  * means, so it records RAM names here. Heap pages only: the image, its BSS and
@@ -4966,11 +4984,12 @@ void xbox_PhysNoteRamName(uint32_t va)
 static void heap_forget_ram_names(int m)
 {
     uint32_t lo = g_heap_blocks[m].addr;
-    int64_t first = lo / CONTIG_PAGE;
-    int64_t last = ((uint64_t)lo + g_heap_blocks[m].size - 1) / CONTIG_PAGE;
+    int64_t first, last;
 
     if (!g_heap_blocks[m].size)
         return;
+    first = lo / CONTIG_PAGE;
+    last = ((uint64_t)lo + g_heap_blocks[m].size - 1) / CONTIG_PAGE;
     for (int j = m - 1; j >= 0; j--) {
         if (!g_heap_blocks[j].size)
             continue;
@@ -4992,8 +5011,8 @@ static void heap_forget_ram_names(int m)
             break;
         }
     }
-    if (last >= CONTIG_PAGES)
-        last = CONTIG_PAGES - 1;
+    if (last >= (int64_t)CONTIG_PAGES)
+        last = (int64_t)CONTIG_PAGES - 1;
     for (int64_t p = first; p <= last; p++)
         g_phys_ram_named[p] = 0;
 }
@@ -5187,7 +5206,7 @@ static void heap_free(uint32_t xbox_va)
          * over the empty slots (size 0) earlier merges leave behind; without
          * that, one merge stops every later one dead. */
         {
-            int n = i + 1, p = i - 1;
+            int n = i + 1, p = i - 1, m = i;
             if (xbox_HeapReclaimEnabled()) {
                 while (n < g_heap_block_count && g_heap_blocks[n].size == 0) n++;
                 while (p >= 0 && g_heap_blocks[p].size == 0) p--;
@@ -5203,13 +5222,13 @@ static void heap_free(uint32_t xbox_va)
                 g_heap_blocks[p].size += g_heap_blocks[i].size;
                 g_heap_blocks[i].size = 0;
                 g_heap_blocks[i].addr = 0;
-                i = p;
+                m = p;
             }
+            /* After the merge, so a page this block shared with a neighbour
+             * that is free too is forgotten. Under the lock, so a block
+             * reused at once is named afresh after this, not wiped by it. */
+            heap_forget_ram_names(m);
         }
-        /* After the merge, so a page this block shared with a neighbour that
-         * is free too is forgotten. Under the lock, so a block reused at once
-         * is named afresh after this, not wiped by it. */
-        heap_forget_ram_names(i);
         ReleaseSRWLockExclusive(&g_heap_lock);
         return;
     }

@@ -123,7 +123,7 @@ static inline int mmio_emulate_a64(ucontext_t *uc, uint32_t off, void *dev,
                 if (sub == 2) return 0;
                 if (sub == 1 || sub == 3) {
                     wb = 1;
-                    wb_imm = (int64_t)((int32_t)((insn >> 12) & 0x1FF) << 23) >> 23;
+                    wb_imm = (int64_t)(int32_t)(((insn >> 12) & 0x1FFu) << 23) >> 23;
                 }
             } else if (sub != 2) {
                 return 0;                        /* only register offset */
@@ -196,18 +196,21 @@ static inline int mmio_emulate_a64(ucontext_t *uc, uint32_t off, void *dev,
         int opc = (insn >> 30) & 3, L = (insn >> 22) & 1;
         int mode = (insn >> 23) & 3;             /* 1 post, 2 offset, 3 pre */
         int rt = insn & 31, rt2 = (insn >> 10) & 31, rn = (insn >> 5) & 31;
-        int64_t imm7 = (int64_t)((int32_t)((insn >> 15) & 0x7F) << 25) >> 25;
+        int64_t imm7 = (int64_t)(int32_t)(((insn >> 15) & 0x7Fu) << 25) >> 25;
         int bytes, sext = 0;
 
         if (V) {
 #if A64_CTX_HAS_V
             bytes = 4 << opc;
-            if (bytes == 16) return 0;
+            if (bytes > 8) return 0;        /* Q pairs; opc 3 is unallocated */
 #else
             return 0;
 #endif
         } else if (opc == 0) bytes = 4;
-        else if (opc == 1) { bytes = 4; sext = 1; }    /* LDPSW */
+        else if (opc == 1) {                /* LDPSW; the store form is STGP */
+            if (!L) return 0;
+            bytes = 4; sext = 1;
+        }
         else if (opc == 2) bytes = 8;
         else return 0;
 

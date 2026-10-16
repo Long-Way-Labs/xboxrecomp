@@ -32,6 +32,7 @@
 #include "platform/host_time.h"
 #include "recomp_exit_hook.h"
 #include "guest_vmem.h"
+#include "kernel_missing.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
 #include <stdio.h>
@@ -477,12 +478,12 @@ struct bridge_thread_start {
  * startup writes it through the second, the CRT reads it through the first.
  *
  * The loader cannot know that size: it is computed at run time from the TLS
- * directory in .rdata, and a title's header copy of that directory can be
- * all zeros. The loader therefore built a 4-byte block, fs:[4] sat 4 bytes past
- * it, and the CRT read its per-thread pointer from 0x90 bytes below the block
- * -- zeros on most threads (so the CRT's exit path cleared guest address 0xC)
+ * directory in .rdata, and a title's header copy of that directory can be all
+ * zeros. The loader then built a 4-byte block, fs:[4] sat 4 bytes past it,
+ * and the CRT read its per-thread pointer from 0x90 bytes below the block --
+ * zeros on most threads (so the CRT's exit path cleared guest address 0xC)
  * and, on one loader thread, the tail of a texture someone else had allocated
- * next to that thread's TIB, which faulted.
+ * next to that thread's TIB, which faulted inside the CRT.
  *
  * `kthread` is the object fs:[0x28] names for this thread; `top` is where the
  * block ends. Returns the new fs:[4], 0 when there was nothing to do. */
@@ -591,7 +592,8 @@ static void bridge_write_handle(uint32_t handle_va, HANDLE h);
  *
  * reading SignalState at +4 and ExitStatus at +0x120. ObReferenceObjectByHandle
  * used to hand back NULL, so the title read guest page 0, saw STILL_ACTIVE
- * forever, and spun on it after a loader thread exited.
+ * forever, and a title that waits for its loader thread this way spun on it
+ * after the loader had exited.
  *
  * Every spawned thread now gets a zeroed 0x200-byte object (Type 6 =
  * ThreadObject), carved from contiguous pages because that allocator is
@@ -1058,7 +1060,7 @@ static void bridge_NtClose(void)
     if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
         HANDLE h = bridge_take_handle(raw_handle);
         if (h && h != INVALID_HANDLE_VALUE)
-            xbox_NtClose(h);   /* finishes a pending file overwrite first */
+            xbox_NtClose(h);   /* settles a pending overwrite; drops a dir context */
     }
     g_eax = 0; /* STATUS_SUCCESS */
 }
@@ -1210,7 +1212,6 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
  */
 static void bridge_MmFreeContiguousMemory(void)
 {
-    extern int xbox_ContiguousFree(uint32_t addr);
     uint32_t addr = STACK_ARG(0);
 
     /* Back to the arena it came from. This used to call xbox_HeapFree, which
@@ -1514,16 +1515,16 @@ static void bridge_NtQueryVirtualMemory(void)
     g_eax = 0;                                          /* STATUS_SUCCESS */
 }
 
-/* NtFreeVirtualMemory, answered in guest terms.
+/* NtFreeVirtualMemory without RECOMP_HEAP_RECLAIM, answered in guest terms.
  *
  * Both pointer arguments are guest addresses of guest values: *BaseAddress is
- * a 32-bit guest VA and *FreeSize a 32-bit byte count. This used to hand
- * XBOX_TO_NATIVE(base_ptr) to xbox_NtFreeVirtualMemory as a host PVOID *, which
- * read 8 bytes there -- the guest VA plus the next stack word -- and called the
- * host VirtualFree on the result. That failed every time (one title: 51,215
- * "NtFreeVirtualMemory failed ... err=487" in four minutes, 95% of the kernel
- * log), and even a correct read would have released a slice of the guest RAM
- * view out from under the title.
+ * a 32-bit guest VA and *FreeSize a 32-bit byte count. Handing
+ * XBOX_TO_NATIVE(base_ptr) to xbox_NtFreeVirtualMemory as a host PVOID * read
+ * 8 bytes there -- the guest VA plus the next stack word -- and called the
+ * host VirtualFree on the result. That failed every time (one title logged
+ * tens of thousands of "NtFreeVirtualMemory failed ... err=487" in minutes),
+ * and even a correct read would have released a slice of the guest RAM view
+ * out from under the title.
  *
  * Guest memory is one committed mapping, and the regions a title frees here
  * came from bridge_NtAllocateVirtualMemory, i.e. from xbox_HeapAlloc (or
@@ -1532,67 +1533,33 @@ static void bridge_NtQueryVirtualMemory(void)
  *   MEM_DECOMMIT  the pages stay mapped; they are zeroed, which is what the
  *                 title sees on hardware when it commits them again (a
  *                 recommit is a no-op in the allocate bridge).
- *   MEM_RELEASE   the heap block goes back to xbox_HeapFree. A reservation
- *                 above RAM comes from a bump allocator and is not reused.
+ *   MEM_RELEASE   the heap block goes back to xbox_HeapFree (reused only
+ *                 under RECOMP_HEAP_RECLAIM). A reservation above RAM comes
+ *                 from a bump allocator and is not reused.
  *
  * NT rounds the range out to whole pages and writes the rounded base and
  * size back, and so does this. */
 #define BRIDGE_MEM_DECOMMIT 0x4000u
 #define BRIDGE_MEM_RELEASE  0x8000u
+#define BRIDGE_FREE_VM_NOT_AT_BASE 0xC000009Fu
 
-static void bridge_NtFreeVirtualMemory(void)
+/* True when va lies inside a heap block but not at its start; left is
+ * xbox_HeapBlockSize(va). The byte before an interior address is in the same
+ * block, one byte further from its end. NT refuses a release there. */
+static int bridge_heap_interior(uint32_t va, uint32_t left)
+{
+    return left && va && xbox_HeapBlockSize(va - 1) == left + 1;
+}
+
+static void bridge_free_guest_pages(uint32_t base_ptr, uint32_t size_ptr,
+                                    uint32_t free_type)
 {
     static unsigned long decommits, releases, refused;
     static uint64_t decommit_bytes;
-    uint32_t base_ptr = STACK_ARG(0);
-    uint32_t size_ptr = STACK_ARG(1);
-    uint32_t free_type = STACK_ARG(2);
-    uint32_t base, size, page_base, end;
+    uint32_t base, size, page_base, end, left;
     uint32_t mapped = (uint32_t)(g_xbox_map_size ? g_xbox_map_size
                                                  : g_xbox_total_ram);
 
-    if (base_ptr && size_ptr) {
-        uint32_t vm_base = BRIDGE_MEM32(base_ptr);
-        uint32_t vm_size = BRIDGE_MEM32(size_ptr);
-        uint32_t vm_status;
-
-        if (guest_vmem_free(&vm_base, &vm_size, free_type, &vm_status)) {
-            if (vm_status == 0) {
-                BRIDGE_MEM32(base_ptr) = vm_base;
-                BRIDGE_MEM32(size_ptr) = vm_size;
-            }
-            g_eax = vm_status;
-            return;
-        }
-    }
-
-    /* Memory NtAllocateVirtualMemory took from the guest heap. Under
-     * RECOMP_HEAP_RECLAIM a release returns the block to the heap and a
-     * decommit zeroes the pages it names, since heap memory stays committed. */
-    if (xbox_HeapReclaimEnabled() && base_ptr && size_ptr) {
-        uint32_t vm_base = BRIDGE_MEM32(base_ptr);
-        uint32_t left = xbox_HeapBlockSize(vm_base);
-
-        if (left) {
-            if (free_type & 0x8000) {              /* MEM_RELEASE */
-                xbox_HeapFree(vm_base);
-                BRIDGE_MEM32(size_ptr) = 0;
-            } else {
-                /* MEM_DECOMMIT keeps the block, but on the console the pages
-                 * are gone and a later MEM_COMMIT (a no-op here) brings them
-                 * back zeroed. Zero them now so it does. */
-                uint32_t vm_size = BRIDGE_MEM32(size_ptr);
-                uint32_t n = (vm_size && vm_size < left) ? vm_size : left;
-                memset(XBOX_TO_NATIVE(vm_base), 0, n);
-            }
-            g_eax = 0;
-            return;
-        }
-    }
-
-    /* Everything else is answered in guest terms (see above). Upstream falls
-     * back to the native xbox_NtFreeVirtualMemory here, which reads both guest
-     * slots as host pointers and fails every call. */
     if (!base_ptr || !size_ptr || !bridge_va_mapped(base_ptr, 4)
             || !bridge_va_mapped(size_ptr, 4)) {
         g_eax = 0xC0000005u;                    /* STATUS_ACCESS_VIOLATION */
@@ -1627,17 +1594,30 @@ static void bridge_NtFreeVirtualMemory(void)
         return;
     }
 
+    left = xbox_HeapBlockSize(page_base);
     if (free_type == BRIDGE_MEM_RELEASE) {
-        size = xbox_HeapBlockSize(page_base);
+        if (base != page_base || bridge_heap_interior(page_base, left)) {
+            g_eax = BRIDGE_FREE_VM_NOT_AT_BASE;
+            if (refused++ < 8) {
+                fprintf(stderr, "  [KERNEL] NtFreeVirtualMemory: base=0x%08X "
+                        "release inside a block refused\n", base);
+                fflush(stderr);
+            }
+            return;
+        }
+        size = left;
         xbox_HeapFree(page_base);          /* ignores what it never handed out */
         releases++;
     } else {
         /* FreeSize 0 means "the whole region from here". */
         if (!size)
-            size = xbox_HeapBlockSize(page_base);
+            size = left;
         end = (uint32_t)(((uint64_t)base + size + 0xFFFu) & ~(uint64_t)0xFFFu);
         if (end > mapped || end < page_base)
             end = mapped;
+        /* Never past the block: its neighbour belongs to someone else. */
+        if (left && end - page_base > left)
+            end = page_base + left;
         size = end - page_base;
         if (size)
             memset(XBOX_TO_NATIVE(page_base), 0, size);
@@ -1649,8 +1629,8 @@ static void bridge_NtFreeVirtualMemory(void)
     BRIDGE_MEM32(size_ptr) = size;
     g_eax = 0;                                          /* STATUS_SUCCESS */
 
-    /* Hot on a title with a growable heap: one decommits ~200 times a
-     * second. A running summary, not a line per call. */
+    /* Hot on a title with a growable heap (hundreds of decommits a second):
+     * a running summary, not a line per call. */
     if (KERNEL_LOG_ON() || decommits + releases <= 4
             || ((decommits + releases) & 0x3FFFu) == 0) {
         fprintf(stderr, "  [KERNEL] NtFreeVirtualMemory: base=0x%08X size=%u "
@@ -1659,6 +1639,70 @@ static void bridge_NtFreeVirtualMemory(void)
                 (unsigned long long)(decommit_bytes / 1024), releases);
         fflush(stderr);
     }
+}
+
+static void bridge_NtFreeVirtualMemory(void)
+{
+    uint32_t base_ptr = STACK_ARG(0);
+    uint32_t size_ptr = STACK_ARG(1);
+    uint32_t free_type = STACK_ARG(2);
+
+    if (base_ptr && size_ptr) {
+        uint32_t vm_base = BRIDGE_MEM32(base_ptr);
+        uint32_t vm_size = BRIDGE_MEM32(size_ptr);
+        uint32_t vm_status;
+
+        if (guest_vmem_free(&vm_base, &vm_size, free_type, &vm_status)) {
+            if (vm_status == 0) {
+                BRIDGE_MEM32(base_ptr) = vm_base;
+                BRIDGE_MEM32(size_ptr) = vm_size;
+            }
+            g_eax = vm_status;
+            return;
+        }
+    }
+
+    /* Memory NtAllocateVirtualMemory took from the guest heap. Under
+     * RECOMP_HEAP_RECLAIM a release returns the block to the heap and a
+     * decommit zeroes the pages it names, since heap memory stays committed. */
+    if (xbox_HeapReclaimEnabled() && base_ptr && size_ptr) {
+        uint32_t vm_base = BRIDGE_MEM32(base_ptr);
+        uint32_t left = xbox_HeapBlockSize(vm_base);
+
+        if (left) {
+            if (free_type & 0x8000) {              /* MEM_RELEASE */
+                if (bridge_heap_interior(vm_base, left)) {
+                    g_eax = BRIDGE_FREE_VM_NOT_AT_BASE;
+                    return;
+                }
+                xbox_HeapFree(vm_base);
+                /* NT writes back what it released: the base and the size. */
+                BRIDGE_MEM32(size_ptr) = left;
+            } else {
+                /* MEM_DECOMMIT keeps the block, but on the console the pages
+                 * are gone and a later MEM_COMMIT (a no-op here) brings them
+                 * back zeroed. Zero them now so it does. */
+                uint32_t vm_size = BRIDGE_MEM32(size_ptr);
+                uint32_t n = (vm_size && vm_size < left) ? vm_size : left;
+                uint32_t page_base = vm_base & ~0xFFFu;
+                uint64_t end = ((uint64_t)vm_base + n + 0xFFFu) & ~(uint64_t)0xFFFu;
+                /* NT decommits whole pages and writes back the rounded range;
+                 * both stay inside the block (a block need not start on a
+                 * page, and then its first page is shared). */
+                if (end > (uint64_t)vm_base + left)
+                    end = (uint64_t)vm_base + left;
+                if (xbox_HeapBlockSize(page_base) != left + (vm_base - page_base))
+                    page_base = vm_base;
+                memset(XBOX_TO_NATIVE(page_base), 0, (size_t)(end - page_base));
+                BRIDGE_MEM32(base_ptr) = page_base;
+                BRIDGE_MEM32(size_ptr) = (uint32_t)(end - page_base);
+            }
+            g_eax = 0;
+            return;
+        }
+    }
+
+    bridge_free_guest_pages(base_ptr, size_ptr, free_type);
 }
 
 /* ── ExAllocatePool / ExAllocatePoolWithTag (ordinals 15, 16) ─
@@ -2010,6 +2054,23 @@ static void ke_shadow_insert(uint32_t guest_va, HANDLE host);
 static HANDLE bridge_resolve_handle(uint32_t token);
 static HANDLE ke_guest_event(uint32_t guest_va, int *type);
 
+/* Bring a header-owned host event in line with guest SignalState before a
+ * wait. Explicitly initialized shadows keep their existing host-state policy. */
+static HANDLE ke_guest_event_prepare(uint32_t guest_va, int *type)
+{
+    HANDLE h = ke_guest_event(guest_va, type);
+    if (h) {
+        if (BRIDGE_MEM32(guest_va + 4) == 0) {
+            ResetEvent(h);
+            if (BRIDGE_MEM32(guest_va + 4) != 0) /* set meanwhile */
+                SetEvent(h);
+        } else {
+            SetEvent(h);
+        }
+    }
+    return h;
+}
+
 /* ── KeSetEvent (ordinal 145) ────────────────────────────── */
 static void bridge_KeSetEvent(void)
 {
@@ -2056,15 +2117,8 @@ static void bridge_KeWaitForSingleObject(void)
          * SignalState in guest memory is the truth -- XDK code resets it by
          * writing 0 there -- so bring the host event in line first. */
         int type;
-        HANDLE ge = ke_guest_event(object, &type);
+        HANDLE ge = ke_guest_event_prepare(object, &type);
         if (ge) {
-            if (BRIDGE_MEM32(object + 4) == 0) {
-                ResetEvent(ge);
-                if (BRIDGE_MEM32(object + 4) != 0)     /* set meanwhile */
-                    SetEvent(ge);
-            } else {
-                SetEvent(ge);                          /* set by a header write */
-            }
             g_eax = (uint32_t)xbox_KeWaitForSingleObject(
                 ge, wait_reason, wait_mode,
                 (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
@@ -4260,7 +4314,7 @@ static NTSTATUS bridge_create_file_impl(
                                   (uint32_t)disposition, (uint32_t)options, 0);
         } else if (ntcreate || xbox_missing_verbose())
             fprintf(stderr, "  [FILE] %s (disp %u opts 0x%X from 0x%08X) -> 0x%08X\n",
-                    gpath, (unsigned)disposition, options,
+                    gpath, (unsigned)disposition, (unsigned)options,
                     g_xbox_kernel_caller, status);
         if (xbox_FileOpenHook)              /* e.g. a scripted pad waiting on a movie */
             xbox_FileOpenHook(gpath, status);
@@ -4857,8 +4911,8 @@ static void bridge_NtSetInformationFile(void)
      *     +0  BOOLEAN       ReplaceIfExists
      *     +4  HANDLE        RootDirectory
      *     +8  OBJECT_STRING FileName { u16 Length, u16 Max, char *Buffer }
-     * A title that writes a cache file as .tmp and renames it to its final
-     * name needs this; unhandled, every later open of the final name failed with 0xC0000034. */
+     * A title that writes a z:\ cache file as .tmp and renames it to its
+     * final name never found the final file (0xC0000034) without this. */
     if (infoclass == 10u) {
         XBOX_OBJECT_ATTRIBUTES oa;
         XBOX_ANSI_STRING name;
@@ -5828,7 +5882,8 @@ static void bridge_KeAlertThread(void)
  *
  * KeWaitForSingleObject is routed; the multiple-object sibling was not. Like
  * NtWaitForMultipleObjectsEx, the Objects[] array in guest memory holds 32-bit
- * handle tokens, so each is resolved before the native wait sees it. */
+ * handle tokens or guest dispatcher-object addresses, so each is resolved
+ * before the native wait sees it. */
 #define BRIDGE_MAXIMUM_WAIT_OBJECTS 64
 
 static void bridge_KeWaitForMultipleObjects(void)
@@ -5839,8 +5894,9 @@ static void bridge_KeWaitForMultipleObjects(void)
     uint32_t alertable  = STACK_ARG(5);   /* 3=WaitReason, 4=WaitMode */
     uint32_t timeout_va = STACK_ARG(6);
     HANDLE handles[BRIDGE_MAXIMUM_WAIT_OBJECTS];
-    uint32_t guest_sync[BRIDGE_MAXIMUM_WAIT_OBJECTS]; /* title-built sync events */
-    uint32_t i, n_sync = 0;
+    uint32_t guest_events[BRIDGE_MAXIMUM_WAIT_OBJECTS] = {0};
+    int event_types[BRIDGE_MAXIMUM_WAIT_OBJECTS];
+    uint32_t i;
 
     if (count == 0) {
         g_eax = (uint32_t)STATUS_INVALID_PARAMETER;
@@ -5848,33 +5904,16 @@ static void bridge_KeWaitForMultipleObjects(void)
     }
     if (count > BRIDGE_MAXIMUM_WAIT_OBJECTS)
         count = BRIDGE_MAXIMUM_WAIT_OBJECTS;
-    /* Object pointers, as in KeWaitForSingleObject: a shadowed object (an
-     * event, or a thread) waits on its host twin, and an event the title
-     * built itself (ke_guest_event) first takes its state from guest memory. */
     for (i = 0; i < count; i++) {
-        uint32_t obj = objects_va ? BRIDGE_MEM32(objects_va + i * 4) : 0;
-        int type;
-        HANDLE ge = ke_guest_event(obj, &type);
-
-        guest_sync[i] = 0;
-        if (ge) {
-            if (BRIDGE_MEM32(obj + 4) == 0) {
-                ResetEvent(ge);
-                if (BRIDGE_MEM32(obj + 4) != 0)     /* set meanwhile */
-                    SetEvent(ge);
-            } else {
-                SetEvent(ge);
-            }
-            if (type == 1) {
-                guest_sync[i] = obj;
-                n_sync++;
-            }
-            handles[i] = ge;
-            continue;
+        uint32_t object = objects_va ? BRIDGE_MEM32(objects_va + i * 4) : 0;
+        handles[i] = ke_guest_event_prepare(object, &event_types[i]);
+        if (handles[i]) {
+            guest_events[i] = object;
+        } else {
+            handles[i] = ke_shadow_lookup(object);
+            if (!handles[i])
+                handles[i] = bridge_resolve_handle(object);
         }
-        handles[i] = ke_shadow_lookup(obj);
-        if (!handles[i])
-            handles[i] = bridge_resolve_handle(obj);
     }
 
     g_eax = (uint32_t)xbox_KeWaitForMultipleObjects(
@@ -5883,16 +5922,13 @@ static void bridge_KeWaitForMultipleObjects(void)
         (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_va),
         XBOX_TO_NATIVE(STACK_ARG(7)));
 
-    /* A synchronization event that satisfied the wait is consumed: WaitAny
-     * names it by index, WaitAll consumes every one. */
-    if (n_sync) {
-        if (wait_type == 0 /* WaitAll */ && g_eax == 0) {
-            for (i = 0; i < count; i++)
-                if (guest_sync[i])
-                    BRIDGE_MEM32(guest_sync[i] + 4) = 0;
-        } else if (wait_type != 0 && g_eax < count && guest_sync[g_eax]) {
-            BRIDGE_MEM32(guest_sync[g_eax] + 4) = 0;
-        }
+    /* Only a successful wait consumes synchronization events. WaitAny's
+     * result selects one member; WaitAll consumes every signalled member. */
+    for (i = 0; i < count; i++) {
+        if (guest_events[i] && event_types[i] == 1 &&
+            ((wait_type == 0 && g_eax == 0) ||
+             (wait_type != 0 && g_eax < count && g_eax == i)))
+            BRIDGE_MEM32(guest_events[i] + 4) = 0;
     }
 }
 

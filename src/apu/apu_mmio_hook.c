@@ -1,9 +1,10 @@
 /*
- * MCPX APU MMIO Hook - VEH instruction decoder for APU register access
+ * MCPX APU MMIO Hook - trapped APU register access
  *
- * Decodes the faulting instruction with the shared trapped-MMIO decoder
- * (src/platform/mmio_decode.h) and routes reads/writes through the MCPX APU
- * register handlers.
+ * Decodes the faulting instruction with the shared trapped-MMIO decoders
+ * (src/platform/mmio_decode.h on x86-64 under a VEH, mmio_decode_a64.h on
+ * POSIX arm64 under SIGBUS/SIGSEGV) and routes reads/writes through the MCPX
+ * APU register handlers.
  */
 
 #include "apu.h"
@@ -17,9 +18,9 @@
  * platform's MMIO hook is active, so define it before the #if guard. */
 MCPXAPUState *g_apu_state = NULL;
 
-/* The MMIO hook is a Win32-VEH x86-64 instruction decoder. On Linux the
- * equivalent goes through sigaction + ucontext_t (Stage 2 / main.c). For
- * now the whole body is Windows-only so apu_emu links on Debian. */
+/* Windows: a VEH hands over the CONTEXT. POSIX arm64: a SIGBUS/SIGSEGV
+ * handler hands over the ucontext (apu_hook_handle_mmio_posix, at the end).
+ * x86-64 Linux has no trap yet. */
 #if defined(_WIN32)
 #include <windows.h>
 #include "../platform/mmio_decode.h"
@@ -43,12 +44,14 @@ static volatile uint32_t s_last_wval;
 /* ============================================================
  * Instruction decoding: the shared trapped-MMIO decoder
  * (src/platform/mmio_decode.h, covered by tests/mmio_decode), with the
- * APU register model behind it.
+ * APU register model behind it. It also serves the ALU and TEST-immediate
+ * forms DirectSound polls with (test dword [reg+disp], imm32), which a
+ * private MOV/TEST/CMP/OR/AND decoder here did not.
  * ============================================================ */
 
 /* The model's registers are 32-bit and its read/write ignore the size, so an
  * 8-byte access (the decoder emits size 8 for REX.W) is two 4-byte accesses
- * here; handing it over whole dropped the high dword on a store and returned
+ * here; handing it over whole drops the high dword on a store and returns
  * zero for it on a load. The POSIX arm64 hook below splits the same way. */
 static uint64_t apu_mmio_rd(void *dev, uint32_t off, int size)
 {
@@ -82,6 +85,7 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
     if (mmio_emulate(ctx, mmio_offset, g_apu_state, apu_mmio_rd, apu_mmio_wr))
         return true;
 
+    /* Unrecognized */
     g_apu_mmio_decode_fail++;
     if (g_apu_mmio_decode_fail <= 20) {
         fprintf(stderr, "[APU] MMIO decode fail at RIP=%p offset=0x%X: %02X %02X %02X %02X %02X %02X\n",
@@ -280,8 +284,8 @@ void apu_hook_direct_wr(uint32_t off, uint32_t v, int size)
 
 #if !defined(_WIN32) && defined(__aarch64__)
 /* POSIX arm64: the same hook over sigaction + ucontext, with the A64 decoder
- * (src/platform/mmio_decode_a64.h). The fault handler in the game target's
- * main.c calls apu_hook_handle_mmio_posix before it reports a crash. */
+ * (src/platform/mmio_decode_a64.h). The host's fault handler reaches it
+ * through xbox_PosixMmioFault before it reports a crash. */
 #include <pthread.h>
 #include <time.h>
 #include <string.h>
@@ -307,7 +311,7 @@ volatile int g_apu_hook_bench_active;
 
 /* The model's registers are 32-bit and its read/write ignore the size, so an
  * 8-byte access (ldr/str x, a d register, each half of a q register) is two
- * 4-byte accesses here; handing it over whole would drop the high dword. */
+ * 4-byte accesses here, as on Windows. */
 static uint64_t apu_mmio_rd(void *dev, uint32_t off, int size)
 {
     if (size == 8) {
@@ -440,6 +444,9 @@ bool apu_hook_handle_mmio_posix(void *ucv, uintptr_t fault_addr,
     ok = mmio_emulate_a64(uc, off, g_apu_state, apu_mmio_rd, apu_mmio_wr);
     if (!ok) {
         g_apu_mmio_decode_fail++;
+        /* stdio in a signal handler is not async-signal-safe. The process is
+         * about to die of this fault anyway, and the line is what says why;
+         * capped at 20, as on Windows. */
         if (g_apu_mmio_decode_fail <= 20)
             fprintf(stderr, "[APU] MMIO decode fail at PC=%p insn=%08X offset=0x%X\n",
                     (void *)(uintptr_t)A64_CTX_PC(uc),

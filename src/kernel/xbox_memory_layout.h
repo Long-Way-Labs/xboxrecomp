@@ -410,9 +410,9 @@ typedef union RecompXmm {
  *
  * These used to be fixed -- scratch at 0x00700000, stack at 0x00780000, heap
  * at 0x00F80000 -- which is right only while the title's image ends below
- * 0x00700000. A large title's image can run to tens of MB, so the stack, the
- * kernel data exports and the heap all sat inside its .data/BSS and the first
- * zeroed heap allocation wiped the title's globals.
+ * 0x00700000. A title whose 70-odd sections run past 0x03000000 had the
+ * stack, the kernel data exports and the heap inside its .data/BSS, and the
+ * first zeroed heap allocation wiped its globals.
  *
  * xbox_MemoryLayoutInit now places the region at the first 64 KB boundary
  * above the highest loaded section, never below 0x00700000, so a title that

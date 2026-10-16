@@ -8,7 +8,7 @@ stub that returns without running. Spartan: Total Warrior lost XGAssembleShader
 that way and crashed at boot on the out-buffer it never wrote. disasm now
 prints one warning per such section; which candidates it adds is unchanged.
 
-Run: py -3 tools/disasm/test_unswept_section_warning.py
+Run: python3 tools/disasm/test_unswept_section_warning.py
 """
 
 import contextlib

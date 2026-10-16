@@ -8,8 +8,8 @@ reduces FSIN/FCOS/FSINCOS/FPTAN operands modulo pi/4 with a 66-bit pi, so it
 returns f(x * (1 + D)), D = (pi - pi66) / pi66, where libm returns f(x). This
 evaluates that at 200 bits, rounds to double, and prints the table the ctest
 compares against. --sweep checks the helper's formula (re-implemented here in
-double, the arithmetic of recomp_x87_shift on libm's pair, as the
-recomp_x87_fsin/fcos/fsincos/fptan helpers use it) against the model over
+double, the arithmetic of recomp_x87_sincos_pi66 on libm's pair, as the
+recomp_x87_sin/cos/sincos/tan helpers use it) against the model over
 log-uniform operands, in units of the conformance harness's tolerance.
 """
 
@@ -34,7 +34,7 @@ def hw(f, x):
 
 
 def helper(x):
-    """recomp_x87_shift on libm's sin and cos, in double, for the sweep."""
+    """recomp_x87_sincos_pi66 on libm's sin and cos, in double, for the sweep."""
     if not math.isfinite(x) or abs(x) <= math.pi / 4:
         return math.sin(x), math.cos(x)
     e = x * D_DOUBLE

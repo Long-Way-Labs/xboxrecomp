@@ -26,6 +26,7 @@ static void wav_unlock(void) { LeaveCriticalSection(&s_lock); }
 /* Only called with a file open, so the lock is initialised. */
 static int  wav_trylock(void) { return TryEnterCriticalSection(&s_lock) != 0; }
 static void wav_nap(void)     { Sleep(1); }
+static uint64_t wav_ms(void)  { return GetTickCount64(); }
 #else
 #include <pthread.h>
 #include <time.h>
@@ -37,6 +38,12 @@ static void wav_nap(void)
 {
     struct timespec ts = { 0, 1000000 };
     nanosleep(&ts, NULL);
+}
+static uint64_t wav_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
 }
 #endif
 
@@ -101,17 +108,20 @@ void apu_wav_close(void)
 
 int apu_wav_close_nowait(int wait_ms)
 {
-    int t;
+    uint64_t deadline;
 
     if (!s_fp)
         return 1;
-    for (t = 0; ; t++) {
+    /* Against the clock, not a count of naps: Sleep(1) lasts a whole
+     * scheduler tick (about 15.6 ms) on a default Windows timer. */
+    deadline = wav_ms() + (uint64_t)(wait_ms > 0 ? wait_ms : 0);
+    for (;;) {
         if (wav_trylock()) {
             close_locked();
             wav_unlock();
             return 1;
         }
-        if (t >= wait_ms)
+        if (wav_ms() >= deadline)
             return 0;
         wav_nap();
     }

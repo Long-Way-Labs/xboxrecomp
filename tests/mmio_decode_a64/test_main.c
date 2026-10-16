@@ -52,6 +52,24 @@ static void handler(int sig, siginfo_t *si, void *ucv)
     signal(sig, SIG_DFL);
 }
 
+/* The decoder alone, on an instruction word that never executes: for
+ * encodings the CPU itself would refuse (SIGILL before any fault), whose
+ * decode must still be refused rather than guessed. */
+static int decode_only(uint32_t insn)
+{
+    ucontext_t uc;
+#if defined(__APPLE__)
+    static struct __darwin_mcontext64 mc;
+    memset(&mc, 0, sizeof mc);
+#endif
+    memset(&uc, 0, sizeof uc);
+#if defined(__APPLE__)
+    uc.uc_mcontext = &mc;
+#endif
+    A64_CTX_PC(&uc) = (uintptr_t)&insn;
+    return mmio_emulate_a64(&uc, 0x40, model, rd, wr);
+}
+
 int main(void)
 {
     struct sigaction sa;
@@ -131,6 +149,52 @@ int main(void)
     /* wzr store */
     __asm__ volatile("str wzr, [%0]" : : "r"(win + 0x40) : "memory");
     CHECK_U64("str wzr", *(uint32_t *)(model + 0x40), 0);
+
+    /* SIMD loads and stores: S, D and the 16-byte Q, which a device model's
+     * 4-byte registers see as four accesses (the APU's split). */
+    {
+        double d = 0; uint64_t lo = 0, hi = 0;
+        *(uint64_t *)(model + 0x400) = 0x0011223344556677ull;
+        *(uint64_t *)(model + 0x408) = 0x8899AABBCCDDEEFFull;
+        __asm__ volatile("ldr s0, [%1]\n\tfmov %w0, s0" : "=r"(lo) : "r"(win + 0x210) : "v0", "memory");
+        CHECK_U64("ldr s -> v0", lo, 0x3FC00000u);
+        __asm__ volatile("ldr %d0, [%1]" : "=w"(d) : "r"(win + 0x400) : "memory");
+        memcpy(&lo, &d, 8);
+        CHECK_U64("ldr d", lo, 0x0011223344556677ull);
+        __asm__ volatile("ldr q0, [%2]\n\tfmov %0, d0\n\tmov %1, v0.d[1]"
+                         : "=r"(lo), "=r"(hi) : "r"(win + 0x400) : "v0", "memory");
+        CHECK_U64("ldr q lo", lo, 0x0011223344556677ull);
+        CHECK_U64("ldr q hi", hi, 0x8899AABBCCDDEEFFull);
+        __asm__ volatile("ldr q0, [%0]\n\tstr q0, [%1]"
+                         : : "r"(model + 0x400), "r"(win + 0x420) : "v0", "memory");
+        CHECK_U64("str q lo", *(uint64_t *)(model + 0x420), 0x0011223344556677ull);
+        CHECK_U64("str q hi", *(uint64_t *)(model + 0x428), 0x8899AABBCCDDEEFFull);
+    }
+    /* LDPSW sign-extends both; LDP with writeback advances the base. */
+    {
+        uint64_t a = 0, b = 0;
+        uint8_t *q = win + 0x500;
+        *(uint32_t *)(model + 0x500) = 0x80000000u;
+        *(uint32_t *)(model + 0x504) = 7u;
+        *(uint64_t *)(model + 0x508) = 0x1111111122222222ull;
+        *(uint64_t *)(model + 0x510) = 0x3333333344444444ull;
+        __asm__ volatile("ldpsw %0, %1, [%2]" : "=r"(a), "=r"(b) : "r"(q) : "memory");
+        CHECK_U64("ldpsw a", a, 0xFFFFFFFF80000000ull);
+        CHECK_U64("ldpsw b", b, 7);
+        q = win + 0x500;
+        __asm__ volatile("ldp %0, %1, [%2, #8]!" : "=r"(a), "=r"(b), "+r"(q) : : "memory");
+        CHECK_U64("ldp pre-index a", a, 0x1111111122222222ull);
+        CHECK_U64("ldp pre-index b", b, 0x3333333344444444ull);
+        CHECK_U64("ldp pre-index base", (uintptr_t)q, (uintptr_t)(win + 0x508));
+        __asm__ volatile("stp %1, %2, [%0], #16" : "+r"(q) : "r"(5ull), "r"(6ull) : "memory");
+        CHECK_U64("stp post-index base", (uintptr_t)q, (uintptr_t)(win + 0x518));
+        CHECK_U64("stp post-index a", *(uint64_t *)(model + 0x508), 5);
+    }
+    /* Refused without executing: STGP (the L=0 form of LDPSW's encoding)
+     * and a V pair with opc 3, which is unallocated. */
+    CHECK_U64("stgp refused", decode_only(0x69000440u), 0);
+    CHECK_U64("V pair opc 3 refused", decode_only(0xED400440u), 0);
+    CHECK_U64("decode_only sees a plain ldr w", decode_only(0xB9400000u | (1u << 5)), 1);
 
     /* Refused: an exclusive load must not be reported as handled. */
     {

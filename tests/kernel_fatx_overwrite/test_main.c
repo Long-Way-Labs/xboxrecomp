@@ -11,12 +11,13 @@
  * FATX keeps no valid-data length, so the second open's trim exposes the
  * bytes already on disk. The host truncate (O_TRUNC, CREATE_ALWAYS) zero-
  * fills instead, and every cache file came out as zeros of the right length
- * (seen on Proton: a 1 MB game archive file, all zeros).
+ * (seen on Proton: a 1 MB cache file that was all zeros).
  *
  * Cross-platform: it calls the xbox_Nt* file functions directly, which are
  * the Win32 backend on Windows (and Proton) and the POSIX one elsewhere.
  */
 #include "kernel.h"
+#include "recomp_env.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -141,6 +142,39 @@ static void make_dir(const char *p)
 #endif
 }
 
+static int is_dir(const char *p)
+{
+#if defined(_WIN32)
+    DWORD a = GetFileAttributesA(p);
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+#else
+    struct stat st;
+    return stat(p, &st) == 0 && S_ISDIR(st.st_mode);
+#endif
+}
+
+/* Translate a guest path and compare it with <want>. */
+static void check_maps(const char *guest, const char *want, const char *what)
+{
+    xbox_host_char host[MAX_PATH];
+    char got[MAX_PATH * 2], d[MAX_PATH * 2 + 32];
+    int ok = xbox_translate_path(guest, host, MAX_PATH);
+#if defined(_WIN32)
+    if (ok) WideCharToMultiByte(CP_UTF8, 0, host, -1, got, sizeof got, NULL, NULL);
+#else
+    if (ok) snprintf(got, sizeof got, "%s", host);
+#endif
+    if (!ok) snprintf(got, sizeof got, "(not translated)");
+    {   /* the join can double a separator; the host APIs don't mind */
+        char *r = got, *w = got;
+        for (; *r; r++)
+            if (!((*r == '/' || *r == '\\') && w > got && w[-1] == *r)) *w++ = *r;
+        *w = 0;
+    }
+    snprintf(d, sizeof d, "got %s", got);
+    check(ok && strcmp(got, want) == 0, what, d);
+}
+
 /* A search abandoned after one result must not outlive its handle.
  *
  * A title that looks for one save (FindFirstFile, then FindClose without
@@ -222,6 +256,41 @@ static void test_dir_search(void)
              fresh, SEARCHES, reused, first_bad[0] ? first_bad : "none");
     printf("  (%s)\n", d);
     check(fresh == SEARCHES, "each new search starts in its own directory", d);
+}
+
+/* Where Partition1's UDATA and TDATA go: RECOMP_SAVE_DIR, the save dir, or
+ * the game dir when saves are only there. */
+static void test_save_dir(const char *root)
+{
+    char game[600], save[600], ov[600], p[700], want[700];
+
+    printf("\nSave directories\n");
+    snprintf(game, sizeof game, "%s" SEP_S "g", root);
+    snprintf(save, sizeof save, "%s" SEP_S "s", root);
+    snprintf(ov, sizeof ov, "%s" SEP_S "ov", root);
+    make_dir(game);
+    make_dir(save);
+
+    recomp_env_set(RENV_SAVE_DIR, ov);
+    xbox_path_init(game, save);
+    check(is_dir(ov), "RECOMP_SAVE_DIR is created", ov);
+    snprintf(want, sizeof want, "%s" SEP_S "UDATA" SEP_S "x", ov);
+    check_maps("\\Device\\Harddisk0\\Partition1\\UDATA\\x", want,
+               "UDATA\\x goes under RECOMP_SAVE_DIR");
+
+    recomp_env_set(RENV_SAVE_DIR, NULL);
+    snprintf(p, sizeof p, "%s" SEP_S "TDATA", game);
+    make_dir(p);                   /* saves only in the game dir */
+    xbox_path_init(game, save);
+    snprintf(want, sizeof want, "%s" SEP_S "UDATA" SEP_S "x", save);
+    check_maps("\\Device\\Harddisk0\\Partition1\\UDATA\\x", want,
+               "unset: UDATA\\x goes under the save dir");
+    snprintf(want, sizeof want, "%s" SEP_S "TDATA" SEP_S "y", game);
+    check_maps("\\Device\\Harddisk0\\Partition1\\TDATA\\y", want,
+               "TDATA only in the game dir stays there");
+    snprintf(want, sizeof want, "%s" SEP_S "UDATAx" SEP_S "z", game);
+    check_maps("\\Device\\Harddisk0\\Partition1\\UDATAx\\z", want,
+               "UDATAx is not UDATA");
 }
 
 int main(int argc, char **argv)
@@ -342,6 +411,8 @@ int main(int argc, char **argv)
     /* FILE_OVERWRITE of a missing file still fails. */
     st = open_file("z:\\missing.dat", XBOX_FILE_OVERWRITE, 0x60, &h);
     check(st != 0, "FILE_OVERWRITE of a missing file fails", NULL);
+
+    test_save_dir(root);
 
 done:
     {

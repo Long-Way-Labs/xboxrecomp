@@ -131,6 +131,12 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
     (void)pitch;
 }
 
+/* The AA row step (#162, fb_present.c). Unused here: the SDL window takes
+ * the walker's own surface size and skips a surface that is not 2 or 4
+ * bytes a pixel, so an anti-aliased one is not shown rather than shown
+ * squashed. */
+void xbox_FramebufferWindowSetAA(uint32_t sy) { (void)sy; }
+
 void xbox_FramebufferWindowStart(void) {}
 
 static void present_copy(uint32_t fb_va, uint32_t pitch);

@@ -8,27 +8,54 @@
  * fsin(double(pi)), which Bruce Dawson measured ("Intel Underestimates Error
  * Bounds by 1.3 quintillion", 2014).
  *
+ * The range check and C2 are recomp_fp_trig_in_range's; the vectors check
+ * the recomp_x87_* value helpers the lifter calls inside it.
  * -DX87_TRIG_PLAIN_LIBM swaps the helpers for the old lifting (plain libm);
  * that build is the second ctest, expected to fail (CMakeLists.txt). */
 #include "recomp_types.h"
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 
+RECOMP_TLS uint16_t g_fp_cc;
+
+/* The value step of each op. -DX87_TRIG_PLAIN_LIBM puts back libm's. */
 #ifdef X87_TRIG_PLAIN_LIBM
-static int t_sin(double *st0, uint16_t *cc) { (void)cc; *st0 = sin(*st0); return 1; }
-static int t_cos(double *st0, uint16_t *cc) { (void)cc; *st0 = cos(*st0); return 1; }
-static int t_sincos(double *st0, double *c, uint16_t *cc) {
-    (void)cc; *c = cos(*st0); *st0 = sin(*st0); return 1;
-}
-static int t_tan(double *st0, double *push, uint16_t *cc) {
-    (void)cc; *st0 = tan(*st0); *push = 1.0; return 1;
-}
+static double v_sin(double x) { return sin(x); }
+static double v_cos(double x) { return cos(x); }
+static double v_sincos(double x, double *c) { *c = cos(x); return sin(x); }
+static double v_tan(double x) { return tan(x); }
 #else
-#define t_sin recomp_x87_fsin
-#define t_cos recomp_x87_fcos
-#define t_sincos recomp_x87_fsincos
-#define t_tan recomp_x87_fptan
+#define v_sin recomp_x87_sin
+#define v_cos recomp_x87_cos
+#define v_sincos recomp_x87_sincos
+#define v_tan recomp_x87_tan
 #endif
+
+/* Each op as the lifter emits it: recomp_fp_trig_in_range sets or clears C2
+ * in g_fp_cc and gates the value step and the push. These take the status
+ * word through *cc so the checks below can seed and read it; they return
+ * whether the op completed (and so pushed). */
+static int t_op(double *st0, uint16_t *cc, int which, double *push) {
+    int done;
+    g_fp_cc = *cc;
+    done = recomp_fp_trig_in_range(*st0);
+    if (done) {
+        double x = *st0;
+        switch (which) {
+        case 0: *st0 = v_sin(x); break;
+        case 1: *st0 = v_cos(x); break;
+        case 2: *st0 = v_sincos(x, push); break;
+        default: *st0 = v_tan(x); *push = isfinite(x) ? 1.0 : x - x; break;
+        }
+    }
+    *cc = g_fp_cc;
+    return done;
+}
+static int t_sin(double *st0, uint16_t *cc) { return t_op(st0, cc, 0, NULL); }
+static int t_cos(double *st0, uint16_t *cc) { return t_op(st0, cc, 1, NULL); }
+static int t_sincos(double *st0, double *c, uint16_t *cc) { return t_op(st0, cc, 2, c); }
+static int t_tan(double *st0, double *push, uint16_t *cc) { return t_op(st0, cc, 3, push); }
 
 static int failures;
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); ++failures; } } while (0)
@@ -146,20 +173,24 @@ int main(void) {
 
     /* 6. The CRT's reduction: `fsin; fnstsw ax; sahf; jp reduce`, then
      * `fprem1; fnstsw ax; sahf; jp loop`. The status word is built as the
-     * lifted fnstsw builds it, and fprem clears C2 as the lifted one does. */
+     * lifted fnstsw builds it, and the fprem1 is the lifted one,
+     * recomp_fprem, which clears C2 on a complete reduction. */
     {
         double st0 = 18446744073709551616.0; uint16_t cc = 0; uint16_t top = 7;
         t_sin(&st0, &cc);
         uint16_t sw = (uint16_t)(((top & 7u) << 11) | cc);
         CHECK((sw >> 8) & 0x04);               /* sahf: PF = C2, jp taken */
-        cc &= (uint16_t)~0x0400u;              /* fprem1, as lifted */
+        g_fp_cc = cc;
+        st0 = recomp_fprem(st0, 6.283185307179586, 1);
+        cc = g_fp_cc;
         sw = (uint16_t)(((top & 7u) << 11) | cc);
         CHECK(!((sw >> 8) & 0x04));            /* the loop exits */
+        CHECK(t_sin(&st0, &cc) == 1 && !(cc & 0x0400));
     }
 
     if (failures) return 1;
 
-    /* 7. Cost, printed and not asserted (design.md D4). */
+    /* 7. Cost, printed and not asserted. */
     {
         enum { N = 2000000 };
         volatile double sink = 0.0;

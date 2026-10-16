@@ -3,10 +3,10 @@
 MSVC parks a switch table after the function's last ret, aligns it with
 `mov edi, edi`, and the linker then packs the next function right after the
 table. Nothing marks that start. The int3 boundary pass finds a table, not a
-ret, in front of it, and the gap-prologue pass looks only after a ret. Worse,
-the gap-prologue pass used to take the `mov edi, edi` for a hot-patch prologue.
-It started a function on the padding, and that function stepped over the table
-and swallowed the real one behind it.
+ret, in front of it, and the gap-prologue pass looks only after a ret (and,
+since #182, skips the `mov edi, edi` padding in front of a table rather than
+taking it for a hot-patch prologue; test_padding_in_front_of_a_table_is_not_a
+_prologue keeps that covered here).
 
 Fixtures are synthetic: hand-assembled bytes, no game data.
 """

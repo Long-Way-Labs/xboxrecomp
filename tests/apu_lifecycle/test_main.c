@@ -1,20 +1,24 @@
 /* The APU brought up and torn down several times in one process.
  *
- * Two kinds of state outlived an instance. The =auto doorbell ack caches
- * the slot it derived from GPSADDR as a host pointer in a file static: a new
- * instance whose title programmed the same GPSADDR got the old instance's
- * slot, so the ack cleared a dword in the old RAM and never the new one.
- * And shutdown never released the GP/EP state that init allocates.
+ * Three kinds of state outlived an instance. The =auto doorbell ack once
+ * cached the slot it derived from GPSADDR as a host pointer: a new instance
+ * whose title programmed the same GPSADDR acked a dword in the old RAM and
+ * never the new one. The ack keeps its configuration and the GPRST gate in
+ * file statics: a GP held in reset by one instance left the ack paused in
+ * the next, and the RECOMP_APU_DSP_ACK setting read by the first instance
+ * was never read again. And shutdown never released the GP/EP state that
+ * init allocates.
  *
- * Small zeroed buffers stand in for RAM: with no heap, no image and no
- * contiguous allocation above page 0, mcpx_apu_phys resolves a low physical
- * address to the buffer + address. The frame thread idles after init
- * (pause_requested) until something resumes it, so the test polls the
- * doorbell itself. RECOMP_APU_DSP_ACK=auto comes from the ctest. */
+ * Small zeroed buffers stand in for RAM, as in apu_dsp_ack: with no heap,
+ * no image and no contiguous allocation above page 0, mcpx_apu_phys resolves
+ * a low physical address to the buffer + address. The frame thread idles
+ * after init (pause_requested) until something resumes it, so the test polls
+ * the doorbell itself. */
 #include "apu_state.h"
 #include "apu.h"
 #include "apu_xaudio2.h"
 #include "apu_regs.h"
+#include "recomp_env.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,8 +42,8 @@ int  xa2_is_active(void)       { return dev_open; }
 int  xa2_get_buffer_size(void) { return 512; }
 int  xa2_get_buffer_count(void) { return 4; }
 unsigned xa2_underruns(void)   { return 0; }
-uint64_t xa2_samples_played(void) { return 0; }
 int  xa2_queued_samples(void)  { return 0; }
+uint64_t xa2_samples_played(void) { return 0; }
 void xa2_expect_drain(void)    {}
 int  xa2_submit_samples(const int16_t *s, int n) { (void)s; (void)n; return 1; }
 
@@ -54,6 +58,13 @@ static void check(int ok, const char *what)
 {
     printf("  %-62s %s\n", what, ok ? "PASS" : "FAIL");
     if (!ok) failures++;
+}
+
+/* recomp_env reads the environment once per process; set the value it
+ * hands out instead, as a changed environment would after a reload. */
+static void set_ack_env(const char *v)
+{
+    recomp_env_set(RENV_APU_DSP_ACK, v);
 }
 
 static uint32_t *dword(uint8_t *ram, uint32_t phys)
@@ -104,7 +115,10 @@ static long long heap_in_use(void)
  * memory. */
 static void doorbell_case(uint8_t *ram_a, uint8_t *ram_b)
 {
-    MCPXAPUState *d = bring_up(ram_a);
+    MCPXAPUState *d;
+
+    set_ack_env("auto");
+    d = bring_up(ram_a);
 
     if (!d) { failures++; return; }
     *dword(ram_a, DOORBELL) = 0x11;
@@ -119,6 +133,50 @@ static void doorbell_case(uint8_t *ram_a, uint8_t *ram_b)
     mcpx_apu_dsp_ack_poll(d);
     check(*dword(ram_b, DOORBELL) == 0, "reinit, same GPSADDR: poll clears the new RAM's doorbell");
     check(*dword(ram_a, DOORBELL) == 0x22, "reinit: the old RAM is left alone");
+    mcpx_apu_shutdown(d);
+}
+
+/* A GP held in reset when the instance went away: the next init must start
+ * with the GP running, as a fresh process does. */
+static void gate_case(uint8_t *ram)
+{
+    MCPXAPUState *d;
+
+    set_ack_env("auto");
+    d = bring_up(ram);
+    if (!d) { failures++; return; }
+    mcpx_apu_dsp_gprst_write(0);                       /* hold the GP */
+    *dword(ram, DOORBELL) = 0x11;
+    mcpx_apu_dsp_ack_poll(d);
+    check(*dword(ram, DOORBELL) == 0x11, "held in reset: poll leaves the doorbell");
+    mcpx_apu_shutdown(d);
+
+    d = bring_up(ram);
+    if (!d) { failures++; return; }
+    *dword(ram, DOORBELL) = 0x22;
+    mcpx_apu_dsp_ack_poll(d);
+    check(*dword(ram, DOORBELL) == 0, "reinit: GP counts as running, poll clears it");
+    mcpx_apu_shutdown(d);
+}
+
+/* The ack setting is read again by each instance. */
+static void config_case(uint8_t *ram)
+{
+    MCPXAPUState *d;
+
+    set_ack_env("off");
+    d = bring_up(ram);
+    if (!d) { failures++; return; }
+    *dword(ram, DOORBELL) = 0x33;
+    mcpx_apu_dsp_ack_poll(d);
+    check(*dword(ram, DOORBELL) == 0x33, "RECOMP_APU_DSP_ACK=off: poll leaves it");
+    mcpx_apu_shutdown(d);
+
+    set_ack_env("auto");
+    d = bring_up(ram);
+    if (!d) { failures++; return; }
+    mcpx_apu_dsp_ack_poll(d);
+    check(*dword(ram, DOORBELL) == 0, "reinit with =auto: poll clears it");
     mcpx_apu_shutdown(d);
 }
 
@@ -161,6 +219,8 @@ int main(void)
     if (!ram_a || !ram_b) { fprintf(stderr, "out of memory\n"); return 2; }
     setvbuf(stdout, NULL, _IONBF, 0);
     doorbell_case(ram_a, ram_b);
+    gate_case(ram_b);
+    config_case(ram_b);
     cycle_case(ram_b);
     printf("%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
     free(ram_a);

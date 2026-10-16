@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(apu_lifecycle_test C)
 # mcpx_apu_init_standalone / mcpx_apu_shutdown more than once in a process:
-# the =auto doorbell is found again by every instance, and shutdown releases
-# the GP/EP state once, after the frame thread has stopped.
+# the DSP doorbell gate and its configuration start fresh on every init, and
+# shutdown releases the GP/EP state once, after the frame thread has stopped.
 set(CMAKE_C_STANDARD 11)
 add_subdirectory(../.. runtime)
 add_executable(apu_lifecycle_test test_main.c)
@@ -11,4 +11,3 @@ target_include_directories(apu_lifecycle_test PRIVATE ../../src ../../src/apu)
 target_link_libraries(apu_lifecycle_test PRIVATE xboxrecomp)
 enable_testing()
 add_test(NAME apu_lifecycle COMMAND apu_lifecycle_test)
-set_tests_properties(apu_lifecycle PROPERTIES ENVIRONMENT "RECOMP_APU_DSP_ACK=auto")

@@ -104,17 +104,17 @@ int main(int argc, char **argv)
     xbox_path_init(root, root);
 
     printf("failed open status\n");
-    st = open_read("D:\\adx\\track01.adx");
+    st = open_read("D:\\adx\\music_TITLE.adx");
     check((uint32_t)st == 0xC0000034u, "missing file, directory present: NAME_NOT_FOUND", (unsigned)st);
     check(xbox_LastFileError() == 2u, "... and win32 err 2 (ERROR_FILE_NOT_FOUND)", xbox_LastFileError());
-    st = open_read("D:\\media\\event\\EVCAMST0101_005.CAM");
+    st = open_read("D:\\media\\event\\CLIP0001.BIN");
     check((uint32_t)st == 0xC000003Au, "missing directory: PATH_NOT_FOUND", (unsigned)st);
     check(xbox_LastFileError() == 3u, "... and win32 err 3 (ERROR_PATH_NOT_FOUND)", xbox_LastFileError());
 
     printf("attribute query status (unchanged)\n");
-    st = query("D:\\adx\\track01.adx");
+    st = query("D:\\adx\\music_TITLE.adx");
     check((uint32_t)st == 0xC0000034u, "missing file: NAME_NOT_FOUND", (unsigned)st);
-    st = query("D:\\media\\event\\EVCAMST0101_005.CAM");
+    st = query("D:\\media\\event\\CLIP0001.BIN");
     check((uint32_t)st == 0xC0000034u, "missing directory: NAME_NOT_FOUND too", (unsigned)st);
 
     printf("%s (%d failure%s)\n", failures ? "FAILED" : "OK", failures, failures == 1 ? "" : "s");

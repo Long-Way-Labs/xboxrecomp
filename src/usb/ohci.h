@@ -45,8 +45,8 @@ int  xbox_OhciOwnsAddress(uint32_t xbox_va);
  * and stepped over. `ctx` is the fault's thread state: the PCONTEXT from a
  * Win32 VEH, or the ucontext_t * a POSIX SA_SIGINFO handler receives (its
  * third argument). void * keeps windows.h out of here. A title's fault
- * handler calls this for an address xbox_OhciOwnsAddress claims, before it
- * treats the fault as a crash. */
+ * handler calls this (or xbox_VehMmioFault / xbox_PosixMmioFault, which
+ * route to it) before it treats the fault as a crash. */
 int  xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va);
 
 /* Report counts at exit, so a run says whether the driver ever looked. */

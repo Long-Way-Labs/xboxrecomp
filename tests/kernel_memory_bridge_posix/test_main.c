@@ -1,21 +1,21 @@
 /*
- * Kernel memory and file bridges, through the path a title takes.
+ * Kernel thread objects, memory and file bridges, through the path a title
+ * takes.
  *
- * Three bridges that were wrong in ways nothing caught:
+ *   Thread objects            a thread handle leads to a guest thread object
+ *                             whose SignalState and ExitStatus follow the host
+ *                             thread, also through a duplicate of the handle.
+ *   NtFreeVirtualMemory (199) reads its arguments as guest pointers; it used
+ *                             to call the host VirtualFree on a guest VA and
+ *                             fail every call.
+ *   NtSetInformationFile (226) FileRenameInformation: a title that writes
+ *                             x.tmp and renames it to x.dat must find x.dat.
+ *   FATX overwrite            an overwrite followed by a smaller end-of-file
+ *                             keeps the bytes below the new end.
  *
- *   NtFreeVirtualMemory (199)   passed a guest VA to the host as a PVOID * and
- *                               called VirtualFree on what it read there; it
- *                               failed every call (51,215 in 4 min in one title).
- *   MmFreeContiguousMemory (171) handed window addresses to the general heap,
- *                               which never matched them; the window was a
- *                               bump allocator and ran out at ~119 s.
- *   NtSetInformationFile (226)  had no FileRenameInformation, so a title that
- *                               writes x.tmp and renames it to x.dat could
- *                               never open x.dat.
- *
- * Each is driven by ordinal through recomp_lookup_kernel, as in
+ * Each bridge is driven by ordinal through recomp_lookup_kernel, as in
  * tests/kernel_bridge, but against a real guest window from
- * xbox_MemoryLayoutInit so the contiguous window at 0x80000000 exists.
+ * xbox_MemoryLayoutInit.
  */
 #include "kernel.h"
 #include "xbox_memory_layout.h"
@@ -145,10 +145,11 @@ static unsigned char *load(const char *path, size_t *n)
 static void test_virtual_memory(void)
 {
     char d[160];
-    uint32_t pbase = g_scratch, psize = g_scratch + 4, base, st, i;
+    uint32_t pbase = g_scratch, psize = g_scratch + 4, base, next, st, i;
     int intact = 1, zeroed = 1;
 
-    printf("NtFreeVirtualMemory\n");
+    printf("NtFreeVirtualMemory (%s)\n", xbox_HeapReclaimEnabled()
+           ? "RECOMP_HEAP_RECLAIM" : "default");
     G32(pbase) = 0;
     G32(psize) = 0x10000;
     st = CALL(ORD_NTALLOC, pbase, 0, psize, 0x3000 /* RESERVE|COMMIT */, 4);
@@ -170,11 +171,38 @@ static void test_virtual_memory(void)
     check(zeroed, "decommitted page reads back as zero", NULL);
     check(intact, "neighbouring pages untouched", NULL);
 
-    /* Release: size must be 0; the whole block goes back to the heap. */
+    /* A decommit running past the block stops at its end. */
+    G32(pbase) = 0;
+    G32(psize) = 0x10000;
+    st = CALL(ORD_NTALLOC, pbase, 0, psize, 0x3000, 4);
+    next = G32(pbase);
+    check(st == 0 && next, "allocate a second 64 KB", NULL);
+    memset(GP(next), 0xCD, 0x10000);
+    G32(pbase) = base + 0xF000;
+    G32(psize) = 0x3000;
+    st = CALL(ORD_NTFREE, pbase, psize, 0x4000);
+    snprintf(d, sizeof d, "status 0x%08X base 0x%08X size 0x%X", st,
+             G32(pbase), G32(psize));
+    check(st == 0 && G32(pbase) == base + 0xF000 && G32(psize) == 0x1000,
+          "decommit past the block is clamped to it", d);
+    check(GP(next)[0] == 0xCD && GP(base + 0x10000 - 1)[0] == 0,
+          "the next block is untouched", NULL);
+
+    /* Release only from the start of the block. */
+    G32(pbase) = base + 0x2000;
+    G32(psize) = 0;
+    st = CALL(ORD_NTFREE, pbase, psize, 0x8000);
+    snprintf(d, sizeof d, "status 0x%08X", st);
+    check(st == 0xC000009Fu, "MEM_RELEASE inside a block: FREE_VM_NOT_AT_BASE", d);
+
+    /* Release: size must be 0; the whole block goes back to the heap. The
+     * RECOMP_HEAP_RECLAIM path (upstream's) takes a nonzero size as 0. */
     G32(pbase) = base;
     G32(psize) = 0x1000;
-    st = CALL(ORD_NTFREE, pbase, psize, 0x8000);
-    check(st != 0, "MEM_RELEASE with a nonzero size is refused", NULL);
+    if (!xbox_HeapReclaimEnabled()) {
+        st = CALL(ORD_NTFREE, pbase, psize, 0x8000);
+        check(st != 0, "MEM_RELEASE with a nonzero size is refused", NULL);
+    }
     G32(psize) = 0;
     st = CALL(ORD_NTFREE, pbase, psize, 0x8000 /* MEM_RELEASE */);
     snprintf(d, sizeof d, "status 0x%08X size 0x%X", st, G32(psize));

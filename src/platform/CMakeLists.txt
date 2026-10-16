@@ -42,6 +42,9 @@ else()
     )
     find_package(Threads REQUIRED)
     target_link_libraries(platform PUBLIC Threads::Threads recomp_env)
+    if(NOT APPLE)
+        target_link_libraries(platform PUBLIC m)   # feclearexcept etc.; libSystem has them on macOS
+    endif()
     target_compile_options(platform PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
     # glibc declares pthread_setname_np, pthread_[gs]etaffinity_np, the
     # CPU_* set macros and dladdr only under _GNU_SOURCE, and a header that

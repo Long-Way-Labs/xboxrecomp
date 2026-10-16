@@ -1787,8 +1787,15 @@ uint64_t xbox_ReadTimeStampCounter(void)
  * and the XDK's XMV player only starts its clock on an even one: Burnout 3's
  * EA intro waited on its loading screen indefinitely.
  *
- * Without vblanks (RECOMP_VBLANK off) the count stays 0, so the pin toggles
- * per read instead; then it at least alternates.
+ * The count is xbox_VblankCount, the one vblank count, bumped once per tick
+ * by the timer thread. Two regimes follow from it:
+ *  - tick-driven (RECOMP_VBLANK=1, once the first vblank is counted): the pin
+ *    is the count's parity and holds still between vblanks, however often
+ *    it is read;
+ *  - no tick (before the first vblank, or the whole run with RECOMP_VBLANK
+ *    off): the count is 0, so the pin toggles on every read instead. A
+ *    reader waiting for either field still sees it; nothing is implied
+ *    about vblank delivery.
  *
  * Every other port reads 0 and is logged on first use, once per port.
  * ========================================================================= */

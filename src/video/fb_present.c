@@ -28,6 +28,7 @@
 #include "mouse.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
+extern uint32_t xbox_GetDisplayMode(uint32_t *pitch, uint32_t *w, uint32_t *h);
 
 static volatile LONG s_fb_running;
 static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
@@ -419,6 +420,8 @@ void xbox_FramebufferWindowStart(void)
 {
     HANDLE th;
 
+    uint32_t w = 0, h = 0;
+
     if (!recomp_env(RENV_FB_WINDOW))
         return;
     if (!fb_window_wanted(recomp_env(RENV_PB_BACKEND), 1)) {
@@ -430,6 +433,13 @@ void xbox_FramebufferWindowStart(void)
     }
     if (InterlockedCompareExchange(&s_fb_running, 1, 0) != 0)
         return;
+    /* The first mode's frame is the window's for the run (its buffers are
+     * sized once); 640x480 when the mode word was not one the kernel knows. */
+    xbox_GetDisplayMode(NULL, &w, &h);
+    if (w && h) {
+        s_fb_width = w;
+        s_fb_height = h;
+    }
     th = CreateThread(NULL, 0, fb_thread, NULL, 0, NULL);
     if (th)
         CloseHandle(th);

@@ -3329,9 +3329,12 @@ static void dump_frame(void)
 static struct nv2a_occ s_occ;           /* see "Visibility tests" below */
 
 /* The surface a flip puts on screen: the walker's pick (present_pick in
- * nv2a_pb_exec.c, the same for every backend), as the render target of that
- * offset and size. The walker hands its offset over as `surface_offset`.
- * With no render target for it here yet, the frame on screen stays. */
+ * nv2a_pb_exec.c, the same for every backend), as the render target at that
+ * offset and pitch (a field buffer and a frame can share an offset),
+ * whatever its size: a smaller one (a buffer drawn only below the
+ * display mode's frame) is grown by present_extent. The walker hands its
+ * offset over as `surface_offset`. With no render target for it here yet,
+ * the frame on screen stays. */
 static RenderTarget *present_target(uint32_t surface_offset)
 {
     const struct nv2a_pb_present *p = nv2a_pb_present_state();
@@ -3340,9 +3343,13 @@ static RenderTarget *present_target(uint32_t surface_offset)
     for (i = 0; i < RT_MAX; i++) {
         RenderTarget *rt = &s_rt[i];
         if (rt->tex && surface_offset && rt->offset == surface_offset
-                && (!p->offset || (rt->w >= p->w && rt->h >= p->h)))
+                && (!p->offset || rt->pitch == p->pitch))
             return rt;
     }
+    /* The frame on screen stays, even when it is the pick's offset at
+     * another pitch (a field buffer for a frame): a NULL here would present
+     * an undefined back buffer. present_extent matches the pitch too, so it
+     * neither grows nor crops that target as if it were the pick. */
     return s_drawn;
 }
 
@@ -3539,12 +3546,20 @@ static void internal_resize(const RenderTarget *rt, UINT cw, UINT ch)
  * when it names this surface. A target grown for a larger clip (rt_grow) can
  * be bigger than the frame; the rest of it, and its black grow margin, is not
  * the frame. */
-static void present_extent(const RenderTarget *rt, UINT *w, UINT *h)
+static void present_extent(RenderTarget *rt, UINT *w, UINT *h)
 {
     const struct nv2a_pb_present *p = nv2a_pb_present_state();
+    /* The walker publishes the display mode's frame, which a title that only
+     * ever drew this buffer at a smaller clip has no target that big for:
+     * grow it (as a larger clip would) rather than show less than the CPU
+     * path, which reads the whole frame from guest memory. A failed grow
+     * shows what there is. */
+    if (p->offset && p->offset == rt->offset && p->pitch == rt->pitch && p->w && p->h
+            && (p->w > rt->w || p->h > rt->h))
+        rt_grow(rt, rt->w > p->w ? rt->w : p->w, rt->h > p->h ? rt->h : p->h);
     *w = rt->w;
     *h = rt->h;
-    if (p->offset && p->offset == rt->offset && p->w && p->h) {
+    if (p->offset && p->offset == rt->offset && p->pitch == rt->pitch && p->w && p->h) {
         if (p->w < *w) *w = p->w;
         if (p->h < *h) *h = p->h;
     }

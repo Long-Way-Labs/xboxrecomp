@@ -843,7 +843,8 @@ static int write_bmp_at(const char *path, const uint8_t *base, uint32_t pitch,
  * 640x480 entry and the size alternated 480/464 flip by flip, which every
  * scaling present showed as the picture jumping at 60 Hz. So the offsets
  * the last present_stale flips presented (s_scanout, as physical addresses)
- * set the size too, the set empties at a display-mode change as the field
+ * set the size too (only picks sized from the display address or the set
+ * join it: a pass-1 pick is just the largest surface anywhere), the set empties at a display-mode change as the field
  * latch does, and when the table is full eviction takes an entry that is
  * neither at a scanout offset nor at the display address (at the display or
  * field pitch) first, plain LRU only once every entry is one. The table
@@ -852,7 +853,18 @@ static int write_bmp_at(const char *path, const uint8_t *base, uint32_t pitch,
  * unchanged: the newest draw, as above. The set widens an old quirk of the
  * size-first rule: a fresh larger entry at the display pitch held the
  * screen when it sat at the display address, and now does at any offset in
- * the set too, until it goes stale. */
+ * the set too, until it goes stale.
+ *
+ * The extent. All of the above decides which surface a flip shows; the size
+ * it shows is the display mode's. AvSetDisplayMode sets one timing, and the
+ * CRTC scans that many lines from PCRTC_START whatever rows the title drew,
+ * so one title's 640x464 menus are 640x480 frames on the TV and its races are
+ * too: presenting the clip instead made every menu-to-race change a size step
+ * under any scaling present. So a pick at the display pitch publishes the
+ * mode's frame (xbox_GetDisplayMode), one at twice it (fields) half the
+ * frame's lines, and only without a known mode size, or at another pitch,
+ * the entry's clip extent. The clip still ranks the candidates: it is what
+ * tells a back buffer from an odd target at the same offset. */
 #define PRESENT_MAX 32
 #define SCANOUT_MAX 8
 /* The staleness window in flips: RECOMP_DEBUG=present_stale=n, default 120
@@ -877,7 +889,8 @@ static struct nv2a_pb_present s_present;
 
 /* The scanout set: the physical form of each offset a flip presented (the
  * compare the display address uses) and the flip that last presented it.
- * Fed by present_pick; an entry not presented for present_stale flips no
+ * Fed by present_pick with the picks sized from the display address or the
+ * set itself, never a pass-1 pick; an entry not presented for present_stale flips no
  * longer counts, and a display-mode change (s_scanout_gen) empties it.
  * phys 0 marks an empty slot: physical page 0 is never a framebuffer. */
 static struct { uint32_t phys, last_flip; } s_scanout[SCANOUT_MAX];
@@ -1111,11 +1124,12 @@ static void present_pick(void)
     static uint32_t s_pitch_seen;        /* a display pitch some surface had */
     static uint32_t s_mode_gen, s_mode_flip;
     uint32_t gen = xbox_DisplayModeGeneration();
-    uint32_t disp_pitch = 0, disp = xbox_GetDisplayFramebuffer(&disp_pitch);
-    uint32_t tw = 0, th = 0, want = disp_pitch;
+    uint32_t disp_pitch = 0, disp_w = 0, disp_h = 0;
+    uint32_t disp = xbox_GetDisplayMode(&disp_pitch, &disp_w, &disp_h);
+    uint32_t tw = 0, th = 0, want = disp_pitch, ew = 0, eh = 0;
     uint64_t area = 0, stale_area = 0;
     uint32_t stale_w = 0, stale_h = 0;
-    int i, pass, at_disp, best = -1;
+    int i, pass, at_disp, best = -1, rule = 0;
 
     /* Field pitch only if no surface since the last mode set has had the
      * display's own. */
@@ -1195,13 +1209,45 @@ static void present_pick(void)
             }
         }
     }
+    /* The extent the pick publishes: the display mode's frame, as the CRTC
+     * scans it, whatever clip the title drew the buffer with (rule 1); one
+     * field of it for a buffer at twice the display pitch (rule 2); the
+     * entry's clip without a known mode size, at any other pitch, or for a
+     * pass-1 pick (rule 3). A pass-1 pick is not at the display address or
+     * a scanout offset, so nothing says the mode's frame is there: an
+     * offscreen target at the display pitch grown to it would claim memory
+     * past its own buffer. */
+    if (best >= 0) {
+        if (at_disp && disp_w && s_psurf[best].pitch == disp_pitch) {
+            ew = disp_w;
+            eh = disp_h;
+            rule = 1;
+        } else if (at_disp && disp_w && s_psurf[best].pitch == disp_pitch << 1) {
+            ew = disp_w;
+            eh = disp_h / 2;
+            rule = 2;
+        } else {
+            ew = s_psurf[best].w;
+            eh = s_psurf[best].h;
+            rule = 3;
+        }
+    }
     if (s_ptrace_on > 0) {
         static uint32_t pick[2];
         uint32_t now = best >= 0 ? s_psurf[best].offset : s_present.offset;
         if (pick[0] && now != pick[0]) {
-            fprintf(stderr, "[PRESENT] flip %u picks 0x%08X (2 flips ago 0x%08X),"
-                    " display %ux%u at 0x%08X; this frame's surfaces:\n",
-                    s_gpu.flips, now, pick[0], tw, th, disp);
+            if (best >= 0)
+                fprintf(stderr, "[PRESENT] flip %u picks 0x%08X (2 flips ago 0x%08X),"
+                        " size %ux%u at 0x%08X, mode %ux%u: extent %ux%u (rule %d);"
+                        " this frame's surfaces:\n",
+                        s_gpu.flips, now, pick[0], tw, th, disp, disp_w, disp_h,
+                        ew, eh, rule);
+            else
+                fprintf(stderr, "[PRESENT] flip %u holds 0x%08X %ux%u (2 flips ago"
+                        " 0x%08X), mode %ux%u at 0x%08X: held, nothing drawn since the"
+                        " last flip; this frame's surfaces:\n",
+                        s_gpu.flips, now, s_present.w, s_present.h, pick[0],
+                        disp_w, disp_h, disp);
             for (i = 0; i < s_ptrace_n; i++)
                 fprintf(stderr, "[PRESENT]   0x%08X %ux%u pitch %u: %u draws %u clears\n",
                         s_ptrace[i].offset, s_ptrace[i].w, s_ptrace[i].h,
@@ -1225,11 +1271,16 @@ static void present_pick(void)
         /* One assignment, so the pick is never half old, half new (see the
          * thread contract in nv2a_pb_state.h). */
         struct nv2a_pb_present pick = {
-            s_psurf[best].offset, s_psurf[best].w, s_psurf[best].h,
+            s_psurf[best].offset, ew, eh,
             s_psurf[best].pitch, s_psurf[best].format,
         };
         s_present = pick;
-        scanout_note(pick.offset);
+        /* Only a pick sized from the display address or the set joins the
+         * set: a pass-1 pick is whatever surface was largest, and once in
+         * the set it would count as scanout, take the mode's frame (rule 1)
+         * and be grown past its own buffer. */
+        if (at_disp)
+            scanout_note(pick.offset);
     }
     s_psurf_flip_seq = s_psurf_seq;
 }

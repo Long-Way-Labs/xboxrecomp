@@ -2409,9 +2409,6 @@ static void bridge_AvSetDisplayMode(void)
         if (fb_va && fb_va < XBOX_CONTIG_SIZE)
             fb_va = XBOX_CONTIG_BASE + fb_va;
 
-        xbox_FramebufferWindowSet(fb_va, pitch);
-        xbox_FramebufferWindowStart();
-
         /* Record the resolved address, not the physical one the title passed.
          * Every reader of this wants to read guest memory with it, and the
          * physical form lands in the loaded image -- so the checksum probe
@@ -2419,8 +2416,11 @@ static void bridge_AvSetDisplayMode(void)
          * few megabytes away, and so did every dump that asked for "the"
          * framebuffer. Resolving once here is the fix; resolving in each
          * caller is how there came to be two of them disagreeing. */
-        xbox_SetDisplayFramebuffer(fb_va, pitch);
-        /* After the address and pitch, so a walker that sees the new
+        xbox_SetDisplayMode(fb_va, pitch, mode, format);
+        /* After the record: the window takes its size from it. */
+        xbox_FramebufferWindowSet(fb_va, pitch);
+        xbox_FramebufferWindowStart();
+        /* After the address, pitch and size, so a walker that sees the new
          * generation also sees the new mode (present_pick, N8). */
         xbox_DisplayModeBump();
     }

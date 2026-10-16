@@ -1385,6 +1385,320 @@ static int scanout_cases(void)
     return f;
 }
 
+/* The mode-height cases: with a known display mode the pick publishes the
+ * mode's frame, not the clip (rules 1-3 at present_pick). After the scanout
+ * cases, on the CPU path, with Metal where it builds for the two that show a
+ * target; each ends with no display mode. As there, the first flip after a
+ * mode set holds the screen (the field latch), so a case flips once first. */
+#define MH_A    0x03A00000u     /* case 2: a buffer only ever drawn at 320x240 */
+#define MH_F    0x03B40000u     /* case 3: the field title's buffer */
+#define MH_U    0x03C80000u     /* case 5: the unknown word's buffer */
+#define MH_P0   0x03D00000u     /* case 6: one buffer pair */
+#define MH_P1   0x03E40000u
+#define MH_C4   0x03F00000u     /* case 4: the 480-line mode's buffer */
+#define MH_HD   0x03F80000u     /* and the 720p one (only 2x2 quads land there) */
+#define MH_N    0x02C00000u     /* case 7: a display buffer nothing draws */
+#define MH_O    0x02E00000u     /* and a 320x240 offscreen at the display pitch */
+#define MH_480  0x0801010Du     /* NTSC-M 480i, 640x480 */
+#define MH_720  0x880B0A02u     /* 720p, 1280x720 */
+
+/* What the AvSetDisplayMode bridge records, A8R8G8B8. */
+static void mh_mode(uint32_t buf, uint32_t pitch, uint32_t mode)
+{
+    xbox_SetDisplayMode(0x80000000u | buf, pitch, mode, 0x12);
+    xbox_DisplayModeBump();
+}
+
+static void mh_draw(uint32_t buf, uint32_t w, uint32_t h, uint32_t pitch)
+{
+    static const uint32_t c[4] = {0xFF00FF00u, 0xFF00FF00u, 0xFF00FF00u, 0xFF00FF00u};
+    sc_surf(buf, w, h, pitch);
+    quad_uv(0.0f, 0.0f, 2.0f, 2.0f, c, NULL);
+}
+
+static int mh_is(const char *what, int flip, uint32_t off, uint32_t w, uint32_t h,
+                 uint32_t pitch)
+{
+    const struct nv2a_pb_present *p = nv2a_pb_present_state();
+    int ok = p->offset == off && p->w == w && p->h == h && p->pitch == pitch;
+    if (!ok)
+        fprintf(stderr, "[backend-smoke] mode-height: %s flip %d presents 0x%08X %ux%u pitch"
+                " %u (want 0x%08X %ux%u pitch %u)\n", what, flip, p->offset, p->w, p->h,
+                p->pitch, off, w, h, pitch);
+    return ok;
+}
+
+/* stderr into a temporary file, for counting a warning's lines: begin
+ * returns the saved descriptor, end restores it and counts `what`. */
+static int mh_capture_begin(FILE **tmp)
+{
+    int saved;
+
+    *tmp = tmpfile();
+    if (!*tmp)
+        return -1;
+    fflush(stderr);
+    saved = dup(2);
+    dup2(fileno(*tmp), 2);
+    return saved;
+}
+
+static int mh_capture_end(FILE *tmp, int saved, const char *what)
+{
+    char line[512];
+    int n = 0;
+
+    if (saved < 0)
+        return -1;
+    fflush(stderr);
+    dup2(saved, 2);
+    close(saved);
+    rewind(tmp);
+    while (fgets(line, sizeof line, tmp)) {
+        fputs(line, stderr);             /* the log keeps what the case printed */
+        n += strstr(line, what) != NULL;
+    }
+    fclose(tmp);
+    return n;
+}
+
+static uint32_t mh_px(int gpu, uint32_t buf, uint32_t x, uint32_t y)
+{
+#ifdef __APPLE__
+    if (gpu) {
+        uint32_t hw = 0, hh = 0;
+        const uint8_t *hp = nv2a_pb_metal_host_pixels(buf, &hw, &hh);
+        return hp && x < hw && y < hh ? ((const uint32_t *)hp)[y * hw + x] : 0;
+    }
+#endif
+    (void)gpu;
+    return ((const uint32_t *)guest(buf))[y * W + x];
+}
+
+/* Returns the failures. gpu is Metal, or NULL for the CPU path alone. */
+static int mode_height_cases(const struct nv2a_pb_backend *gpu)
+{
+    static const uint32_t pair[2] = {MH_P0, MH_P1};
+    uint32_t tw = 0, th = 0, sw = 0, sh = 0, lw = 0, lh = 0;
+    int k, b, ok, changes, f = 0;
+
+    (void)tw; (void)th; (void)sw; (void)sh;
+    M(0x0304, 0);
+    M(0x1B0C, 0);
+    clear_rect(0, 0, 4095, 4095);
+
+    /* 1. Rule 1 beside the crop: the crop case's stream (122 flips of a
+     * 320x240 clip at BUF0) with a 640x480 mode set at BUF0 shows the mode's
+     * 640x480 on both paths. Metal first, as there. */
+    for (b = gpu ? 0 : 1; b < 2; b++) {
+        int i;
+        nv2a_pb_set_backend(b ? nv2a_pb_cpu_backend() : gpu);
+        mh_mode(BUF0, W * 4u, MH_480);
+        surf_clip(BUF0, 0, 0, W, H);
+        clear_to(0xFF000000u);
+        surf_clip(BUF0, 0, 0, 320, 240);
+        for (i = 0; i < 122; i++) {
+            clear_to(0xFF000000u);
+            M(0x012C, 0);
+            M(0x0130, 0);
+        }
+        if (b) {
+            ok = mh_is("crop with a mode", 122, BUF0, W, H, W * 4u);
+            fprintf(stderr, "[backend-smoke] mode-height: crop with a 640x480 mode, cpu"
+                    " presents 640x480 %s\n", ok ? "PASS" : "FAIL");
+        }
+#ifdef __APPLE__
+        else {
+            ok = nv2a_pb_metal_shown(BUF0, &tw, &th, &sw, &sh) && tw == W && th == H
+                && sw == W && sh == H;
+            fprintf(stderr, "[backend-smoke] mode-height: crop with a 640x480 mode, metal"
+                    " target %ux%u shown %ux%u (want 640x480, 640x480) %s\n", tw, th, sw, sh,
+                    ok ? "PASS" : "FAIL");
+        }
+#endif
+        f += !ok;
+        surf_clip(BUF0, 0, 0, W, H);
+        sc_display(0);
+    }
+
+    /* 2. Grow at present: a buffer only ever drawn with a 320x240 clip
+     * shows the mode's 640x480. Metal grows its 320x240 target to the pick
+     * (seeded from the guest bytes, the pattern) instead of clamping: the
+     * cleared 320x240 at the top left, the pattern beyond, on both paths. */
+    for (b = gpu ? 0 : 1; b < 2; b++) {
+        uint32_t in, out;
+        nv2a_pb_set_backend(b ? nv2a_pb_cpu_backend() : gpu);
+        fill(MH_A, PATTERN);
+        mh_mode(MH_A, W * 4u, MH_480);
+        for (k = 0; k < 2; k++) {
+            surf_clip(MH_A, 0, 0, 320, 240);
+            clear_to(0xFFFF0000u);
+            M(0x012C, 0);
+            M(0x0130, 0);
+        }
+        ok = b ? mh_is("grow", 2, MH_A, W, H, W * 4u) : 1;
+#ifdef __APPLE__
+        if (!b)
+            ok = nv2a_pb_metal_shown(MH_A, &tw, &th, &sw, &sh) && tw == W && th == H
+                && sw == W && sh == H;
+#endif
+        in = mh_px(!b, MH_A, 10, 10) & 0x00FFFFFFu;
+        out = mh_px(!b, MH_A, 400, 300) & 0x00FFFFFFu;
+        ok &= in == 0xFF0000u && out == (PATTERN & 0x00FFFFFFu);
+        if (b)
+            fprintf(stderr, "[backend-smoke] mode-height: 320x240 clip under a 640x480 mode,"
+                    " cpu presents 640x480, (10,10) %06X (400,300) %06X %s\n", in, out,
+                    ok ? "PASS" : "FAIL");
+        else
+            fprintf(stderr, "[backend-smoke] mode-height: 320x240 clip under a 640x480 mode,"
+                    " metal target %ux%u shown %ux%u, (10,10) %06X (400,300) %06X %s\n",
+                    tw, th, sw, sh, in, out, ok ? "PASS" : "FAIL");
+        f += !ok;
+        sc_display(0);
+    }
+
+    nv2a_pb_set_backend(nv2a_pb_cpu_backend());
+
+    /* 3. Field title: the mode at pitch 2560, every frame drawn with a
+     * 640x232 clip at twice it. One field at the mode's half height, not the
+     * clip (rule 2), with the field warning once; then a frame at the display
+     * pitch is the mode's 640x480 (rule 1). The first case to set a field
+     * pitch, so the warning has not printed yet. */
+    {
+        FILE *tmp = NULL;
+        int saved = mh_capture_begin(&tmp), warned;
+        mh_mode(MH_F, W * 4u, MH_480);
+        ok = 1;
+        for (k = 0; k < 4; k++) {
+            mh_draw(MH_F, W, 232, W * 8u);
+            sc_flip(MH_F);
+            ok &= mh_is("field", k + 1, MH_F, W, 240, W * 8u);
+        }
+        mh_draw(MH_F, W, H, W * 4u);
+        sc_flip(MH_F);
+        ok &= mh_is("field, then frame", 5, MH_F, W, H, W * 4u);
+        warned = mh_capture_end(tmp, saved, "(field rendering?)");
+        ok &= warned == 1;
+        fprintf(stderr, "[backend-smoke] mode-height: field title drawn at 640x232 presents"
+                " 640x240 at pitch 5120, then 640x480; field warning %d time(s) (want 1)"
+                " %s\n", warned, ok ? "PASS" : "FAIL");
+    }
+    f += !ok;
+    sc_display(0);
+
+    /* 4. Mode change: 480 lines at MH_C4, then 720p at a new address and
+     * twice the pitch, then back. Each new mode's frame from its second flip
+     * (the first holds the old one, not a new pick of an old buffer). */
+    mh_mode(MH_C4, W * 4u, MH_480);
+    for (k = 0; k < 2; k++) {
+        mh_draw(MH_C4, W, H, W * 4u);
+        sc_flip(MH_C4);
+    }
+    ok = mh_is("480 before 720p", 2, MH_C4, W, H, W * 4u);
+    mh_mode(MH_HD, 5120u, MH_720);
+    for (k = 0; k < 3; k++) {
+        mh_draw(MH_HD, 1280, 720, 5120u);
+        sc_flip(MH_HD);
+        ok &= k ? mh_is("720p", k + 1, MH_HD, 1280, 720, 5120u)
+                : mh_is("720p, held", 1, MH_C4, W, H, W * 4u);
+    }
+    mh_mode(MH_C4, W * 4u, MH_480);
+    for (k = 0; k < 3; k++) {
+        mh_draw(MH_C4, W, H, W * 4u);
+        sc_flip(MH_C4);
+        ok &= k ? mh_is("back to 480", k + 1, MH_C4, W, H, W * 4u)
+                : mh_is("back to 480, held", 1, MH_HD, 1280, 720, 5120u);
+    }
+    fprintf(stderr, "[backend-smoke] mode-height: 640x480, 720p at 1280x720, 640x480 again %s\n",
+            ok ? "PASS" : "FAIL");
+    f += !ok;
+    sc_display(0);
+
+    /* 5. An unknown word (timing byte 0x7F) records no size: the clip
+     * extent, as before this change (rule 3). */
+    mh_mode(MH_U, W * 4u, (MH_480 & ~0xFF00u) | 0x7F00u);
+    for (k = 0; k < 2; k++) {
+        mh_draw(MH_U, 320, 240, W * 4u);
+        sc_flip(MH_U);
+    }
+    ok = mh_is("unknown word", 2, MH_U, 320, 240, W * 4u);
+    fprintf(stderr, "[backend-smoke] mode-height: unknown mode word keeps the 320x240 clip %s\n",
+            ok ? "PASS" : "FAIL");
+    f += !ok;
+    sc_display(0);
+
+    /* 6. Burnout 3's pattern: one buffer pair, 20 frames with the clip at
+     * 640x464 (its menus), then 20 at 640x480 and 640x463 (the race and its
+     * card). Every flip after the first presents 640x480: no size change at
+     * the menu-to-race step. */
+    mh_mode(MH_P0, W * 4u, 0x080F0D12u);   /* 480p, 640x480 */
+    ok = 1;
+    changes = 0;
+    for (k = 0; k < 40; k++) {
+        const struct nv2a_pb_present *p;
+        uint32_t cur = pair[k & 1];
+        if (k < 20) {
+            mh_draw(cur, W, 464, W * 4u);
+        } else {
+            mh_draw(cur, W, H, W * 4u);
+            mh_draw(cur, W, 463, W * 4u);
+        }
+        sc_flip(pair[(k + 1) & 1]);
+        if (!k)
+            continue;
+        ok &= mh_is("menus to race", k + 1, cur, W, H, W * 4u);
+        p = nv2a_pb_present_state();
+        if (k > 1 && (p->w != lw || p->h != lh))
+            changes++;
+        lw = p->w;
+        lh = p->h;
+    }
+    ok &= !changes;
+    fprintf(stderr, "[backend-smoke] mode-height: menus at 640x464 then race, 39 flips at"
+            " 640x480, %d size changes %s\n", changes, ok ? "PASS" : "FAIL");
+    f += !ok;
+    sc_display(0);
+
+    /* 7. A pass-1 pick keeps its clip (rule 3): the mode set at a buffer
+     * nothing draws, and only a 320x240 offscreen at the display pitch drawn,
+     * for more than present_stale flips so every earlier surface is stale.
+     * The offscreen is the pick, but not at the display address, so the
+     * mode's 640x480 is not its frame: Metal must not grow its target (the
+     * grown target would own, and write back over, memory past the buffer). */
+    for (b = gpu ? 0 : 1; b < 2; b++) {
+        int i;
+        nv2a_pb_set_backend(b ? nv2a_pb_cpu_backend() : gpu);
+        mh_mode(MH_N, W * 4u, MH_480);
+        surf_clip(MH_O, 0, 0, 320, 240);
+        for (i = 0; i < 122; i++) {
+            clear_to(0xFF0000FFu);
+            M(0x012C, 0);
+            M(0x0130, 0);
+        }
+        ok = mh_is("pass-1 pick", 122, MH_O, 320, 240, W * 4u);
+#ifdef __APPLE__
+        if (!b)
+            ok &= nv2a_pb_metal_shown(MH_O, &tw, &th, &sw, &sh) && tw == 320 && th == 240
+                && sw == 320 && sh == 240;
+#endif
+        if (b)
+            fprintf(stderr, "[backend-smoke] mode-height: offscreen 320x240 with the mode at an"
+                    " undrawn buffer, cpu presents %ux%u (want 320x240) %s\n",
+                    nv2a_pb_present_state()->w, nv2a_pb_present_state()->h,
+                    ok ? "PASS" : "FAIL");
+        else
+            fprintf(stderr, "[backend-smoke] mode-height: offscreen 320x240 with the mode at an"
+                    " undrawn buffer, metal target %ux%u shown %ux%u (want 320x240, 320x240)"
+                    " %s\n", tw, th, sw, sh, ok ? "PASS" : "FAIL");
+        f += !ok;
+        surf_clip(MH_O, 0, 0, W, H);
+        sc_display(0);
+    }
+
+    nv2a_pb_set_backend(NULL);
+    return f;
+}
+
 /* The absolute checks of bigidx and elem32, on one path's frame. */
 static int probes_ok(int sc, const char *path, const uint32_t *px)
 {
@@ -1450,6 +1764,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "[backend-smoke] no backend '%s' on this host: GPU scenes"
                 " skipped\n", which);
         failures += scanout_cases();
+        failures += mode_height_cases(NULL);
         return failures ? 1 : 77;
     }
     cpu_px = (uint32_t *)malloc(W * H * 4);
@@ -1523,6 +1838,11 @@ int main(int argc, char **argv)
 #endif
     /* Last: they set a display mode and fill the table (scanout_cases). */
     failures += scanout_cases();
+#ifdef __APPLE__
+    failures += mode_height_cases(gpu == nv2a_pb_metal_backend() ? gpu : NULL);
+#else
+    failures += mode_height_cases(NULL);
+#endif
     if (failures) {
         fprintf(stderr, "[backend-smoke] FAIL: %d of %d scenes\n", failures, SC_COUNT);
         return 1;

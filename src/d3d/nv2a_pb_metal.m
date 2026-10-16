@@ -2134,9 +2134,11 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
 
 /* ---- flip ---------------------------------------------------------------------- */
 
-/* The render target for the surface the walker picked: its offset, and at
- * least its size when the walker knows it (a grown target covers smaller
- * frames, rt_grow). NULL when this backend never drew there; the guest's own
+/* The render target for the surface the walker picked: the one at its
+ * offset and pitch (a field buffer and a frame can share an offset),
+ * whatever its size. A larger one covers a smaller frame; a smaller
+ * one (a buffer drawn only below the display mode's frame) is grown by
+ * present_extent. NULL when this backend never drew there; the guest's own
  * bytes are presented then. */
 static RenderTarget *present_target(uint32_t surface_offset)
 {
@@ -2146,7 +2148,7 @@ static RenderTarget *present_target(uint32_t surface_offset)
     for (i = 0; i < RT_MAX; i++) {
         RenderTarget *rt = &s_rt[i];
         if (rt->tex && surface_offset && rt->offset == surface_offset
-                && (!p->offset || (rt->w >= p->w && rt->h >= p->h))) {
+                && (!p->offset || rt->pitch == p->pitch)) {
             rt->presented = 1;
             return rt;
         }
@@ -2158,12 +2160,20 @@ static RenderTarget *present_target(uint32_t surface_offset)
  * when it names this surface (D3D11's present_extent). A target grown for a
  * larger clip (rt_grow) can be bigger than the frame; the rest of it is not
  * the frame. */
-static void present_extent(const RenderTarget *rt, uint32_t *w, uint32_t *h)
+static void present_extent(RenderTarget *rt, uint32_t *w, uint32_t *h)
 {
     const struct nv2a_pb_present *p = nv2a_pb_present_state();
+    /* The walker publishes the display mode's frame, which a title that only
+     * ever drew this buffer at a smaller clip has no target that big for:
+     * grow it (as a larger clip would) rather than show less than the CPU
+     * path, which reads the whole frame from guest memory. A failed grow
+     * shows what there is. */
+    if (p->offset && p->offset == rt->offset && p->pitch == rt->pitch && p->w && p->h
+            && (p->w > rt->w || p->h > rt->h))
+        rt_grow(rt, rt->w > p->w ? rt->w : p->w, rt->h > p->h ? rt->h : p->h);
     *w = rt->w;
     *h = rt->h;
-    if (p->offset && p->offset == rt->offset && p->w && p->h) {
+    if (p->offset && p->offset == rt->offset && p->pitch == rt->pitch && p->w && p->h) {
         if (p->w < *w) *w = p->w;
         if (p->h < *h) *h = p->h;
     }

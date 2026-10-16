@@ -1484,6 +1484,39 @@ VOID __stdcall xbox_AvSetDisplayMode(
         Step, Mode, Format, Pitch, FrameBuffer);
 }
 
+/* The frame size of an AV mode word.
+ *
+ * AvSetDisplayMode programs the encoder and CRTC for one timing, and from then
+ * on the CRTC scans the framebuffer at that timing's width and active lines,
+ * whatever rows the title drew: a title's 640x464 menu is a 640x480 frame on
+ * the TV. The word is the kernel's AV vocabulary (nxdk's hal/video.c lists the
+ * same words with the same sizes): bits 8-15 are the timing, and the timing
+ * alone fixes the frame. Field rendering is not in the word -- the same word
+ * serves a 640x480 frame and 640x240 fields; D3D reports fields by halving the
+ * pitch it passes, which the present pick reads from the surface pitch. */
+int xbox_AvModeSize(ULONG Mode, ULONG *w, ULONG *h)
+{
+    static const struct { UCHAR timing; USHORT w, h; } sizes[] = {
+        { 0x01,  640,  480 }, { 0x03,  640,  480 }, { 0x07,  640,  480 },
+        { 0x0D,  640,  480 }, { 0x0E,  640,  480 }, { 0x0F,  640,  480 },
+        { 0x02,  720,  480 }, { 0x04,  720,  480 }, { 0x08,  720,  480 },
+        { 0x05,  640,  576 }, { 0x06,  720,  576 }, { 0x10,  640,  576 },
+        { 0x0A, 1280,  720 }, { 0x0C, 1920, 1080 },
+    };
+    ULONG timing = (Mode >> 8) & 0xFF, i;
+
+    for (i = 0; i < sizeof sizes / sizeof sizes[0]; i++) {
+        if (sizes[i].timing == timing) {
+            if (w) *w = sizes[i].w;
+            if (h) *h = sizes[i].h;
+            return 1;
+        }
+    }
+    if (w) *w = 0;
+    if (h) *h = 0;
+    return 0;
+}
+
 /* ============================================================================
  * SMBus - HalReadSMBusValue / HalWriteSMBusValue
  *

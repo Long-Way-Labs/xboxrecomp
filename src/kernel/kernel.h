@@ -1094,6 +1094,9 @@ ULONG   __stdcall xbox_AvGetSavedDataAddress(void);
 VOID    __stdcall xbox_AvSendTVEncoderOption(PVOID RegisterBase, ULONG Option, ULONG Param, PULONG Result);
 VOID    __stdcall xbox_AvSetSavedDataAddress(ULONG Address);
 VOID    __stdcall xbox_AvSetDisplayMode(PVOID RegisterBase, ULONG Step, ULONG Mode, ULONG Format, ULONG Pitch, ULONG FrameBuffer);
+/* The frame an AV mode word scans out: *w x *h from the word's timing byte,
+ * 1 when it is known, 0 (and 0x0) when it is not. Not a kernel export. */
+int xbox_AvModeSize(ULONG Mode, ULONG *w, ULONG *h);
 
 /* SMBus (HalReadSMBusValue / HalWriteSMBusValue) */
 NTSTATUS __stdcall xbox_HalReadSMBusValue(UCHAR SlaveAddress, UCHAR CommandCode, BOOLEAN ReadWordValue, PULONG DataValue);

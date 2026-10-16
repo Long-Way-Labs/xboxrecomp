@@ -1477,12 +1477,96 @@ static int s_pb_report = 0;
  * second so a run can answer the only question that matters before building a
  * presenter: is the guest putting pixels anywhere at all, and do they change
  * from frame to frame. */
-static uint32_t s_fb_va, s_fb_pitch, s_fb_height = 480;
+static uint32_t s_fb_va, s_fb_pitch;
+/* The mode's frame size (0x0 for an unknown word or a pitch that disagrees
+ * with it) and AV format, beside the address. Everything that used to assume
+ * 480 lines reads these. */
+static uint32_t s_fb_mode_w, s_fb_mode_h, s_fb_format;
+/* A sequence count around the record: the title's thread sets it, the
+ * executor (the ack thread) reads it at every flip, and a half-written
+ * record would pair a new address with an old size. Odd while a write is
+ * in flight; a reader retries until it saw the same even count on both
+ * sides of its copy. */
+static uint32_t s_fb_seq;
 
+static void fb_record(uint32_t fb_va, uint32_t pitch, uint32_t w, uint32_t h,
+                      uint32_t format)
+{
+    uint32_t seq = __atomic_load_n(&s_fb_seq, __ATOMIC_RELAXED);
+
+    __atomic_store_n(&s_fb_seq, seq + 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_store_n(&s_fb_va, fb_va, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_fb_pitch, pitch, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_fb_mode_w, w, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_fb_mode_h, h, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_fb_format, format, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_fb_seq, seq + 2, __ATOMIC_RELEASE);
+}
+
+/* Address and pitch alone, with no size: what a caller without a mode word
+ * (the backend smoke's older cases) sets, so the present keeps the clip. */
 void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch)
 {
-    s_fb_va = fb_va;
-    s_fb_pitch = pitch;
+    fb_record(fb_va, pitch, 0, 0, 0);
+}
+
+/* Bytes per pixel of the linear AV formats D3D passes AvSetDisplayMode (it
+ * maps its D3DFORMAT to these codes); 0 for anything else, which is not
+ * cross-checked. */
+static uint32_t av_format_bpp(uint32_t format)
+{
+    switch (format) {
+    case 0x12: case 0x1E:            return 4;   /* LIN_A8R8G8B8, LIN_X8R8G8B8 */
+    case 0x11: case 0x1C: case 0x10: return 2;   /* LIN_R5G6B5, LIN_X1R5G5B5, LIN_A1R5G5B5 */
+    default:                         return 0;
+    }
+}
+
+void xbox_SetDisplayMode(uint32_t fb_va, uint32_t pitch, uint32_t mode, uint32_t format)
+{
+    ULONG w = 0, h = 0;
+    uint32_t bpp = av_format_bpp(format);
+
+    if (!xbox_AvModeSize(mode, &w, &h)) {
+        fprintf(stderr, "  [AV] mode 0x%08X: unknown timing 0x%02X, no display size"
+                        " (the present keeps the clip extent)\n",
+                mode, (mode >> 8) & 0xFF);
+    } else if (bpp && pitch && pitch / bpp != w && pitch / bpp != w / 2) {
+        /* D3D halves the pitch it passes for a field mode (its buffers are
+         * at twice the display pitch), so half the width is a field title,
+         * not a disagreement. Any other width is: presenting the mode's
+         * width at this pitch would make a row of pitch / w bytes, a pixel
+         * size no format has, so record no size and keep the clip. */
+        fprintf(stderr, "  [AV] mode 0x%08X is %lux%lu but pitch %u is %u pixels"
+                        " of format 0x%02X; no display size (the present keeps the"
+                        " clip extent)\n",
+                mode, (unsigned long)w, (unsigned long)h, pitch, pitch / bpp, format);
+        w = h = 0;
+    }
+    fb_record(fb_va, pitch, (uint32_t)w, (uint32_t)h, format);
+}
+
+uint32_t xbox_GetDisplayMode(uint32_t *pitch, uint32_t *w, uint32_t *h)
+{
+    uint32_t seq, va, p, mw, mh, spins = 0;
+
+    do {
+        /* A writer preempted mid-record would keep a spinning reader from
+         * ever seeing an even count on a busy host: let it run. */
+        if (++spins > 64)
+            SwitchToThread();
+        seq = __atomic_load_n(&s_fb_seq, __ATOMIC_ACQUIRE);
+        va = __atomic_load_n(&s_fb_va, __ATOMIC_RELAXED);
+        p = __atomic_load_n(&s_fb_pitch, __ATOMIC_RELAXED);
+        mw = __atomic_load_n(&s_fb_mode_w, __ATOMIC_RELAXED);
+        mh = __atomic_load_n(&s_fb_mode_h, __ATOMIC_RELAXED);
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    } while ((seq & 1) || seq != __atomic_load_n(&s_fb_seq, __ATOMIC_RELAXED));
+    if (pitch) *pitch = p;
+    if (w) *w = mw;
+    if (h) *h = mh;
+    return va;
 }
 
 /* Where the title last said its framebuffer is, for anything that wants to read
@@ -1498,9 +1582,7 @@ void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch)
  * twice over -- once in the probe below, once in a caller of this. */
 uint32_t xbox_GetDisplayFramebuffer(uint32_t *pitch)
 {
-    if (pitch)
-        *pitch = s_fb_pitch;
-    return s_fb_va;
+    return xbox_GetDisplayMode(pitch, NULL, NULL);
 }
 
 static uint32_t s_display_mode_gen;
@@ -1520,24 +1602,31 @@ static void framebuffer_probe_tick(void)
     static DWORD last_ms;
     static uint32_t last_sum;
     DWORD now = GetTickCount();
-    uint32_t sum = 0, nonzero = 0, i, n;
+    uint32_t sum = 0, nonzero = 0, i, n, fb_pitch = 0, fb_h = 0, fb_va;
     const uint32_t *p;
 
-    if (!s_nv2a_trace || !s_fb_va || !s_fb_pitch)
+    if (!s_nv2a_trace)
+        return;
+    /* The record through its reader: the title's thread may be setting a
+     * mode as this runs. */
+    fb_va = xbox_GetDisplayMode(&fb_pitch, NULL, &fb_h);
+    if (!fb_h)
+        fb_h = 480;
+    if (!fb_va || !fb_pitch)
         return;
     if (last_ms && (now - last_ms) < 1000)
         return;
     last_ms = now;
-    if ((size_t)s_fb_va + s_fb_pitch * s_fb_height > g_memory_size)
+    if ((size_t)fb_va + fb_pitch * fb_h > g_memory_size)
         return;
-    p = (const uint32_t *)((uintptr_t)s_fb_va + g_memory_offset);
-    n = (s_fb_pitch * s_fb_height) / 4;
+    p = (const uint32_t *)((uintptr_t)fb_va + g_memory_offset);
+    n = (fb_pitch * fb_h) / 4;
     for (i = 0; i < n; i++) {
         sum = sum * 33u + p[i];
         if (p[i]) nonzero++;
     }
     fprintf(stderr, "  [FB] 0x%08X sum=%08X nonzero=%u/%u %s\n",
-            s_fb_va, sum, nonzero, n,
+            fb_va, sum, nonzero, n,
             sum != last_sum ? "CHANGED" : "same");
     last_sum = sum;
     fflush(stderr);

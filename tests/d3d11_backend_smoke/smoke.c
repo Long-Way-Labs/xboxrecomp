@@ -19,6 +19,8 @@
  * and elem32: a quad list of 4800 ARRAY_ELEMENT16 indices whose quads from
  * index 4096 on have their own colour, and a triangle list whose odd last
  * index is an ARRAY_ELEMENT32; a pixel inside each must be drawn.
+ * Then the display mode's frame: with a 640x480 mode the crop case shows
+ * 640x480, and a buffer drawn only at 320x240 is grown to it.
  * Last, present.surface=internal: a live render.scale change resizes the
  * swap chain to the frame's host size.
  * With RECOMP_PB_BACKEND=d3d11 that reaches ClearRenderTargetView, a draw
@@ -47,6 +49,9 @@ void nv2a_pb_d3d11_back_size(uint32_t *w, uint32_t *h);
 int nv2a_pb_d3d11_shown(uint32_t offset, uint32_t *tw, uint32_t *th,
                         uint32_t *sw, uint32_t *sh);
 ptrdiff_t xbox_GetMemoryOffset(void);
+void xbox_SetDisplayMode(uint32_t fb_va, uint32_t pitch, uint32_t mode, uint32_t format);
+void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch);
+void xbox_DisplayModeBump(void);
 
 /* The kernel library expects these from the title's generated code. */
 void *recomp_lookup(ULONG address) { (void)address; abort(); }
@@ -103,6 +108,9 @@ static uint32_t s_surf_base = 0x01000000u;
 /* clip_cases' render.scale 2 crop: a 640x480 buffer of its own, since a
  * target's host size is fixed when it is made. */
 #define CROP2     (s_surf_base + 0x00400000u)
+/* mode_cases' grow: a 640x480 buffer drawn only at 320x240, in the gap
+ * after the two back buffers. */
+#define GROW      (s_surf_base + 0x00258000u)
 #define P8_GUEST  (TEX_GUEST + 0x8000u)
 #define PAL_GUEST (TEX_GUEST + 0x9000u)
 #define MIP_GUEST (TEX_GUEST + 0xA000u)  /* 32x32 A8R8G8B8, 6 levels */
@@ -575,6 +583,102 @@ static int clip_cases(const uint32_t *buf)
     M(0x0200, 640u << 16);
     M(0x0204, 480u << 16);
     M(0x0210, buf[0]);
+    return f;
+}
+
+/* The display mode's frame (present-mode-height): with a 640x480 mode set,
+ * the walker publishes 640x480 whatever clip drew the buffer, and this
+ * backend shows that much. Crop with a mode: crop_flips' stream, whose
+ * 320x240 frame of a 640x480 target is shown 320x240 without a mode, is
+ * shown 640x480, so back-buffer (400,300) is the red the whole frames left
+ * there. Grow: a buffer only ever drawn with a 320x240 clip has a 320x240
+ * target, which present_extent grows to 640x480 and shows whole; (100,100)
+ * is the clip's blue on screen. The grow margin is not checked: it is black
+ * here and the guest's bytes on Metal and the CPU path (a TASKS follow-up).
+ * Each case ends with no display mode. Returns the failures. */
+static void mode_set(uint32_t buf)
+{
+    /* What the AvSetDisplayMode bridge records: NTSC-M 480i, 640x480,
+     * LIN_A8R8G8B8 at pitch 2560, the resolved address. */
+    xbox_SetDisplayMode(0x80000000u | buf, 2560u, 0x0801010Du, 0x12);
+    xbox_DisplayModeBump();
+}
+
+static void mode_clear(void)
+{
+    xbox_SetDisplayFramebuffer(0, 0);
+    xbox_DisplayModeBump();
+}
+
+static int mode_cases(uint32_t buf)
+{
+    uint32_t tw = 0, th = 0, sw = 0, sh = 0, got;
+    int f = 0, k, ok;
+
+    /* Crop with a mode. */
+    mode_set(buf);
+    M(0x0210, buf);
+    M(0x020C, 640u * 4u);
+    M(0x0200, 640u << 16);
+    M(0x0204, 480u << 16);
+    for (k = 0; k < 2; k++) {
+        M(0x1D90, 0xFFFF0000u);
+        M(0x1D94, 0xF0);
+        M(0x012C, 0);
+        M(0x0130, 0);
+    }
+    M(0x0200, 320u << 16);
+    M(0x0204, 240u << 16);
+    nv2a_pb_d3d11_back_pixel(400, 300);
+    for (k = 0; k < 122; k++) {
+        M(0x1D90, 0xFF0000FFu);
+        M(0x1D94, 0xF0);
+        M(0x012C, 0);
+        M(0x0130, 0);
+    }
+    got = nv2a_pb_d3d11_back_pixel(-1, -1);
+    ok = nv2a_pb_d3d11_shown(buf, &tw, &th, &sw, &sh) && tw == 640 && th == 480
+        && sw == 640 && sh == 480 && got == 0xFFFF0000u;
+    fprintf(stderr, "[backend-smoke] mode-height: crop with a 640x480 mode, target %ux%u"
+            " shown %ux%u, back buffer (400,300) 0x%08X (want 640x480, 640x480,"
+            " 0xFFFF0000) %s\n", tw, th, sw, sh, got, ok ? "PASS" : "FAIL");
+    f += !ok;
+    M(0x0200, 640u << 16);
+    M(0x0204, 480u << 16);
+    mode_clear();
+
+    /* Grow at present. */
+    {
+        /* The guest bytes under it green, written from the CPU, so no
+         * draw makes a 640x480 target first. */
+        uint32_t *g = (uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + GROW);
+        for (k = 0; k < 640 * 480; k++)
+            g[k] = 0xFF00FF00u;
+    }
+    mode_set(GROW);
+    M(0x0200, 320u << 16);
+    M(0x0204, 240u << 16);
+    M(0x0208, 0x00000128u);
+    M(0x020C, 640u * 4u);
+    M(0x0210, GROW);
+    nv2a_pb_d3d11_back_pixel(100, 100);
+    for (k = 0; k < 3; k++) {
+        M(0x1D90, 0xFF0000FFu);
+        M(0x1D94, 0xF0);
+        M(0x012C, 0);
+        M(0x0130, 0);
+    }
+    got = nv2a_pb_d3d11_back_pixel(-1, -1);
+    ok = nv2a_pb_d3d11_shown(GROW, &tw, &th, &sw, &sh) && tw == 640 && th == 480
+        && sw == 640 && sh == 480 && got == 0xFF0000FFu;
+    fprintf(stderr, "[backend-smoke] mode-height: 320x240 clip under a 640x480 mode,"
+            " target %ux%u shown %ux%u, back buffer (100,100) 0x%08X (want 640x480,"
+            " 640x480, 0xFF0000FF) %s\n", tw, th, sw, sh, got, ok ? "PASS" : "FAIL");
+    f += !ok;
+    M(0x0200, 640u << 16);
+    M(0x0204, 480u << 16);
+    M(0x0210, buf);
+    mode_clear();
     return f;
 }
 
@@ -1179,6 +1283,10 @@ int main(int argc, char **argv)
     if (clip_cases(buf)) {
         fprintf(stderr, "[backend-smoke] FAIL: clip extents (clear, present crop)\n");
         return 5;
+    }
+    if (mode_cases(buf[0])) {
+        fprintf(stderr, "[backend-smoke] FAIL: display mode's frame (crop, grow)\n");
+        return 9;
     }
     if (alias_cases(buf)) {
         fprintf(stderr, "[backend-smoke] FAIL: render-target ownership\n");

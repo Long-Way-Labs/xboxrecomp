@@ -188,6 +188,16 @@ uint32_t xbox_Nv2aKickStats(uint64_t *wait_ns);
 
 /* Tell the runtime where the display framebuffer is (from AvSetDisplayMode). */
 void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch);
+/* The whole display mode, from AvSetDisplayMode: the resolved address, the
+ * pitch, the AV mode word (its frame size through xbox_AvModeSize) and the AV
+ * format. An unknown word, or a pitch that is neither the mode's width nor
+ * half of it (a field title) in the format's pixels, records no size. Safe
+ * against a reader on another thread. Call before xbox_DisplayModeBump. */
+void xbox_SetDisplayMode(uint32_t fb_va, uint32_t pitch, uint32_t mode, uint32_t format);
+/* The display's pitch and frame size; w and h are 0 without a mode set or
+ * for an unknown word. Returns the resolved address, as the getter below.
+ * Any pointer may be NULL. */
+uint32_t xbox_GetDisplayMode(uint32_t *pitch, uint32_t *w, uint32_t *h);
 /* Read it back: 0 until the title sets a mode. Pitch is optional. */
 uint32_t xbox_GetDisplayFramebuffer(uint32_t *pitch);
 /* A display-mode generation: AvSetDisplayMode bumps it (on the title's

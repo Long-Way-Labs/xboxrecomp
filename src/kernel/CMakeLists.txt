@@ -34,6 +34,7 @@ set(KERNEL_SOURCES
     nv2a_tex_pack.c
     nv2a_vsh_cpu.c
     nv2a_vsh_cdump.c
+    nv2a_fb_ring.c
     nv2a_combiner.c
 )
 

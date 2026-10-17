@@ -3310,13 +3310,14 @@ static void dump_frame(void)
         prefix = recomp_env(RENV_D3D11_DUMP);
     }
     if (!prefix) {
-        /* fb_dump_at leaves the listed flips to this backend, which writes
-         * them only next to its d3d11_dump frames. */
+        /* fb_dump_at and fb_dump_prog leave their flips to this backend,
+         * which writes them only next to its d3d11_dump frames. */
         static int warned;
         if (!warned && nv2a_pb_dump_at_listed((uint32_t)s_presents)) {
             warned = 1;
-            fprintf(stderr, LOGP "WARNING: fb_dump_at is set without d3d11_dump;"
-                    " no flips will be dumped\n");
+            fprintf(stderr, LOGP "WARNING: %s is set without d3d11_dump;"
+                    " no flips will be dumped\n",
+                    recomp_env(RENV_FB_DUMP_AT) ? "fb_dump_at" : "fb_dump_prog");
         }
         return;
     }

@@ -42,6 +42,7 @@
 #include "../d3d/d3d8_swizzle.h"
 #include "nv2a_vsh_cpu.h"
 #include "nv2a_vsh_cdump.h"
+#include "nv2a_fb_ring.h"
 #include "nv2a_combiner.h"
 #include "nv2a_pb_state.h"
 #include "nv2a_backend_common.h"
@@ -1325,21 +1326,23 @@ static void dump_present_bmp(void)
 /* RECOMP_FB_DUMP_AT=<flips>: the frame each listed flip presents, as
  * <prefix>flip_NNNNN.bmp named by the flip number (the number
  * RECOMP_FLIP_LOG prints), whatever else dumps in between. <flips> is a comma
- * list of numbers and ranges (a-b), up to 64 items. Flip N is the frame
+ * list of numbers and ranges (a-b), up to DUMP_AT_MAX items; the rest are
+ * counted and reported, not dumped. Flip N is the frame
  * RECOMP_D3D11_DUMP writes as present N, so a golden-frame script can ask for
  * dump k as flip 60k+1, or for a window around an event. The CPU path and
  * backends that write back (Metal) are dumped here, from guest memory, with
  * the RECOMP_FB_DUMP prefix; a backend that presents from its own surfaces
  * (D3D11) dumps the listed flips itself (nv2a_pb_dump_at_listed). */
+#define DUMP_AT_MAX 256
 static int s_dump_at_n = -1;
-static uint32_t s_dump_at_lo[64], s_dump_at_hi[64];
+static uint32_t s_dump_at_lo[DUMP_AT_MAX], s_dump_at_hi[DUMP_AT_MAX];
 
 static void dump_at_parse(void)
 {
     const char *e = recomp_env(RENV_FB_DUMP_AT);
-    int n = 0;
+    int n = 0, dropped = 0;
 
-    while (e && *e && n < 64) {
+    while (e && *e) {
         char *end;
         unsigned long a = strtoul(e, &end, 10), b = a;
         if (end == e)
@@ -1350,7 +1353,9 @@ static void dump_at_parse(void)
             if (end == e)
                 break;
         }
-        if (b >= a) {
+        if (b >= a && n == DUMP_AT_MAX) {
+            dropped++;
+        } else if (b >= a) {
             s_dump_at_lo[n] = (uint32_t)a;
             s_dump_at_hi[n] = (uint32_t)b;
             n++;
@@ -1360,6 +1365,61 @@ static void dump_at_parse(void)
             break;
     }
     s_dump_at_n = n;
+    if (dropped)
+        fprintf(stderr, "  [GPU] fb_dump_at: %d ranges past the first %d ignored\n",
+                dropped, DUMP_AT_MAX);
+}
+
+/* RECOMP_DEBUG=fb_dump_prog (nv2a_fb_ring.h): armed at the first flip,
+ * fired by the first draw of a listed program (fb_prog_draw), which makes
+ * flips lo..hi dump as if fb_dump_at listed them and has the ring written
+ * at the next flip. */
+static struct {
+    int state;          /* 0 unread, 1 armed, 2 fired (ring to write), 3 done, -1 off */
+    int here;           /* the walker dumps (CPU, write-back backend) */
+    struct nv2a_vsh_cdump_cfg cfg;
+    uint32_t after, lo, hi;
+    struct nv2a_fb_ring ring;
+} s_fbp;
+
+static void fb_prog_init(void);
+
+/* Armed: keep the frame this flip presents, read back as write_present_bmp
+ * reads it. */
+static void fb_prog_keep(uint32_t flip)
+{
+    static int warned;
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    uint32_t bpp = s_present.w ? s_present.pitch / s_present.w : 0;
+    const struct nv2a_pb_backend *be;
+
+    if (!s_present.offset || (bpp != 2 && bpp != 4))
+        return;
+    be = nv2a_pb_get_backend();
+    if (be->sync_guest)
+        be->sync_guest(s_present.offset, s_present.pitch, s_present.w, s_present.h);
+    if (nv2a_fb_ring_push(&s_fbp.ring, flip, mem + dma_resolve(s_present.offset),
+                          s_present.pitch, s_present.w, s_present.h, bpp)
+            && !warned) {
+        warned = 1;
+        fprintf(stderr, "  [GPU] fb_dump_prog: no memory for flip %u's frame;"
+                        " the ring has a gap\n", flip);
+    }
+}
+
+/* Fired: the flips before the trigger, oldest first, then the ring goes. */
+static void fb_prog_write_ring(const char *prefix)
+{
+    uint32_t i;
+    char path[512];
+
+    for (i = 0; prefix && i < s_fbp.ring.count; i++) {
+        const struct nv2a_fb_frame *f = nv2a_fb_ring_get(&s_fbp.ring, i);
+        snprintf(path, sizeof path, "%sflip_%05u.bmp", prefix, f->flip);
+        if (!write_bmp_at(path, f->px, f->pitch, f->w, f->h, f->bpp, 0))
+            fprintf(stderr, "  [GPU] flip %u: fb_dump_prog dump failed\n", f->flip);
+    }
+    nv2a_fb_ring_free(&s_fbp.ring);
 }
 
 int nv2a_pb_dump_at_listed(uint32_t flip)
@@ -1371,7 +1431,7 @@ int nv2a_pb_dump_at_listed(uint32_t flip)
     for (i = 0; i < s_dump_at_n; i++)
         if (flip >= s_dump_at_lo[i] && flip <= s_dump_at_hi[i])
             return 1;
-    return 0;
+    return s_fbp.state >= 2 && flip >= s_fbp.lo && flip <= s_fbp.hi;
 }
 
 static void dump_at_flip(uint32_t flip)
@@ -1394,6 +1454,14 @@ static void dump_at_flip(uint32_t flip)
                 fprintf(stderr, "  [GPU] WARNING: fb_dump_at is set without"
                         " fb_dump; no flips will be dumped\n");
         }
+    }
+    if (s_fbp.state == 0)
+        fb_prog_init();
+    if (s_fbp.state == 1 && s_fbp.ring.size)
+        fb_prog_keep(flip);
+    else if (s_fbp.state == 2) {
+        fb_prog_write_ring(here ? prefix : NULL);
+        s_fbp.state = 3;
     }
     if (!here || !prefix || !nv2a_pb_dump_at_listed(flip))
         return;
@@ -2475,7 +2543,7 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
 static struct nv2a_pb_vsh s_vsh;
 
 /* Distinct programs, by hash of the slots from START to FINAL. */
-#define VSH_MAX_PROGS 64
+#define VSH_MAX_PROGS 256
 static struct { uint32_t hash, start, len, batches; } s_vsh_progs[VSH_MAX_PROGS];
 static int s_vsh_prog_count;
 
@@ -2711,13 +2779,22 @@ static uint32_t vsh_note_program(void)
     uint32_t len, pc, h = nv2a_vsh_program_hash(&s_vsh, &len);
     int i;
 
+    /* A linear scan, up to VSH_MAX_PROGS per draw on the CPU path: cheaper
+     * than the hash above, which walks the whole program every draw. */
     for (i = 0; i < s_vsh_prog_count; i++)
         if (s_vsh_progs[i].hash == h && s_vsh_progs[i].start == s_vsh.start) {
             s_vsh_progs[i].batches++;
             return len;
         }
-    if (s_vsh_prog_count >= VSH_MAX_PROGS)
+    if (s_vsh_prog_count >= VSH_MAX_PROGS) {
+        static int said;
+        if (!said) {
+            said = 1;
+            fprintf(stderr, "  [VSH] %d programs noted; later ones are neither"
+                            " counted nor dumped\n", VSH_MAX_PROGS);
+        }
         return len;
+    }
     s_vsh_progs[s_vsh_prog_count].hash = h;
     s_vsh_progs[s_vsh_prog_count].start = s_vsh.start;
     s_vsh_progs[s_vsh_prog_count].len = len;
@@ -5931,6 +6008,110 @@ static void vsh_const_dump_draw(void)
     s_vcd.bytes += NV2A_VSH_CDUMP_RECORD;
 }
 
+/* A frame count for fb_dump_prog_before/_after: digits only, so a typo turns
+ * the trigger off instead of silently meaning 0. */
+static int fb_prog_count(const char *key, const char *e, uint32_t *out)
+{
+    char *end;
+    unsigned long v;
+
+    if (!e)
+        return 0;
+    v = strtoul(e, &end, 10);
+    if (end == e || *end || *e == '-' || v > 0xFFFFFFFFul) {
+        fprintf(stderr, "  [GPU] %s=%s is not a frame count; fb_dump_prog off\n", key, e);
+        return -1;
+    }
+    *out = (uint32_t)v;
+    return 0;
+}
+
+/* Each dumped flip is a full BMP (about 1.2 MB at 640x480): a typo such as
+ * fb_dump_prog_after=60000 would otherwise write tens of GB. */
+#define FB_PROG_AFTER_MAX 240
+
+static void fb_prog_init(void)
+{
+    const char *progs = recomp_env(RENV_FB_DUMP_PROG);
+    const struct nv2a_pb_backend *be = nv2a_pb_get_backend();
+    uint32_t before = 30;
+
+    s_fbp.state = -1;
+    if (!progs)
+        return;
+    s_fbp.after = 60;
+    if (fb_prog_count("fb_dump_prog_before", recomp_env(RENV_FB_DUMP_PROG_BEFORE), &before)
+            || fb_prog_count("fb_dump_prog_after", recomp_env(RENV_FB_DUMP_PROG_AFTER),
+                             &s_fbp.after))
+        return;
+    if (s_fbp.after > FB_PROG_AFTER_MAX) {
+        fprintf(stderr, "  [GPU] fb_dump_prog_after=%u: capped at %d\n", s_fbp.after,
+                FB_PROG_AFTER_MAX);
+        s_fbp.after = FB_PROG_AFTER_MAX;
+    }
+    s_fbp.here = be == nv2a_pb_cpu_backend() || be->writes_back;
+    if (!vsh_enabled()) {
+        fprintf(stderr, "  [GPU] fb_dump_prog needs pb_vsh (pb_vsh=0 is set); off\n");
+        return;
+    }
+    if (nv2a_vsh_cdump_parse(NULL, progs, &s_fbp.cfg) || !s_fbp.cfg.nprog) {
+        fprintf(stderr, "  [GPU] fb_dump_prog malformed; off\n");
+        return;
+    }
+    /* D3D11 presents from its own surfaces: it dumps the flips after the
+     * trigger (nv2a_pb_dump_at_listed) but keeps no ring. */
+    if (nv2a_fb_ring_init(&s_fbp.ring, s_fbp.here ? before : 0)) {
+        fprintf(stderr, "  [GPU] fb_dump_prog_before=%u: 0..%d frames; off\n",
+                before, NV2A_FB_RING_MAX);
+        return;
+    }
+    s_fbp.state = 1;
+    fprintf(stderr, "  [GPU] fb_dump_prog: armed for %d program(s), %u flips"
+                    " before%s, %u after\n", s_fbp.cfg.nprog, s_fbp.ring.size,
+            s_fbp.here || !before ? "" : " (no ring on this backend)", s_fbp.after);
+    /* Said at arming, not at the trigger, which may come minutes later. */
+    if (s_fbp.here && !recomp_env(RENV_FB_DUMP))
+        fprintf(stderr, "  [GPU] WARNING: fb_dump_prog is set without fb_dump;"
+                        " no flips will be dumped\n");
+    else if (!s_fbp.here && !recomp_env(RENV_D3D11_DUMP))
+        fprintf(stderr, "  [GPU] WARNING: fb_dump_prog is set without d3d11_dump;"
+                        " no flips will be dumped\n");
+}
+
+/* The trigger: a draw at flip count k is presented by flip k+1. */
+static void fb_prog_draw(void)
+{
+    uint32_t h, first;
+
+    if (s_fbp.state == 0)
+        fb_prog_init();
+    if (s_fbp.state != 1 || !vsh_batch_active())
+        return;
+    h = nv2a_vsh_program_hash(&s_vsh, NULL);
+    if (!nv2a_vsh_cdump_wanted(&s_fbp.cfg, s_gpu.flips, h))
+        return;
+    nv2a_fb_trigger_range(s_gpu.flips, s_fbp.ring.count, s_fbp.after,
+                          &first, &s_fbp.lo, &s_fbp.hi);
+    s_fbp.state = 2;
+    fprintf(stderr, "  [GPU] fb_dump_prog: %08X first drawn at flip %u (draw %u);"
+                    " dumping flips %u-%u\n", h, s_gpu.flips, s_gpu.draws,
+            s_fbp.ring.count ? first : s_fbp.lo, s_fbp.hi);
+}
+
+/* vsh_dump and the vsh trace on a GPU backend, where raster_batch_vsh_one
+ * (which notes the program on the CPU path) never runs. Only when asked: the
+ * hash walks the whole program, every draw. */
+static void vsh_note_gpu(void)
+{
+    static int on = -1;
+
+    if (on < 0)
+        on = s_backend != &s_cpu_backend
+          && (recomp_env(RENV_VSH_DUMP) || recomp_env(RENV_VSH_TRACE));
+    if (on && vsh_batch_active())
+        (void)vsh_note_program();
+}
+
 /* What a batch actually contains. Before anything can be rasterised, the
  * question is what space attribute 0 arrives in: a title running a vertex
  * program hands over object-space positions that mean nothing without running
@@ -5970,6 +6151,8 @@ static void draw_primitive(void)
     if (s_gpu.color_keep != 0xFFFFFFFFu)   /* a depth/stencil-only pass draws no colour */
         present_note(0);
     vsh_const_dump_draw();
+    vsh_note_gpu();
+    fb_prog_draw();
     if (s_backend->on_draw) {
         uint64_t t0 = rt_now();
         struct nv2a_pb_draw d;

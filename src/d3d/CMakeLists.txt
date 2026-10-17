@@ -86,6 +86,9 @@ if(NOT WIN32)
     # And its vertex-program path's near clip and border colour.
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/pb_clip_border
                      ${CMAKE_CURRENT_BINARY_DIR}/pb_clip_border)
+    # And a stride-0 vertex array: every vertex reads its one element.
+    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/pb_stride0
+                     ${CMAKE_CURRENT_BINARY_DIR}/pb_stride0)
     # And the semaphore release's context DMA base (RAMHT/PRAMIN lookup).
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/pb_semaphore
                      ${CMAKE_CURRENT_BINARY_DIR}/pb_semaphore)

@@ -694,7 +694,12 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
 
     out[0] = out[1] = out[2] = 0.0f;
     out[3] = 1.0f;
-    if (!a->size || !a->stride)
+    /* Size 0 is the only inline state. Stride 0 is still an array: every
+     * vertex reads the same element (a per-batch constant from memory).
+     * SSX 3's rider passes its mesh offset in v4 this way; reading the
+     * inline value instead picked up another program's v4 and threw the
+     * body off screen. */
+    if (!a->size)
         return 0;
     if (s_gpu.inline_active) {
         /* The batch arrived as INLINE_ARRAY, so `offset` is a byte offset into
@@ -2841,7 +2846,7 @@ static void vsh_inputs(uint32_t index, float v[NV2A_VSH_INPUTS][4])
 
     for (a = 0; a < NV_VERTEX_ATTRS; a++) {
         const VertexAttr *at = &s_gpu.attr[a];
-        if (at->size && at->stride
+        if (at->size
                 && (s_gpu.inline_active || at->offset)
                 && fetch_attr(at, index, v[a])) {
             /* An array of fewer than four components fills the rest with

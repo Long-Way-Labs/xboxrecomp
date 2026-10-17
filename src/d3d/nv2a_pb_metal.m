@@ -2054,10 +2054,11 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             return;
         }
         /* Each input as float4, fetched as the CPU path does; a disabled
-         * one (or one without data) is its SET_VERTEX_DATA value. */
+         * one (or one without data) is its SET_VERTEX_DATA value. Stride 0
+         * is an array of one element (fetch_attr). */
         for (k = 0; k < nf4; k++) {
             const VertexAttr *a = &d->attr[slot[k]];
-            int on = a->size && a->stride;
+            int on = a->size != 0;
             for (i = 0; i < count; i++) {
                 float *o = vf + ((size_t)i * nf4 + k) * 4;
                 if (!on || !fetch(d, a, lo + i, o))

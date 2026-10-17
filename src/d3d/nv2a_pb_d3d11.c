@@ -2599,7 +2599,7 @@ static void trace_batch(const struct nv2a_pb_draw *d, VsEntry *vs, RenderTarget 
             memset(in, 0, sizeof in);
             for (i = 0; i < NV2A_VSH_INPUTS && i < NV2A_VS_MAX_INPUTS; i++) {
                 const VertexAttr *a = &d->attr[i];
-                if (!(a->size && a->stride) || !fetch(d, a, d->idx[k], in[i]))
+                if (!a->size || !fetch(d, a, d->idx[k], in[i]))
                     memcpy(in[i], v->inl[i], 16);
             }
             nv2a_vsh_run((const uint32_t (*)[4])v->prog, v->start,
@@ -2615,7 +2615,7 @@ static void trace_batch(const struct nv2a_pb_draw *d, VsEntry *vs, RenderTarget 
         memset(in, 0, sizeof in);
         for (i = 0; i < NV2A_VSH_INPUTS && i < NV2A_VS_MAX_INPUTS; i++) {
             const VertexAttr *a = &d->attr[i];
-            if (!(a->size && a->stride) || !fetch(d, a, index, in[i]))
+            if (!a->size || !fetch(d, a, index, in[i]))
                 memcpy(in[i], v->inl[i], 16);
         }
         nv2a_vsh_run((const uint32_t (*)[4])v->prog, v->start,
@@ -2984,8 +2984,9 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
      * assembler reads natively is copied as it is: vertices lo..hi of its
      * buffer in one block, shared by every stream interleaved in it (same
      * stride, within one stride of each other), bound at their own offsets.
-     * The rest go as float4 per vertex, or one float4 at stride 0 (the
-     * current SET_VERTEX_DATA value) if disabled. */
+     * The rest go as float4 per vertex, or one float4 at stride 0: a
+     * stride-0 array's one element (every vertex reads it, as fetch_attr
+     * does), or the current SET_VERTEX_DATA value if disabled. */
     memset(vbs, 0, sizeof vbs);
     memset(strides, 0, sizeof strides);
     memset(offs, 0, sizeof offs);
@@ -3067,7 +3068,8 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
             }
             strides[i] = 16;
         } else {
-            memcpy(f, v->inl[i], 16);
+            if (!a->size || !fetch(d, a, 0, f))
+                memcpy(f, v->inl[i], 16);
             strides[i] = 0;
         }
         s_vb_expanded += bytes;

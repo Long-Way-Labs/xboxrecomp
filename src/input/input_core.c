@@ -76,6 +76,31 @@ void xbox_InputSetBackend(const xbox_input_backend *b)
     memset(g_rumbling, 0, sizeof g_rumbling);
 }
 
+DWORD xbox_InputGetPadState(DWORD slot, XBOX_INPUT_STATE *pState)
+{
+    if (slot >= XBOX_MAX_CONTROLLERS || !pState)
+        return ERROR_DEVICE_NOT_CONNECTED;
+    xbox_InputInit();
+    return due(slot) ? probe(slot, pState) : ERROR_DEVICE_NOT_CONNECTED;
+}
+
+void xbox_InputMergeKbm(XBOX_INPUT_STATE *pad, const XBOX_INPUT_STATE *kb)
+{
+    XBOX_GAMEPAD *g = &pad->Gamepad;
+
+    g->wButtons |= kb->Gamepad.wButtons;
+    for (int i = 0; i < 8; i++)
+        if (kb->Gamepad.bAnalogButtons[i] > g->bAnalogButtons[i])
+            g->bAnalogButtons[i] = kb->Gamepad.bAnalogButtons[i];
+    if (kb->Gamepad.sThumbLX) g->sThumbLX = kb->Gamepad.sThumbLX;
+    if (kb->Gamepad.sThumbLY) g->sThumbLY = kb->Gamepad.sThumbLY;
+    if (kb->Gamepad.sThumbRX) g->sThumbRX = kb->Gamepad.sThumbRX;
+    if (kb->Gamepad.sThumbRY) g->sThumbRY = kb->Gamepad.sThumbRY;
+    /* The title's input layer records edges, so an unchanged packet
+     * number reads as the same state and a key press never happens. */
+    pad->dwPacketNumber = kb->dwPacketNumber;
+}
+
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
     XBOX_INPUT_STATE kb;
@@ -83,9 +108,7 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
-    xbox_InputInit();
-
-    rc = due(dwPort) ? probe(dwPort, pState) : ERROR_DEVICE_NOT_CONNECTED;
+    rc = xbox_InputGetPadState(dwPort, pState);
 
     /* The keyboard answers for port 0 with or without a pad there, and is
      * merged on top of one: a real pad keeps working, the keys only add. */
@@ -94,18 +117,7 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
             *pState = kb;
             return ERROR_SUCCESS;
         }
-        XBOX_GAMEPAD *g = &pState->Gamepad;
-        g->wButtons |= kb.Gamepad.wButtons;
-        for (int i = 0; i < 8; i++)
-            if (kb.Gamepad.bAnalogButtons[i] > g->bAnalogButtons[i])
-                g->bAnalogButtons[i] = kb.Gamepad.bAnalogButtons[i];
-        if (kb.Gamepad.sThumbLX) g->sThumbLX = kb.Gamepad.sThumbLX;
-        if (kb.Gamepad.sThumbLY) g->sThumbLY = kb.Gamepad.sThumbLY;
-        if (kb.Gamepad.sThumbRX) g->sThumbRX = kb.Gamepad.sThumbRX;
-        if (kb.Gamepad.sThumbRY) g->sThumbRY = kb.Gamepad.sThumbRY;
-        /* The title's input layer records edges, so an unchanged packet
-         * number reads as the same state and a key press never happens. */
-        pState->dwPacketNumber = kb.dwPacketNumber;
+        xbox_InputMergeKbm(pState, &kb);
     }
     return rc;
 }

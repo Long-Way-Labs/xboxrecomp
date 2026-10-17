@@ -287,7 +287,7 @@ static void test_readme(const char *path)
 /* ── 4. connection cache ───────────────────────────────────────────────── */
 
 static uint64_t f_now;
-static int f_plugged[4], f_get_calls[4], f_set_calls[4], f_init_calls, f_kb_on;
+static int f_plugged[4], f_get_calls[4], f_set_calls[4], f_init_calls, f_kb_on, f_kb_calls;
 static XBOX_VIBRATION f_last_vib[4];
 
 static void f_init(void) { f_init_calls++; }
@@ -307,6 +307,7 @@ static DWORD f_set(DWORD p, const XBOX_VIBRATION *v)
 }
 static int f_kb(XBOX_INPUT_STATE *s)
 {
+    f_kb_calls++;
     if (!f_kb_on) return 0;
     memset(s, 0, sizeof *s);
     s->Gamepad.bAnalogButtons[XBOX_BUTTON_A] = 255;
@@ -391,6 +392,63 @@ static void test_cache(void)
     xbox_InputSetBackend(NULL);
 }
 
+/* xbox_InputGetPadState: the pad alone, never the keyboard (a game merging
+ * the keyboard itself must read it once a poll, since the read consumes
+ * mouse motion), under the same probe and cache rule as GetState. */
+static void test_pad_only(void)
+{
+    XBOX_INPUT_STATE st, kb;
+
+    memset(f_plugged, 0, sizeof f_plugged);
+    memset(f_get_calls, 0, sizeof f_get_calls);
+    f_now = 50000;
+    f_plugged[0] = 1;
+    f_kb_on = 1;
+    xbox_InputSetBackend(&k_fake);
+    xbox_InputInit();
+    f_kb_calls = 0;
+
+    CHECK(xbox_InputGetPadState(0, &st) == ERROR_SUCCESS
+          && st.Gamepad.wButtons == XBOX_GAMEPAD_START
+          && !st.Gamepad.bAnalogButtons[XBOX_BUTTON_A], "slot 0 pad-only read carries the keyboard");
+    CHECK(f_kb_calls == 0, "GetPadState(0) read the keyboard %d times", f_kb_calls);
+    CHECK(f_get_calls[0] == 2, "slot 0 backend calls %d, want 2", f_get_calls[0]);
+
+    /* An empty slot backs off like GetState, and never answers with keys. */
+    CHECK(xbox_InputGetPadState(1, &st) == ERROR_DEVICE_NOT_CONNECTED, "slot 1 connected?");
+    CHECK(f_get_calls[1] == 1, "slot 1 probed inside the backoff (%d)", f_get_calls[1]);
+    f_plugged[0] = 0;
+    CHECK(xbox_InputGetPadState(0, &st) == ERROR_DEVICE_NOT_CONNECTED,
+          "empty slot 0 answered (keyboard leak)");
+    CHECK(f_kb_calls == 0, "GetPadState read the keyboard %d times", f_kb_calls);
+
+    /* GetState(0) still reads it exactly once a call. */
+    CHECK(xbox_InputGetState(0, &st) == ERROR_SUCCESS
+          && st.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 255, "GetState(0) lost the keyboard");
+    CHECK(f_kb_calls == 1, "GetState(0) read the keyboard %d times, want 1", f_kb_calls);
+    xbox_InputGetState(1, &st);
+    CHECK(f_kb_calls == 1, "GetState(1) read the keyboard");
+
+    /* The exported merge is GetState's. */
+    memset(&st, 0, sizeof st);
+    st.Gamepad.wButtons = XBOX_GAMEPAD_START;
+    st.Gamepad.sThumbRX = 1000;
+    st.Gamepad.bAnalogButtons[XBOX_BUTTON_B] = 9;
+    memset(&kb, 0, sizeof kb);
+    kb.Gamepad.wButtons = XBOX_GAMEPAD_BACK;
+    kb.Gamepad.sThumbRY = -5;
+    kb.Gamepad.bAnalogButtons[XBOX_BUTTON_B] = 4;
+    kb.dwPacketNumber = 9;
+    xbox_InputMergeKbm(&st, &kb);
+    CHECK(st.Gamepad.wButtons == (XBOX_GAMEPAD_START | XBOX_GAMEPAD_BACK)
+          && st.Gamepad.sThumbRX == 1000 && st.Gamepad.sThumbRY == -5
+          && st.Gamepad.bAnalogButtons[XBOX_BUTTON_B] == 9 && st.dwPacketNumber == 9,
+          "xbox_InputMergeKbm");
+
+    f_kb_on = 0;
+    xbox_InputSetBackend(NULL);
+}
+
 int main(int argc, char **argv)
 {
     xbox_InputSetDeadzone(0);
@@ -398,6 +456,7 @@ int main(int argc, char **argv)
     test_deadzone();
     test_readme(argc > 1 ? argv[1] : "input_README.md");
     test_cache();
+    test_pad_only();
     printf("input_map: %d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

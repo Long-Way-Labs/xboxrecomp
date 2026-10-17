@@ -59,6 +59,12 @@ void xbox_InputShutdown(void);
 // Poll controller state (returns 0 on success, non-zero if disconnected)
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState);
 
+// The pad on a host slot alone: same probe rule, no keyboard/mouse merge
+DWORD xbox_InputGetPadState(DWORD slot, XBOX_INPUT_STATE *pState);
+
+// Merge a keyboard/mouse state onto a pad (the rule GetState uses on port 0)
+void xbox_InputMergeKbm(XBOX_INPUT_STATE *pad, const XBOX_INPUT_STATE *kb);
+
 // Set vibration motors
 DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration);
 

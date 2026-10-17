@@ -114,6 +114,29 @@ class BasicBlock:
         return self.instructions[-1] if self.instructions else None
 
 
+def disasm_lazily(cs, code, address, batch=32):
+    """cs.disasm(code, address), decoded a batch at a time.
+
+    Capstone's disasm decodes the whole buffer, with detail, before it yields
+    the first instruction. The CFG walks stop at the first jmp or ret but are
+    handed every byte up to the next function start (a section's end at
+    worst), so each probe paid for the whole tail: Burnout 3's 16,842
+    boundary probes spent 370 s in capstone for 204,348 instructions kept.
+    Same instructions, same stop at an invalid one: a batch of `batch`
+    instructions always fits in batch * 15 bytes, so a short batch can only
+    mean an invalid instruction or the end of `code`.
+    """
+    offset = 0
+    while offset < len(code):
+        n = 0
+        for insn in cs.disasm(code[offset:offset + batch * 15], address + offset, batch):
+            n += 1
+            yield insn
+        if n < batch:
+            return
+        offset = insn.address + insn.size - address
+
+
 # Capstone register ID → name mapping (populated on init)
 _reg_names = {}
 
@@ -269,7 +292,7 @@ class Disassembler:
             if not (start_va <= entry < end_va) or entry in decoded:
                 continue
             offset = entry - start_va
-            for cs_insn in self._cs.disasm(raw_bytes[offset:size], entry):
+            for cs_insn in disasm_lazily(self._cs, raw_bytes[offset:size], entry):
                 if cs_insn.address != entry and cs_insn.address in stop_addresses:
                     break
                 if cs_insn.address >= end_va or cs_insn.address in decoded:

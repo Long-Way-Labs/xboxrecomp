@@ -773,9 +773,16 @@ class FunctionDetector:
             print(f"  {found} function address(es) installed into"
                   f" indirect-call slots")
 
-    def _probes_as_tail_body(self, target, starts, sections, *, entry_frame=False) -> bool:
-        """Prove a callback's direct tail dependencies in their bounded gaps."""
+    def _probes_as_tail_body(self, target, starts, sections, *, entry_frame=False,
+                             memo=None) -> bool:
+        """Prove a callback's direct tail dependencies in their bounded gaps.
+
+        `memo` caches each proof by its exact inputs. The caller owns it and
+        must clear it whenever it adds a function or alias, since those are
+        the tail targets every proof is measured against.
+        """
         proven = set(self.functions) | self._alias_entries.keys()
+        local = set()      # entries this walk proved, on top of `proven`
         pending = [target]
         visiting = set()
         while pending:
@@ -791,10 +798,18 @@ class FunctionDetector:
             index = bisect.bisect_right(starts, entry)
             if index < len(starts):
                 upper = min(upper, starts[index])
-            if self.engine.probes_as_callback_body(
+            frame = entry_frame and entry == target
+            key = (entry, upper, frame, frozenset(local))
+            ok = memo.get(key) if memo is not None else None
+            if ok is None:
+                ok = self.engine.probes_as_callback_body(
                     entry, upper, tail_targets=proven,
-                    require_entry_frame=entry_frame and entry == target):
+                    require_entry_frame=frame)
+                if memo is not None:
+                    memo[key] = ok
+            if ok:
                 proven.add(entry)
+                local.add(entry)
                 pending.pop()
                 continue
             if entry in visiting:
@@ -1093,16 +1108,31 @@ class FunctionDetector:
             tails.update(self.engine.recursive_descent(
                 [entry], [(entry, alias_end)]))
         claimed = self._callback_code
+        # The tail proofs below decode up to the next function start, and a
+        # table of suffixes into one long body re-proves the same tail entries
+        # for every word. BLiNX 2 has a run of them into a 90 KB body
+        # (0x176150), about 5 s each: its disassembly went from 30 s to hours.
+        # Each proof depends only on its inputs and on the known entries, so
+        # cache it until the next alias.
+        memo = {}
         found = 0
         for target in sorted(targets):
             if target in self.functions or target in self._alias_entries:
+                continue
+            # Inside a body only an instruction boundary can become an alias
+            # (the check below), so test that before the proof. The proof
+            # decodes up to the next function start, and most data words that
+            # land in code are not boundaries: BLiNX 2 has 52,789 such words
+            # inside bodies, 14,968 of them on a boundary, and proving all of
+            # them kept its disassembly running past 35 minutes (30 s before).
+            if inside_a_function(target) and target not in self.engine.instructions:
                 continue
             # A table word can name an instruction suffix in any known body.
             # Require the same callable-entry proof as for recovered callbacks;
             # an instruction boundary alone does not establish an entry.
             if ((target in claimed or inside_a_function(target))
                     and not self._probes_as_tail_body(
-                    target, starts, sections, entry_frame=True)):
+                    target, starts, sections, entry_frame=True, memo=memo)):
                 continue
             j = bisect.bisect_right(starts, target) - 1
             if j >= 0 and bounds[j][0] < target < bounds[j][1]:
@@ -1143,11 +1173,13 @@ class FunctionDetector:
                 if not (self.engine.probes_as_callback_body(
                             target, end, lower, tail_targets=tails)
                         or self.engine.probes_as_vcall_thunk(target)):
-                    if not self._probes_as_tail_body(target, starts, sections):
+                    if not self._probes_as_tail_body(target, starts, sections,
+                                                     memo=memo):
                         continue
             if end <= target:
                 continue
             self._alias_entries[target] = end
+            memo.clear()
             reachable = self.engine.recursive_descent([target], [(target, end)])
             tails.update(reachable)
             # Every byte, as for immediate callbacks: a later immediate into

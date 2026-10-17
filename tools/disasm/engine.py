@@ -118,6 +118,9 @@ class DisasmEngine:
 
         # Instruction cache: address -> Instruction
         self.instructions: Dict[int, Instruction] = {}
+        # probes_as_callback_body's decodes, shared by every probe on this
+        # image (Disassembler._stream); read-only to the probes.
+        self._probe_decodes: Dict[int, object] = {}
 
         # Sorted address list (built lazily for range queries)
         self._sorted_addrs: Optional[List[int]] = None
@@ -711,7 +714,8 @@ class DisasmEngine:
         while True:
             decoded = decoder.disassemble_cfg(
                 raw, lower, upper, entries,
-                stop_mnemonics=("int3", "int", "ud2", "hlt", "iret", "iretd"))
+                stop_mnemonics=("int3", "int", "ud2", "hlt", "iret", "iretd"),
+                cache=self._probe_decodes)
             arms = set()
             for insn in decoded:
                 if not insn.is_jump or insn.jump_target is not None:

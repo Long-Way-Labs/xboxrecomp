@@ -9,7 +9,68 @@ blinx2-v0.3.2; earlier tags are described by their commits.
 
 ## [Unreleased]
 
+## [blinx2-v0.5.0] - 2026-10-17
+
+### Changed
+- Merged upstream xboxrecomp v0.14.0 ("Other Machines"): lifter fixes
+  (`lock xadd` flags, FCMOV, MXCSR rounding, x87 trig, `in`/`out`, `neg`),
+  the APU DSP-ack gate and device-queue stall fallback, arm64 MMIO decoder
+  hardening, OHCI split access and upstream's POSIX tests. The fork keeps
+  its own pushbuffer executor and Metal/D3D11 backends, its keyboard and
+  mouse layer (upstream's Win32-only `RECOMP_MKB` is not carried) and
+  `recomp_env` for every knob.
+- The disassembler's data-pointer pass from v0.14.0 is fast again:
+  probes decode a batch of instructions at a time, share one decode cache
+  and memoize tail proofs. Output is byte-identical; BLiNX 2 had gone from
+  30 s to more than 35 minutes.
+- `xbox_InputGetState` is now `xbox_InputGetPadState` (one host pad, no
+  keyboard or mouse) plus `xbox_InputMergeKbm`. A game that maps host
+  slots to guest ports itself can read one pad alone; games that read
+  slot N as port N are unchanged.
+
+### Added
+- `RECOMP_MISSING_FILES` and `RECOMP_MISSING_FILES_LIST`, upstream's names
+  for the missing-file report, are accepted as old names of
+  `RECOMP_TRACE=missing` and `RECOMP_DEBUG=missing_list`.
+- SDL game controller hot-plug (macOS, Linux): a pad connected after
+  launch is picked up, and a replugged pad takes its old port back. Ports
+  never shift. Windows/XInput is unchanged.
+- `RECOMP_FALLOFF_TAIL`: a lifted body that runs off its end into code no
+  function claims now dispatches to that address and logs one miss per
+  site, instead of returning silently. Under `RECOMP_ABI_CHECK`, short
+  esp returns are reported per call site.
+- Debug dumps for vertex programs: `vsh_dump` now works on every backend;
+  `fb_dump_prog` dumps the flips around the first draw of named programs
+  (`fb_dump_prog_before`, `fb_dump_prog_after`); `vsh_const_dump` writes
+  each program batch's 192 constant rows (`vsh_const_flips`,
+  `vsh_const_prog`). All are off by default.
+- New ctests: `pb_clip_border`, `pb_stride0`, `apu_vp`,
+  `kernel_file_handles`, `input_hotplug_sdl`, `nv2a_vsh_cdump`,
+  `nv2a_fb_ring` and `recomp_env_list`.
+
 ### Fixed
+- The disassembler refuses a weak function start (a call or tail target,
+  an alias) that falls inside an instruction of the body in front of it.
+  BLiNX 2 had one such start from a switch table that decoded as a call;
+  the cut body returned 4 bytes short on the stack and the game hung at
+  the Tom Tom rank exam.
+- macOS: a Finder launch starts with a limit of 256 open files, and
+  BLiNX 2 keeps 363 cache files open, so it crashed. The runtime raises
+  the soft limit at startup, file handles are checked before use (a bad
+  or closed handle gives `STATUS_INVALID_HANDLE`, not a crash), and
+  running out of descriptors gives `STATUS_TOO_MANY_OPENED_FILES`.
+- A vertex attribute with stride 0 is an array whose one element every
+  vertex reads, not an absent attribute. SSX 3's rider vanished about a
+  minute into a race.
+- Colour clears use the clear rectangle alone, clamped to the surface,
+  so a clear no longer wipes other parts of the same surface. The CPU
+  rasteriser clips at the near plane with the depth test off too. The
+  texture border colour (address mode 4) is sampled on D3D11, Metal and
+  the CPU rasteriser.
+- APU: the voice processor holds the mix while a queued voice is locked,
+  as xemu does, so a title's half-updated voice no longer plays as a
+  burst. ADPCM decode buffers hold 18 blocks and wider voices are
+  refused, so a wide block no longer overruns the stack (upstream #217).
 - A title's `E:\CACHE` (`\Device\Harddisk0\Partition1\CACHE`) now goes
   to `<save_dir>/TitleCache` (or under `RECOMP_SAVE_DIR`), not
   `<save_dir>/CACHE`. On Windows, Proton and macOS that was the same folder

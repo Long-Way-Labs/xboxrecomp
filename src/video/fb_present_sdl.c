@@ -92,6 +92,7 @@ extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_log_thread_role(const char *role, uint32_t routine);
 extern void xbox_InputSetMainPump(int on);   /* src/input/xinput_device.c */
 extern int  xbox_InputAnyOpen(void);
+extern void xbox_InputSdlPadSync(void);      /* src/input/xinput_device.c */
 
 /* ── Handoff: three slots, one each for writer, reader and the ready frame ── */
 
@@ -662,6 +663,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         /* The capture can change on the poll thread (the release key, a
          * script); relative mode has to be set here, on the window's. */
         xbox_InputSdlMouseSync();
+        /* Pads come and go here, on the thread that pumps their events
+         * (xinput_device.c says why it cannot be a poll thread). */
+        xbox_InputSdlPadSync();
 
         pthread_mutex_lock(&s_lock);
         seq = s_ready_seq;

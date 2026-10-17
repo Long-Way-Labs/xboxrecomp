@@ -286,10 +286,21 @@ the merge on every host.
 disconnected is not asked again until a second has passed since its last
 probe (XInput's guidance); `xbox_InputIsConnected` answers from the same
 cache and refreshes it under the same rule, so a pad plugged in later
-appears within a second. Port N is XInput user index N, or the Nth SDL game
-controller found at init. `xbox_InputSetState` reaches only connected ports;
-`xbox_InputShutdown` (also registered with `atexit` by `xbox_InputInit`)
-stops every motor.
+appears within a second. Port N is XInput user index N. On SDL hosts a pad
+keeps its port while it stays attached, and ports never shift: a removed pad
+frees its port, and a new one takes the port the same model (joystick GUID)
+last held when that is free and another pad is still connected, else the
+lowest free port, so a pad that connects while no other pad is connected
+takes port 0. Device events and a once-a-second rescan both feed this, run
+by the thread that pumps SDL: the window's loop (`xbox_InputSdlPadSync`), or
+the poll when headless, since sdl2-compat's device-index calls are not safe
+beside another thread's pump; each change logs `[INPUT] host pad added
+port=N "name"` or `[INPUT] host pad removed port=N`. With a window, the
+first poll waits up to 250 ms for the window's loop to open the pads, so a
+pad connected before launch is connected at the first read.
+`tests/input_hotplug_sdl` checks it with SDL's virtual joysticks.
+`xbox_InputSetState` reaches only connected ports; `xbox_InputShutdown`
+(also registered with `atexit` by `xbox_InputInit`) stops every motor.
 
 ## Ports
 

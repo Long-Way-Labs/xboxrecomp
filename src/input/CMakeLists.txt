@@ -56,9 +56,13 @@ add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/input_keyboard
 # injector and the port-0 merge (every host, no SDL, no window).
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/input_bindings
                  ${CMAKE_CURRENT_BINARY_DIR}/input_bindings)
+# Beside the SDL key test: game controller hot-plug through SDL's virtual
+# joysticks (POSIX).
 if(NOT WIN32)
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/input_keyboard_sdl
                      ${CMAKE_CURRENT_BINARY_DIR}/input_keyboard_sdl)
+    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/input_hotplug_sdl
+                     ${CMAKE_CURRENT_BINARY_DIR}/input_hotplug_sdl)
 endif()
 # The XInput DLL a game's exe imports must ship with Windows (Windows builds
 # with an objdump to read the import table).

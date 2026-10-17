@@ -41,6 +41,7 @@
  * Morton order, not a second one that can disagree with it. */
 #include "../d3d/d3d8_swizzle.h"
 #include "nv2a_vsh_cpu.h"
+#include "nv2a_vsh_cdump.h"
 #include "nv2a_combiner.h"
 #include "nv2a_pb_state.h"
 #include "nv2a_backend_common.h"
@@ -5844,6 +5845,92 @@ static void cpu_px_report(const uint32_t before[4], const float zb[4])
     }
 }
 
+/* RECOMP_DEBUG=vsh_const_dump: the constants this program batch runs with,
+ * here before the backend draws it, so every backend dumps the same records.
+ * The cap keeps an unbounded window from filling the disk: at ~3 KB a record
+ * and a few hundred skinned batches a frame, every flip is ~1 MB. */
+static struct {
+    FILE *f;
+    int state;                          /* 0 unread, 1 on, -1 off */
+    struct nv2a_vsh_cdump_cfg cfg;
+    uint64_t bytes;
+} s_vcd;
+
+static void vsh_const_dump_close(const char *why)
+{
+    fprintf(stderr, "[VSH-CONST] done at flip %u: %llu bytes%s\n", s_gpu.flips,
+            (unsigned long long)s_vcd.bytes, why);
+    fclose(s_vcd.f);
+    s_vcd.f = NULL;
+    s_vcd.state = -1;
+}
+
+/* At FLIP_INCREMENT_WRITE: the flip's records are complete. Flushed here
+ * because runs are usually ended by a kill, not an exit, and closed once the
+ * window is past so its last flip is on disk too. */
+static void vsh_const_dump_flip(void)
+{
+    if (s_vcd.state <= 0)
+        return;
+    if (s_gpu.flips > s_vcd.cfg.last)
+        vsh_const_dump_close("");
+    else if (s_gpu.flips > s_vcd.cfg.first)
+        fflush(s_vcd.f);
+}
+
+static void vsh_const_dump_draw(void)
+{
+    const uint64_t cap = 256ull << 20;
+    uint32_t len, h;
+
+    if (s_vcd.state == 0) {
+        const char *path = recomp_env(RENV_VSH_CONST_DUMP);
+        s_vcd.state = -1;
+        if (!path)
+            return;
+        if (!vsh_enabled())
+            /* No program batches without the interpreter's tracking. */
+            fprintf(stderr, "[VSH-CONST] needs pb_vsh (pb_vsh=0 is set); no dump\n");
+        else if (nv2a_vsh_cdump_parse(recomp_env(RENV_VSH_CONST_FLIPS),
+                                      recomp_env(RENV_VSH_CONST_PROG), &s_vcd.cfg))
+            fprintf(stderr, "[VSH-CONST] vsh_const_flips or vsh_const_prog"
+                            " malformed; no dump\n");
+        else if (!(s_vcd.f = fopen(path, "wb")))
+            fprintf(stderr, "[VSH-CONST] cannot open %s; no dump\n", path);
+        else {
+            s_vcd.state = 1;
+            fprintf(stderr, "[VSH-CONST] dumping to %s, flips %u-%u every %u,"
+                            " %d program filter(s)\n", path, s_vcd.cfg.first,
+                    s_vcd.cfg.last, s_vcd.cfg.every, s_vcd.cfg.nprog);
+        }
+    }
+    if (s_vcd.state < 0 || !vsh_batch_active())
+        return;
+    if (s_gpu.flips > s_vcd.cfg.last) {
+        vsh_const_dump_close("");
+        return;
+    }
+    if (s_vcd.bytes + NV2A_VSH_CDUMP_RECORD > cap) {
+        vsh_const_dump_close(" (cap)");
+        return;
+    }
+    if (s_gpu.flips < s_vcd.cfg.first)
+        return;
+    h = nv2a_vsh_program_hash(&s_vsh, &len);
+    if (!nv2a_vsh_cdump_wanted(&s_vcd.cfg, s_gpu.flips, h))
+        return;
+    if (nv2a_vsh_cdump_write(s_vcd.f, s_gpu.flips, s_gpu.draws, h, s_vsh.start,
+                             len, (const float (*)[4])s_vsh.c)) {
+        fprintf(stderr, "[VSH-CONST] write failed at flip %u; no more dumps\n",
+                s_gpu.flips);
+        fclose(s_vcd.f);
+        s_vcd.f = NULL;
+        s_vcd.state = -1;
+        return;
+    }
+    s_vcd.bytes += NV2A_VSH_CDUMP_RECORD;
+}
+
 /* What a batch actually contains. Before anything can be rasterised, the
  * question is what space attribute 0 arrives in: a title running a vertex
  * program hands over object-space positions that mean nothing without running
@@ -5882,6 +5969,7 @@ static void draw_primitive(void)
 
     if (s_gpu.color_keep != 0xFFFFFFFFu)   /* a depth/stencil-only pass draws no colour */
         present_note(0);
+    vsh_const_dump_draw();
     if (s_backend->on_draw) {
         uint64_t t0 = rt_now();
         struct nv2a_pb_draw d;
@@ -6540,6 +6628,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                          ? (s_gpu.flip_write + 1) % s_gpu.flip_modulo
                          : s_gpu.flip_write + 1;
         s_gpu.flips++;
+        vsh_const_dump_flip();
         return;
 
     case NV097_FLIP_STALL: {

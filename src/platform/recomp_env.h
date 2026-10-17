@@ -238,6 +238,9 @@ extern "C" {
     X(TEX_DUMP,          DEBUG, "tex_dump",        "RECOMP_TEX_DUMP",          "=prefix: textures, first use") \
     X(TEX_DUMP_EVERY,    DEBUG, "tex_dump_every",  "RECOMP_TEX_DUMP_EVERY",    "=n: tex_dump every nth bind too") \
     X(VSH_DUMP,          DEBUG, "vsh_dump",        "RECOMP_VSH_DUMP",          "=prefix: vertex programs, raw") \
+    X(VSH_CONST_DUMP,    DEBUG, "vsh_const_dump",  NULL,                       "=path: every program batch's constants c[0..191] with its flip, draw and program hash, one file (src/kernel/nv2a_vsh_cdump.h); stops at 256 MB") \
+    X(VSH_CONST_FLIPS,   DEBUG, "vsh_const_flips", NULL,                       "=a-b[/n]: vsh_const_dump only at flips a..b, every nth (default every flip)") \
+    X(VSH_CONST_PROG,    DEBUG, "vsh_const_prog",  NULL,                       "=hash[,hash]: vsh_const_dump only these programs (hex, up to 16)") \
     X(D3D11_DUMP,        DEBUG, "d3d11_dump",      "RECOMP_D3D11_DUMP",        "=prefix: D3D11 present dump at flips 60k+1") \
     X(FMV_DUMP,          DEBUG, "fmv_dump",        "RECOMP_FMV_DUMP",          "=prefix: two movie frames") \
     X(AUDIO_WAV,         DEBUG, "audio_wav",       "RECOMP_AUDIO_WAV",         "=path: WAV of the audio output") \

@@ -484,9 +484,46 @@ static int crop_flips(uint32_t buf)
     return f;
 }
 
+/* Red, then a 160x120 clip at (100,100) and a clear rect of (50,50)-(399,299)
+ * cleared green: the rect alone, ended by the clip's far corner (where a
+ * pitch surface ends, as xemu sizes it), so (50,50)-(259,219) turns green,
+ * above and left of the clip too (nv2a_clear_box, upstream #212's rule).
+ * Read from the D3D11 target, or with `cpu` from guest memory after the CPU
+ * path's clear. Returns the failures. */
+static int rect_past_clip(uint32_t buf, int cpu)
+{
+    static const struct { uint32_t x, y, argb; } want[5] = {
+        {50, 50, 0xFF00FF00u}, {259, 219, 0xFF00FF00u}, {150, 150, 0xFF00FF00u},
+        {49, 150, 0xFFFF0000u}, {260, 150, 0xFFFF0000u},
+    };
+    const uint8_t *g = (const uint8_t *)xbox_GetMemoryOffset() + nv2a_pb_dma_resolve(buf);
+    int f = 0, k;
+
+    surf_clear(buf, 640, 480, 0xFFFF0000u);
+    M(0x0200, (160u << 16) | 100u);
+    M(0x0204, (120u << 16) | 100u);
+    M(0x1D98, (399u << 16) | 50u);
+    M(0x1D9C, (299u << 16) | 50u);
+    M(0x1D90, 0xFF00FF00u);
+    M(0x1D94, 0xF0);
+    M(0x1D98, (639u << 16) | 0u);
+    M(0x1D9C, (479u << 16) | 0u);
+    M(0x0200, 640u << 16);
+    M(0x0204, 480u << 16);
+    for (k = 0; k < 5; k++) {
+        uint32_t got = cpu ? *(const uint32_t *)(g + want[k].y * 2560u + want[k].x * 4u)
+                           : nv2a_pb_d3d11_pixel(buf, want[k].x, want[k].y);
+        fprintf(stderr, "[backend-smoke] %s rect past clip %d: 0x%08X (want 0x%08X) %s\n",
+                cpu ? "cpu" : "d3d11", k, got, want[k].argb,
+                got == want[k].argb ? "PASS" : "FAIL");
+        f += got != want[k].argb;
+    }
+    return f;
+}
+
 /* One back buffer drawn under two clip extents in a frame (Burnout 3's
  * 640x480 buffer with 159x344 and smaller clips): one target, grown to the
- * largest; a clear bounded by its clip and clear rect leaves the rest, and a
+ * largest; a clear bounded by its clear rect or clip leaves the rest, and a
  * draw by its clip; and a
  * flip whose frame is smaller than the target shows only the frame. Returns
  * the failures. */
@@ -496,10 +533,13 @@ static int clip_cases(const uint32_t *buf)
     int f = 0, k;
 
     /* Red over the whole 640x480, then a 160x120 clip at (100,100) cleared
-     * blue: only the clip turns blue. */
+     * blue with the clip as the clear rect, as D3D's Clear sends it: only
+     * the clip turns blue. */
     surf_clear(buf[0], 640, 480, 0xFFFF0000u);
     M(0x0200, (160u << 16) | 100u);
     M(0x0204, (120u << 16) | 100u);
+    M(0x1D98, (259u << 16) | 100u);
+    M(0x1D9C, (219u << 16) | 100u);
     M(0x1D90, 0xFF0000FFu);
     M(0x1D94, 0xF0);
     /* The whole clip again, with a clear rect of (300,300)-(339,339): green
@@ -526,6 +566,7 @@ static int clip_cases(const uint32_t *buf)
             f += c[k] != want[k];
         }
     }
+    f += rect_past_clip(buf[0], 0);
     /* Red again, then under the 160x120 clip a blue quad past it on every
      * side: the clip scissors the draw, as on the hardware and the CPU path
      * (Burnout 3's HUD past its 640x448 clip at y 16). (100,100) and
@@ -713,8 +754,14 @@ static int cpu_clip_cases(uint32_t buf)
     surf_clear(buf, 640, 480, 0xFFFF0000u);
     M(0x0200, (160u << 16) | 100u);
     M(0x0204, (120u << 16) | 100u);
+    M(0x1D98, (259u << 16) | 100u);
+    M(0x1D9C, (219u << 16) | 100u);
     M(0x1D90, 0xFF0000FFu);
     M(0x1D94, 0xF0);
+    M(0x1D98, (639u << 16) | 0u);
+    M(0x1D9C, (479u << 16) | 0u);
+    M(0x0200, 640u << 16);
+    M(0x0204, 480u << 16);
     for (k = 0; k < 2; k++)
         c[k] = *(const uint32_t *)(g + want[k].y * 2560u + want[k].x * 4u);
     surf_clear(buf, 640, 480, 0xFFFF0000u);
@@ -730,6 +777,73 @@ static int cpu_clip_cases(uint32_t buf)
         fprintf(stderr, "[backend-smoke] cpu clip clear %d: 0x%08X (want 0x%08X) %s\n", k,
                 c[k], want[k].argb, c[k] == want[k].argb ? "PASS" : "FAIL");
         f += c[k] != want[k].argb;
+    }
+    f += rect_past_clip(buf, 1);
+    nv2a_pb_set_backend(b);
+    return f;
+}
+
+/* Texture address mode 4, border, with the border colour as the source
+ * (FORMAT bit 3), as Burnout 3 sets stages 0-3: the swizzled checker on a
+ * quad whose UVs run from -0.5 to 1.5, 1/32 pixel off the grid so no pixel
+ * centre lands on a texel edge. Past the texture the tap is
+ * SET_TEXTURE_BORDER_COLOR (any colour on D3D11; Metal's three are
+ * nv2a_backend_smoke's), the middle texel (32,32) is orange. With the
+ * texture as the source the edge texel stands in: green left of it. D3D11
+ * first, then the CPU path from guest memory. Returns the failures. */
+static int border_cases(uint32_t buf)
+{
+    static const uint32_t colour[3] = {0x00000000u, 0xFF20C040u, 0xFFFFFFFFu};
+    static const float uv[4][2] = {{-0.5f, -0.5f}, {1.5f, -0.5f}, {1.5f, 1.5f}, {-0.5f, 1.5f}};
+    static const uint32_t at[4][2] = {{120, 200}, {290, 200}, {200, 290}, {200, 200}};
+    const struct nv2a_pb_backend *b = nv2a_pb_get_backend();
+    const uint8_t *g = (const uint8_t *)xbox_GetMemoryOffset() + nv2a_pb_dma_resolve(buf);
+    const float o = 1.0f / 32.0f;
+    int f = 0, path, bc, a, k;
+
+    for (path = 0; path < 2; path++) {
+        if (path)
+            nv2a_pb_set_backend(nv2a_pb_cpu_backend());
+        for (bc = 0; bc < 3; bc++) {
+            int texsrc = bc == 2;
+            surf_clear(buf, 640, 480, 0xFF404040u);
+            M(0x0304, 0);
+            for (a = 0; a < 16; a++)
+                M(0x1760 + 4 * a, a == 0 ? 0x42u : a == 3 ? 0x40u : a == 9 ? 0x22u : 0x02u);
+            M(0x1B00, TEX_GUEST);
+            M(0x1B04, (0x06u << 8) | (TEX_LOG2 << 20) | (TEX_LOG2 << 24) | (1u << 4)
+                      | (2u << 0) | (texsrc ? 0u : 1u << 3));
+            M(0x1B08, 0x00000404u);            /* border u, border v */
+            M(0x1B0C, 0x40000000u);
+            M(0x1B24, colour[bc]);             /* TEXTURE_BORDER_COLOR(0) */
+            M(0x17FC, 8);
+            for (k = 0; k < 4; k++)
+                vertex_uv(k == 1 || k == 2 ? 300.0f + o : 100.0f + o,
+                          k >= 2 ? 300.0f + o : 100.0f + o, 0xFFFFFFFFu, uv[k]);
+            M(0x17FC, 0);
+            M(0x1B08, 0x00000101u);
+            M(0x1B24, 0);
+            M(0x1B0C, 0);
+            M(0x1760 + 4 * 9, 0x02u);
+            for (k = 0; k < 4; k++) {
+                uint32_t x = at[k][0], y = at[k][1];
+                /* Transparent black keeps its alpha 0 (blend off): all 32
+                 * bits there, so opaque black cannot pass for it. */
+                uint32_t opaque = k != 3 && colour[bc] == 0 ? 0 : 0xFF000000u;
+                uint32_t want = k == 3 ? 0xFFFF8000u
+                              : texsrc ? 0xFF00FF00u : colour[bc] | opaque;
+                uint32_t got;
+                if (texsrc && k != 0 && k != 3)
+                    continue;   /* the edge texels there are the checker's own */
+                got = (path ? *(const uint32_t *)(g + y * 2560u + x * 4u)
+                            : nv2a_pb_d3d11_pixel(buf, x, y)) | opaque;
+                fprintf(stderr, "[backend-smoke] %s border 0x%08X%s (%u,%u): 0x%08X"
+                        " (want 0x%08X) %s\n", path ? "cpu" : "d3d11", colour[bc],
+                        texsrc ? " (texture source)" : "", x, y, got, want,
+                        got == want ? "PASS" : "FAIL");
+                f += got != want;
+            }
+        }
     }
     nv2a_pb_set_backend(b);
     return f;
@@ -1328,6 +1442,10 @@ int main(int argc, char **argv)
     if (edge_cases(buf)) {
         fprintf(stderr, "[backend-smoke] FAIL: 0.53125-offset edges\n");
         return 7;
+    }
+    if (border_cases(buf[0])) {
+        fprintf(stderr, "[backend-smoke] FAIL: texture border colour\n");
+        return 10;
     }
     if (surface_cases(buf[0])) {
         fprintf(stderr, "[backend-smoke] FAIL: present.surface=internal scale change\n");

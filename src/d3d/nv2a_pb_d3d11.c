@@ -780,7 +780,7 @@ static RenderTarget *surface(void)
      * back), and the flip found no target of the frame's size: a black
      * title screen and a frozen race. Draws map guest pixels to NDC through
      * rt->w/h, so a larger target keeps every position. What that asks of
-     * the rest: a clear covers only its clip and clear rect (clear_region),
+     * the rest: a clear covers only its clear rect or clip (clear_region),
      * and a flip shows only the frame's extent (present_extent). Another
      * pitch at the same offset is a new allocation, not another clip: it
      * gets a target of its own and the overlap rule retires this one. */
@@ -1034,7 +1034,7 @@ static void clear_region(RenderTarget *rt, const struct nv2a_pb_gpu *g, const fl
     UINT x0, y0, x1, y1;
     D3D11_RECT r;
 
-    /* The clip and clear rect (nv2a_clear_box): one target serves every
+    /* The clear rect, else the clip (nv2a_clear_box): one target serves every
      * clip of its surface (rt_grow), so a whole-target clear would wipe the
      * parts of the frame another clip drew. */
     if (!nv2a_clear_box(g, rt->w, rt->h, b))
@@ -1832,12 +1832,14 @@ static ID3D11ShaderResourceView *tex_bind(const Stage *t)
     return e->srv;
 }
 
-/* NV2A wrap modes: 1 wrap, 2 mirror, 3 clamp to edge, 4 border, 5 clamp. */
+/* NV2A wrap modes: 1 wrap, 2 mirror, 3 clamp to edge, 4 border, 5 clamp.
+ * Border takes the stage's SET_TEXTURE_BORDER_COLOR (nv2a_stage_decode). */
 static D3D11_TEXTURE_ADDRESS_MODE address_mode(uint32_t m)
 {
     switch (m) {
     case 1:  return D3D11_TEXTURE_ADDRESS_WRAP;
     case 2:  return D3D11_TEXTURE_ADDRESS_MIRROR;
+    case NV2A_ADDR_BORDER: return D3D11_TEXTURE_ADDRESS_BORDER;
     default: return D3D11_TEXTURE_ADDRESS_CLAMP;
     }
 }
@@ -1855,7 +1857,7 @@ static D3D11_TEXTURE_ADDRESS_MODE address_mode(uint32_t m)
 #define lod_bias      nv2a_tex_lod_bias
 
 #define SMP_MAX 256
-static struct { uint64_t key; ID3D11SamplerState *s; } s_smp[SMP_MAX];
+static struct { uint64_t key; uint32_t border; ID3D11SamplerState *s; } s_smp[SMP_MAX];
 static int s_smp_n;
 static int s_smp_last[4];   /* per stage: the entry it got last */
 
@@ -1868,6 +1870,7 @@ static ID3D11SamplerState *sampler(const Stage *t, int bump_source)
     int mn, mg, mip, i;
     unsigned an;
     uint64_t key;
+    uint32_t border;
     ID3D11SamplerState *st = NULL;
 
     if (point < 0)
@@ -1884,11 +1887,14 @@ static ID3D11SamplerState *sampler(const Stage *t, int bump_source)
     if (mip)
         key |= (uint64_t)(t->filter & 0x1FFFu) << 12
              | (uint64_t)t->lod_min << 25 | (uint64_t)t->lod_max << 29;
+    /* The colour is part of the state only where an axis uses it. */
+    border = (u == NV2A_ADDR_BORDER || v == NV2A_ADDR_BORDER) ? t->border : 0;
     if (s_smp_last[t - s_stage] < s_smp_n
-            && s_smp[s_smp_last[t - s_stage]].key == key)
+            && s_smp[s_smp_last[t - s_stage]].key == key
+            && s_smp[s_smp_last[t - s_stage]].border == border)
         return s_smp[s_smp_last[t - s_stage]].s;
     for (i = 0; i < s_smp_n; i++)
-        if (s_smp[i].key == key) {
+        if (s_smp[i].key == key && s_smp[i].border == border) {
             s_smp_last[t - s_stage] = i;
             return s_smp[i].s;
         }
@@ -1902,6 +1908,7 @@ static ID3D11SamplerState *sampler(const Stage *t, int bump_source)
     sd.AddressU = address_mode(u);
     sd.AddressV = address_mode(v);
     sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    nv2a_argb_to_float4(border, sd.BorderColor);
     sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
     sd.MipLODBias = mip ? lod_bias(t->filter) : 0.0f;
     if (sd.MipLODBias > 15.99f) sd.MipLODBias = 15.99f;
@@ -1924,6 +1931,7 @@ static ID3D11SamplerState *sampler(const Stage *t, int bump_source)
         s_state_gen++;
     }
     s_smp[i].key = key;
+    s_smp[i].border = border;
     s_smp[i].s = st;
     s_smp_last[t - s_stage] = i;
     if (!fallback)

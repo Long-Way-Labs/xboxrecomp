@@ -73,6 +73,8 @@ typedef struct {
     uint32_t pitch;                     /* bytes per row, from CONTROL1  */
     uint32_t color;                     /* NV097 colour-format code      */
     uint32_t addr_u, addr_v;            /* wrap mode per axis            */
+    uint32_t border;                    /* SET_TEXTURE_BORDER_COLOR      */
+    int      border_on;                 /* FORMAT BORDER_SOURCE: colour  */
     uint32_t palette, pal_len;          /* P8: guest palette (0 none), entries */
     uint32_t filter;                    /* SET_TEXTURE_FILTER as written */
     uint32_t face_stride;               /* cube map: bytes between faces, else 0 */
@@ -130,7 +132,7 @@ struct nv2a_pb_gpu {
     uint32_t clear_color;
     /* SET_CLEAR_RECT_HORIZONTAL/VERTICAL: (max << 16) | min, both inclusive,
      * as xemu reads them; clear_rect_set is 0 until the title sends one.
-     * Every path bounds a colour clear by the clip and this rect
+     * Every path clears this rect alone once set, else the clip
      * (nv2a_clear_box). */
     uint32_t clear_rect_h, clear_rect_v;
     int      clear_rect_set;

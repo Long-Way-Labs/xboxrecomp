@@ -86,6 +86,15 @@ class FunctionDetector:
         self._alias_entries: Dict[int, int] = {}
         self._callback_code: Set[int] = set()
 
+        # Weak starts refused because they sit inside an instruction of the
+        # function in front of them; see _build_functions. Kept so a later
+        # pass cannot re-add them from the same evidence.
+        self.mid_instruction_starts: Dict[int, int] = {}
+        # Set by _find_function_end: the instruction of the body that runs
+        # across the next start, when the walk reached it as code.
+        self._code_straddle: Optional[int] = None
+        self._code_refs: Optional[Dict[int, List[int]]] = None
+
     def detect_all(self, sections: Optional[List[SectionInfo]] = None) -> int:
         """
         Run all detection passes and build the function database.
@@ -530,8 +539,17 @@ class FunctionDetector:
             if addr not in self._alias_entries:
                 self._alias_entries[addr] = body_end
 
+    # Evidence strong enough to keep a start even inside an instruction of
+    # the function before it: the bytes there decode as an entry, or a human
+    # or the runtime named the address.
+    _STRONG_STARTS = ("entry_point", "seed_vtable_thunk", "prologue",
+                      "prologue_alt", "gap_prologue")
+
     def _add_candidate(self, addr: int, confidence: float, method: str) -> None:
         """Add a function start candidate, keeping highest confidence."""
+        if (addr in self.mid_instruction_starts
+                and method not in self._STRONG_STARTS):
+            return
         existing = self._candidates.get(addr)
         if existing is None or confidence > existing[0]:
             self._candidates[addr] = (confidence, method)
@@ -1464,6 +1482,11 @@ class FunctionDetector:
         for addr, end in sorted(self._alias_entries.items()):
             if addr in self.functions:
                 continue
+            if addr in self.mid_instruction_starts:
+                # Refused as a start in _build_functions; the same phantom
+                # call or jump reaches the alias passes as a target inside
+                # the body and would bring it back as a misdecoded alias.
+                continue
             section = self.image.get_section_at_va(addr)
             i = bisect.bisect_right(body_starts, addr) - 1
             if not (i >= 0 and addr < bodies[i][1]) and section is not None:
@@ -1528,8 +1551,12 @@ class FunctionDetector:
             sec_ranges[sec.name] = (sec.virtual_addr,
                                     sec.virtual_addr + sec.virtual_size)
 
+        self._code_refs = None  # built on first use, per build
+
         # Create functions
         for idx, start_addr in enumerate(sorted_starts):
+            if start_addr not in self._candidates:
+                continue  # refused below as a mid-instruction start
             confidence, method = self._candidates[start_addr]
 
             # Determine section
@@ -1540,10 +1567,9 @@ class FunctionDetector:
             # Walk instructions until we hit the next function start,
             # leave the section, or reach an unconditional terminator
             # with no fall-through.
-            if idx + 1 < len(sorted_starts):
-                next_func = sorted_starts[idx + 1]
-            else:
-                next_func = None
+            following = (s for s in sorted_starts[idx + 1:]
+                         if s in self._candidates)
+            next_func = next(following, None)
 
             # Section end boundary
             sec_end = None
@@ -1551,6 +1577,32 @@ class FunctionDetector:
                 sec_end = section.virtual_addr + section.virtual_size
 
             end_addr = self._find_function_end(start_addr, next_func, sec_end)
+            # A start inside an instruction of this body's own code is a
+            # misread, not a function: the body decodes straight across it.
+            # BLiNX 2's sub_001CFCA0 ran into "sub_001CFCE8", a call target
+            # read out of a two-entry jump table elsewhere, which sits in the
+            # immediate of `mov dword [0xEC5340], 2`. Cut there, the lifted
+            # body ended after that store and fell off its own end without
+            # the rest of its code or its ret, leaving the caller's esp four
+            # bytes low until the main loop popped a return address into edi.
+            # Drop the weak start and measure again; a start the bytes or a
+            # seed vouch for stays, and so does one the walk only reached
+            # through data (a byte index table after a switch). Either decode
+            # can be the wrong one, so the crossed start also stays when the
+            # body crossing it rests on weaker evidence and real code calls or
+            # jumps to it: an FPO function behind a cc_boundary misread.
+            while (next_func is not None and self._code_straddle is not None
+                    and self._candidates[next_func][1]
+                    not in self._STRONG_STARTS
+                    and not self.engine.probes_as_prologue(next_func)
+                    and (self._start_strength(start_addr)
+                         >= self._candidates[next_func][0]
+                         or not self._called_from_code(next_func, sections))):
+                self.mid_instruction_starts[next_func] = self._code_straddle
+                del self._candidates[next_func]
+                next_func = next(following, None)
+                end_addr = self._find_function_end(start_addr, next_func,
+                                                   sec_end)
 
             # Count instructions
             insns = self.engine.get_instructions_in_range(start_addr, end_addr)
@@ -1586,6 +1638,73 @@ class FunctionDetector:
             )
             self.functions[start_addr] = func
 
+    def _start_strength(self, addr: int) -> float:
+        """Confidence of a candidate start; strong methods outrank any score."""
+        confidence, method = self._candidates[addr]
+        if method in self._STRONG_STARTS:
+            return float("inf")
+        return confidence
+
+    def _direct_refs(self, entries: List[int],
+                     sections: List[SectionInfo]) -> Dict[int, List[int]]:
+        """Direct call and jump targets of code reachable from `entries`.
+
+        Descent stops at terminators and indirect jumps, so bytes the sweep
+        decoded out of a table or past a ret never get here: those decodes
+        are exactly what this check must not trust.
+        """
+        entries = list(entries)
+        for table in self.engine.jump_tables:
+            entries.extend(self.engine.jump_table_entries(table))
+        reachable = self.engine.recursive_descent(entries, [
+            (sec.virtual_addr, sec.virtual_addr + sec.virtual_size)
+            for sec in sections])
+        refs: Dict[int, List[int]] = {}
+        for addr in reachable:
+            insn = self.engine.get_instruction(addr)
+            if insn is None:
+                continue
+            if insn.is_call and insn.call_target is not None:
+                refs.setdefault(insn.call_target, []).append(addr)
+            elif insn.is_branch and insn.jump_target is not None:
+                refs.setdefault(insn.jump_target, []).append(addr)
+        return refs
+
+    def _called_from_code(self, addr: int,
+                          sections: List[SectionInfo]) -> bool:
+        """Whether code reachable from another start calls or jumps to addr.
+
+        A source in addr's own decode (up to the next start) does not count:
+        a misread start's phantom body can branch back to itself.
+        """
+        if self._code_refs is None:
+            self._code_refs = self._direct_refs(list(self._candidates),
+                                                sections)
+        starts = sorted(self._candidates)
+        i = bisect.bisect_right(starts, addr)
+        own_end = starts[i] if i < len(starts) else None
+        return any(not (addr <= src and (own_end is None or src < own_end))
+                   for src in self._code_refs.get(addr, ()))
+
+    def refused_start_callers(self, sections: List[SectionInfo]
+                              ) -> Dict[int, List[Tuple[int, int]]]:
+        """For each refused start, the (function, site) pairs that reach it.
+
+        Only sites in reachable code inside a detected body count. A refused
+        start that real code still calls is worth a look: either the refusal
+        or the body that crossed it is wrong.
+        """
+        if not self.mid_instruction_starts:
+            return {}
+        refs = self._direct_refs(list(self.functions), sections)
+        found: Dict[int, List[Tuple[int, int]]] = {}
+        for addr in sorted(self.mid_instruction_starts):
+            for src in sorted(refs.get(addr, ())):
+                func = self.get_function_at(src)
+                if func is not None:
+                    found.setdefault(addr, []).append((func.start, src))
+        return found
+
     def _find_function_end(self, start: int, next_func: Optional[int],
                            sec_end: Optional[int]) -> int:
         """
@@ -1597,6 +1716,13 @@ class FunctionDetector:
         max_addr = start   # exclusive end of the code decoded so far
         max_target = start  # highest branch target that must be *inside* it
         addr = start
+        # Branch targets inside the body, and whether the walk is in bytes
+        # it only reached by stepping past a table or a terminator. Those can
+        # be data that happens to decode, so an instruction there running
+        # across the next start says nothing about that start.
+        targets: Set[int] = set()
+        suspect = False
+        self._code_straddle = None
 
         # Upper bound
         upper = sec_end if sec_end else start + 0x100000
@@ -1615,15 +1741,21 @@ class FunctionDetector:
                 if tbl_end > max_addr:
                     max_addr = tbl_end
                 addr = tbl_end
+                suspect = True
                 continue
 
             insn = self.engine.get_instruction(addr)
             if insn is None:
                 break
 
+            if addr in targets:
+                suspect = False
             end = insn.end_address
             if end > max_addr:
                 max_addr = end
+            if (next_func is not None and end > next_func and not suspect
+                    and insn.address < next_func):
+                self._code_straddle = insn.address
 
             # Track internal forward jumps to extend function bounds.
             #
@@ -1639,6 +1771,11 @@ class FunctionDetector:
             # is_jump and is_cond_jump are mutually exclusive; is_branch is both.
             if insn.is_branch and insn.jump_target is not None:
                 target = insn.jump_target
+                # Only code the walk trusts can vouch for a target: a branch
+                # decoded out of table bytes would otherwise clear `suspect`
+                # wherever it happens to point.
+                if start <= target < upper and not suspect:
+                    targets.add(target)
                 if start <= target < upper and target > max_target:
                     # This jump goes forward within bounds, extend
                     max_target = target
@@ -1651,6 +1788,8 @@ class FunctionDetector:
             # left with those registers clobbered.
             if insn.jump_table is not None:
                 for target in self.engine.jump_table_entries(insn.jump_table):
+                    if start <= target < upper and not suspect:
+                        targets.add(target)
                     if start <= target < upper and target > max_target:
                         max_target = target
 
@@ -1664,6 +1803,7 @@ class FunctionDetector:
                     if skipped > max_addr:
                         max_addr = skipped
                     addr = skipped
+                    suspect = True
                     continue
 
             if insn.is_ret or (insn.is_jump and not insn.is_cond_jump):
@@ -1682,6 +1822,7 @@ class FunctionDetector:
                     break
                 # There might be more code after (jumped over)
                 addr = insn.end_address
+                suspect = True
                 continue
 
             addr = insn.end_address

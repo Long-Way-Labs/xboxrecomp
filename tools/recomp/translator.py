@@ -526,6 +526,9 @@ class FunctionTranslator:
         # (end, last instruction) of cut bodies already warned about: the
         # tail_jump_aliases that share a cut parent's end would repeat it.
         self._teardown_reported = set()
+        # (start, end) of bodies that run off their end with no function
+        # starting there; translate_function tail-dispatches each by address.
+        self.falloffs = []
         # The guest CPU's quantum check at every loop back edge
         # (RECOMP_BACK_EDGE); --no-back-edge-yield leaves the edges bare.
         self.back_edge_yield = True
@@ -2601,6 +2604,18 @@ class FunctionTranslator:
         if ((continues_past_end or bypasses_to_end) and end in self.func_db
                 and end not in self.owned_function_starts):
             fallthrough_target = end
+        # Running off the end with no function there to bridge to. x86 just
+        # keeps executing at `end`, and a C body that returns instead drops
+        # the rest of the code and the ret: BLiNX 2's sub_001CFCA0, cut
+        # mid-instruction by a phantom start, returned four bytes of esp short
+        # and hung the Tom Tom Gang rank exam. Most of these are data decoded
+        # after a real ret and never run; for the rest, dispatch by address,
+        # which reaches an alias there or logs the miss loudly at runtime.
+        falloff_target = None
+        if (continues_past_end and fallthrough_target is None
+                and is_code_address(end)):
+            falloff_target = end
+            self.falloffs.append((start, end))
         # `leave` and `pop ebp` tear a frame down and in compiler output only
         # ever precede a ret, so a body that ends on one with nowhere to fall
         # is cut short, not data: Spartan's D3DXMatrixLookAtLH lost its
@@ -2633,7 +2648,8 @@ class FunctionTranslator:
                 and not (start <= insn.jump_target < end))
             for insn in instructions
         )
-        if has_tail_jump or fallthrough_target is not None:
+        if (has_tail_jump or fallthrough_target is not None
+                or falloff_target is not None):
             used_regs.add("ebp")
 
 
@@ -3050,6 +3066,11 @@ class FunctionTranslator:
             ft_name = self.lifter._call_target_name(fallthrough_target)
             lines.append(f"    g_seh_ebp = ebp; {ft_name}(); return;"
                          f" /* fallthrough 0x{fallthrough_target:08X} */")
+            lines.append(f"")
+        elif falloff_target is not None:
+            lines.append(f"    g_seh_ebp = ebp; RECOMP_FALLOFF_TAIL(0x{falloff_target:08X}u);"
+                         f" return; /* runs off the end: no function at"
+                         f" 0x{falloff_target:08X} */")
             lines.append(f"")
 
         # Insert _icall_esp save points before RECOMP_ICALL_SAFE arg pushes.

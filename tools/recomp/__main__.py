@@ -540,6 +540,16 @@ def main():
               f"{stats['total_lines']} lines of C, "
               f"{stats['num_chunks']} source files",
               file=sys.stderr)
+        falloffs = sorted(set(
+            getattr(translator, "translator", translator).falloffs))
+        if falloffs:
+            # Each is a body cut short (a misdetected start inside it) or data
+            # decoded after a ret; the first kind hung a BLiNX 2 rank exam.
+            names = ", ".join(f"sub_{a:08X}" for a, _ in falloffs[:8])
+            print(f"WARN: {len(falloffs)} bodies run off their end with"
+                  f" no function there, tail-dispatched by address ({names}"
+                  f"{', ...' if len(falloffs) > 8 else ''})",
+                  file=sys.stderr)
         if stats.get("unresolved_stubs"):
             print(f"{stats['unresolved_stubs']} unresolved call targets stubbed "
                   f"(addresses called but not detected as functions)",

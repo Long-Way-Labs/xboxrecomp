@@ -1373,6 +1373,24 @@ extern volatile uint64_t g_icall_guard_misses;
            recomp_icall_fail_log(_va); g_esp += 4; g_eax = 0; } \
 } while(0)
 
+/* RECOMP_FALLOFF_TAIL - a body that runs off its end into code no function
+ * claims (tools/recomp/translator.py). It dispatches by address like
+ * RECOMP_ITAIL, but a miss is logged once per site: a body that falls off
+ * usually sits in a loop, and one line per pass buried every other log. */
+#define RECOMP_FALLOFF_TAIL(xbox_va) do { \
+    static int _miss_logged; \
+    uint32_t _va = (uint32_t)(xbox_va); \
+    recomp_func_t _fn = recomp_lookup_manual(_va); \
+    if (!_fn) _fn = recomp_lookup(_va); \
+    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
+               RECOMP_ABI_CALL(_va, _fn); } \
+    else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
+           if (!_miss_logged) { _miss_logged = 1; \
+                                recomp_icall_fail_log(_va); } \
+           g_esp += 4; g_eax = 0; } \
+} while(0)
+
 /* ================================================================
  * Register name aliases for generated code
  *

@@ -2206,11 +2206,48 @@ extern volatile uint32_t g_icall_trace_idx;
 void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
                               uint32_t edi0, uint32_t esp0)
 {
-    enum { SLOTS = 32 };
+    enum { SLOTS = 32, ESP_SLOTS = 256 };
     static uint32_t seen[SLOTS];
     static uint64_t hits[SLOTS];
     static int count;
     int i;
+
+    /* esp coming back low gets its own table, keyed by call site as well as
+     * callee. A short epilogue is rare and travels: every fpo caller between
+     * it and the next frame-pointer restore comes back low too, so the first
+     * line of a burst names the culprit and the rest are its callers. Keyed
+     * by callee alone, an offender already seen on a harmless path (under a
+     * caller that restores esp from ebp) would stay silent on the path that
+     * matters, and the 32 clobber slots fill up at boot long before. */
+    if (g_esp < esp0 + 4) {
+        static uint32_t esp_seen[ESP_SLOTS][2];
+        static int esp_count;
+        static uint64_t seq;
+        uint32_t ret = *(const uint32_t *)((const uint8_t *)g_memory_offset
+                                           + esp0);
+        int k, same_va = 0;
+
+        seq++;
+        /* The SEH and alloca helpers lower esp on purpose and are called
+         * from everywhere; a few sites each is enough to recognise them. */
+        for (k = 0; k < esp_count; k++) {
+            if (esp_seen[k][0] != va)
+                continue;
+            if (esp_seen[k][1] == ret)
+                break;
+            same_va++;
+        }
+        if (k == esp_count && esp_count < ESP_SLOTS && same_va < 4) {
+            esp_seen[esp_count][0] = va;
+            esp_seen[esp_count][1] = ret;
+            esp_count++;
+            fprintf(stderr, "[ABI] esp short: sub_%08X returning to %08X"
+                            " esp %08X->%08X (%+d) #%llu\n",
+                    va, ret, esp0, g_esp, (int)(g_esp - esp0) - 4,
+                    (unsigned long long)seq);
+            fflush(stderr);
+        }
+    }
 
     for (i = 0; i < count; i++)
         if (seen[i] == va)

@@ -10,7 +10,13 @@
  * The model comes up as tests/apu_lifecycle brings it up: a small zeroed
  * buffer stands in for RAM, every xa2_* is faked, and the frame thread
  * idles on d->cond after init (pause_requested), so it is a second waiter
- * on the cond case 3 watches. VPVADDR puts the voice array in that RAM. */
+ * on the cond case 3 watches. VPVADDR puts the voice array in that RAM.
+ *
+ * Cases 4-6 cover the other half: the mix (mcpx_apu_vp_frame, run here on a
+ * test thread with d->lock held, as the frame thread runs it) holds a frame
+ * while a queued voice is locked, lets go on the unlock, gives up after its
+ * bound, and the title's methods never wait on it; case 7 shows the
+ * unlock's wake, not the poll, is what ends a hold. */
 #include "apu_state.h"
 #include "apu.h"
 #include "apu_xaudio2.h"
@@ -229,9 +235,183 @@ static void no_wake_case(void)
     check(early_returns < 10, "VOICE_LOCK does not signal d->cond (< 10 early returns)");
 }
 
+/* ---- cases 4-6: the mix holds while a queued voice is locked ---- */
+
+#define HELD_VOICE  20
+#define HOLD_MS     2.0     /* VP_HOLD_MAX_US in apu_vp.c */
+
+static uint8_t *ram;
+
+static void voice_reg(unsigned v, uint32_t reg, uint32_t value)
+{
+    memcpy(ram + VOICES + v * NV_PAVS_SIZE + reg, &value, 4);
+}
+
+/* List 0 holds voice HELD_VOICE alone, active and paused, so voice_process
+ * only marks it in g_dbg; lists 1 and 2 are empty. */
+static void one_voice_list(void)
+{
+    d->regs[NV_PAPU_TVL2D] = HELD_VOICE;
+    d->regs[NV_PAPU_TVL3D] = 0xFFFF;
+    d->regs[NV_PAPU_TVLMP] = 0xFFFF;
+    voice_reg(HELD_VOICE, NV_PAVS_VOICE_TAR_PITCH_LINK, 0xFFFF);
+    voice_reg(HELD_VOICE, NV_PAVS_VOICE_PAR_STATE,
+              NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE | NV_PAVS_VOICE_PAR_STATE_PAUSED);
+}
+
+static volatile LONG frame_done;
+static double frame_start_ms, frame_end_ms;
+
+static DWORD WINAPI run_frame(LPVOID arg)
+{
+    static float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
+    (void)arg;
+    qemu_mutex_lock(&d->lock);
+    frame_start_ms = now_ms();
+    mcpx_apu_vp_frame(d, mixbins);
+    frame_end_ms = now_ms();
+    qemu_mutex_unlock(&d->lock);
+    frame_done = 1;
+    return 0;
+}
+
+/* One frame on its own thread; returns its length in ms. */
+static double frame_on_thread(void)
+{
+    frame_done = 0;
+    g_dbg.vp.v[HELD_VOICE].active = false;
+    HANDLE h = CreateThread(NULL, 0, run_frame, NULL, 0, NULL);
+    WaitForSingleObject(h, INFINITE);
+    CloseHandle(h);
+    return frame_end_ms - frame_start_ms;
+}
+
+static void lock_voice(unsigned v, int on)
+{
+    method(NV1BA0_PIO_SET_CURRENT_VOICE, v);
+    method(NV1BA0_PIO_VOICE_LOCK, (uint32_t)on);
+}
+
+/* Case 4 and 6: the frame waits while the voice is locked, without
+ * processing it; the title's methods meanwhile return at once; the unlock
+ * lets the frame go well before the bound. */
+static void hold_and_release_case(void)
+{
+    uint64_t holds = d->vp.hold_count, timeouts = d->vp.hold_timeouts;
+    double worst = 0, t, t_unlock;
+    int waited = 0;
+
+    lock_voice(HELD_VOICE, 1);
+    frame_done = 0;
+    g_dbg.vp.v[HELD_VOICE].active = false;
+    HANDLE h = CreateThread(NULL, 0, run_frame, NULL, 0, NULL);
+    double t0 = now_ms();
+    while (!qatomic_load64(&d->vp.hold_waiting) && !frame_done && now_ms() - t0 < 1000)
+        ;
+    waited = qatomic_load64(&d->vp.hold_waiting) != 0;
+    check(waited && !frame_done, "the frame waits while a queued voice is locked");
+    check(!g_dbg.vp.v[HELD_VOICE].active, "and has not processed the locked voice");
+
+    /* Case 6: VOICE_LOCK on another voice and VOICE_ON/RELEASE, while the
+     * hold waits, each return at once. */
+    method(NV1BA0_PIO_SET_ANTECEDENT_VOICE, 0);
+    for (int i = 0; i < 50; i++) {
+        t = timed(NV1BA0_PIO_SET_CURRENT_VOICE, 30); if (t > worst) worst = t;
+        t = timed(NV1BA0_PIO_VOICE_LOCK, 1);         if (t > worst) worst = t;
+        t = timed(NV1BA0_PIO_VOICE_LOCK, 0);         if (t > worst) worst = t;
+    }
+    method(NV1BA0_PIO_SET_CURRENT_VOICE, HELD_VOICE);
+    t_unlock = now_ms();
+    t = timed(NV1BA0_PIO_VOICE_LOCK, 0);             if (t > worst) worst = t;
+    printf("  slowest title method while the mix holds: %.3f ms\n", worst);
+    check(worst < 5.0, "no title method waits on the hold (each < 5 ms)");
+
+    WaitForSingleObject(h, INFINITE);
+    CloseHandle(h);
+    printf("  frame ended %.3f ms after the unlock (bound %.0f ms)\n",
+           frame_end_ms - t_unlock, HOLD_MS);
+    check(frame_end_ms >= t_unlock, "the frame ends only after the unlock");
+    check(g_dbg.vp.v[HELD_VOICE].active, "and then processes the voice");
+    check(d->vp.hold_count == holds + 1 && d->vp.hold_timeouts == timeouts,
+          "one hold, ended by the unlock, not the bound");
+    check(!d->vp.hold_waiting, "hold_waiting is clear after the hold");
+}
+
+/* Case 7: the unlock's wake, not the 1 ms poll, ends the hold. The test
+ * unlocks once the hold has had time to go to sleep, and counts holds that
+ * hold_wakes says a wake cut short inside the first poll. The idle frame
+ * thread also waits on d->cond (with a plain signal it took every wake on
+ * macOS: 0 of 20), and a busy host can delay the hold past its poll, so
+ * this asks for most of WAKE_REPS, not all. */
+#define WAKE_REPS 20
+
+static void wake_case(void)
+{
+    uint64_t wakes = d->vp.hold_wakes, holds = d->vp.hold_count;
+
+    for (int i = 0; i < WAKE_REPS; i++) {
+        lock_voice(HELD_VOICE, 1);
+        frame_done = 0;
+        HANDLE h = CreateThread(NULL, 0, run_frame, NULL, 0, NULL);
+        double t0 = now_ms();
+        while (!qatomic_load64(&d->vp.hold_waiting) && !frame_done && now_ms() - t0 < 1000)
+            ;
+        /* Past the re-check after hold_waiting is set, into the wait. */
+        t0 = now_ms();
+        while (now_ms() - t0 < 0.3)
+            ;
+        lock_voice(HELD_VOICE, 0);
+        WaitForSingleObject(h, INFINITE);
+        CloseHandle(h);
+    }
+    printf("  holds ended by the unlock's wake: %llu of %d\n",
+           (unsigned long long)(d->vp.hold_wakes - wakes), WAKE_REPS);
+    check(d->vp.hold_count == holds + WAKE_REPS, "every repetition held");
+    check(d->vp.hold_wakes - wakes >= WAKE_REPS / 2,
+          "the unlock wakes the hold before its poll runs out (most reps)");
+}
+
+/* Case 5: a voice the title never unlocks holds one frame for the bound and
+ * no frame after it, until it is unlocked and locked again. */
+static void bound_case(void)
+{
+    uint64_t holds = d->vp.hold_count, timeouts = d->vp.hold_timeouts;
+    double t;
+
+    lock_voice(HELD_VOICE, 1);
+    t = frame_on_thread();
+    printf("  frame with the voice left locked: %.3f ms\n", t);
+    check(t >= HOLD_MS - 0.1 && t < HOLD_MS + 50.0,
+          "a voice left locked holds the frame for the bound");
+    check(d->vp.hold_timeouts == timeouts + 1 && g_dbg.vp.v[HELD_VOICE].active,
+          "the bound runs out and the voice is processed as it stands");
+
+    t = frame_on_thread();
+    check(d->vp.hold_count == holds + 1 && g_dbg.vp.v[HELD_VOICE].active,
+          "the next frame does not hold for the same lock");
+    printf("  next frame: %.3f ms\n", t);
+
+    lock_voice(HELD_VOICE, 0);
+    frame_on_thread();
+    check(d->vp.hold_count == holds + 1, "an unlocked voice is not held");
+    lock_voice(HELD_VOICE, 1);
+    frame_on_thread();
+    check(d->vp.hold_count == holds + 2 && d->vp.hold_timeouts == timeouts + 2,
+          "a fresh lock after the unlock is held again");
+    lock_voice(HELD_VOICE, 0);
+
+    /* A locked voice that is not queued (on no list) never holds. */
+    d->regs[NV_PAPU_TVL2D] = 0xFFFF;
+    lock_voice(HELD_VOICE, 1);
+    t = frame_on_thread();
+    check(d->vp.hold_count == holds + 2, "a locked voice on no list does not hold");
+    lock_voice(HELD_VOICE, 0);
+    d->regs[NV_PAPU_TVL2D] = HELD_VOICE;
+}
+
 int main(void)
 {
-    uint8_t *ram = calloc(1, FAKE_RAM);
+    ram = calloc(1, FAKE_RAM);
     if (!ram) return 1;
 
     printf("apu_voice_lock:\n");
@@ -244,6 +424,10 @@ int main(void)
     lost_update_case(35, 37);
     high_bit_case();
     no_wake_case();
+    one_voice_list();
+    hold_and_release_case();
+    wake_case();
+    bound_case();
 
     mcpx_apu_shutdown(d);
     free(ram);

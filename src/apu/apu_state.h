@@ -430,6 +430,23 @@ typedef struct MCPXAPUVPState {
      * natural alignment: an unaligned 64-bit locked op splits across cache
      * lines on x86 and faults on arm64. */
     _Alignas(8) uint64_t voice_locked[4];
+    /* The mix's hold on a queued voice the title has locked (apu_vp.c,
+     * vp_hold_locked_voices). hold_waiting is 1 while the frame thread waits
+     * there, so voice_lock wakes it only then; it is read by the title side
+     * and written by the frame thread, with the same 64-bit atomics. The
+     * rest belong to the frame thread. */
+    _Alignas(8) uint64_t hold_waiting;
+    uint64_t hold_exempt[4];   /* locked through a whole bound: not held again until unlocked */
+    uint64_t hold_count;       /* frames that waited */
+    uint64_t hold_timeouts;    /* waits that ran out the bound */
+    uint64_t hold_max_us;      /* longest wait */
+    /* Holds that cleared after their first 1 ms wait returned in under
+     * 0.9 ms. Meant to count voice_lock's broadcast, but any early return
+     * counts: a spurious wake, the ISTS/FECTL broadcasts in apu_core.c, the
+     * apu_mixer_play signal, or SleepConditionVariableCS returning early on
+     * native Windows. So it is an upper bound on the wakes, which is why
+     * the ctest only asserts a floor (a wake that works shows up). */
+    uint64_t hold_wakes;
 
     struct {
         int current_entry;

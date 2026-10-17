@@ -66,7 +66,10 @@ static inline uint32_t qatomic_load32(uint32_t *p)
 /* 64-bit words (vp.voice_locked). qatomic_or/and above are _InterlockedOr on
  * a 32-bit long under MSVC and would drop the high half of the word; and
  * qemu_shim's qatomic_read is a plain dereference, which may tear or be
- * cached. */
+ * cached. The load is sequentially consistent, not just acquire, because
+ * the hold and voice_lock each store one word and then load the other
+ * (hold_waiting, voice_locked): only a total order makes sure one of them
+ * sees the other's store. */
 #ifndef qatomic_or64
 #ifdef _MSC_VER
 #define qatomic_or64(p, v)  _InterlockedOr64((__int64 volatile *)(p), (__int64)(v))
@@ -75,7 +78,7 @@ static inline uint32_t qatomic_load32(uint32_t *p)
 #else
 #define qatomic_or64(p, v)  __atomic_fetch_or((p), (v), __ATOMIC_SEQ_CST)
 #define qatomic_and64(p, v) __atomic_fetch_and((p), (v), __ATOMIC_SEQ_CST)
-#define qatomic_load64(p)   __atomic_load_n((p), __ATOMIC_ACQUIRE)
+#define qatomic_load64(p)   __atomic_load_n((p), __ATOMIC_SEQ_CST)
 #endif
 #endif
 

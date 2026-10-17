@@ -559,6 +559,8 @@ static void record_tex_reg(uint32_t method, uint32_t param)
     if (method == 0x1B20u)              /* stage 0 SET_TEXTURE_PALETTE */
         nv2a_tex_palette_decode(param, dma_resolve, &s_gpu.tex.palette,
                                 &s_gpu.tex.pal_len);
+    if (method == 0x1B24u)              /* stage 0 SET_TEXTURE_BORDER_COLOR */
+        s_gpu.tex.border = param;
     /* A pitch is a linear texture's property. A swizzled one has no rows and
      * so no pitch, and requiring one here refused every swizzled texture --
      * which is nearly all of them, since swizzled is the Xbox default. That
@@ -1542,8 +1544,8 @@ static uint32_t surf_written_since(uint32_t lo, uint32_t hi)
 static long surface_swizzle_index(int x, int y)
 {
     static uint32_t key, mx, my;
-    uint32_t w = 1u << ((s_gpu.format >> 16) & 0x1F);
-    uint32_t h = 1u << ((s_gpu.format >> 24) & 0x1F);
+    uint32_t w = nv2a_swizzle_side((s_gpu.format >> 16) & 0x1F);
+    uint32_t h = nv2a_swizzle_side((s_gpu.format >> 24) & 0x1F);
     if ((uint32_t)x >= w || (uint32_t)y >= h)
         return -1;
     if (key != (s_gpu.format & 0xFFFF0000u)) {
@@ -1563,22 +1565,30 @@ static void clear_surface(uint32_t param)
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
     uint32_t y, x, b[4];
+    /* The memory the clear may write (nv2a_clear_box clamps to the same
+     * surface): a swizzled one is its power-of-two size, a pitch one ends
+     * at the clip's far corner. */
+    uint32_t sw = s_gpu.clip_x + s_gpu.clip_w, sh = s_gpu.clip_y + s_gpu.clip_h;
 
     if (!(param & NV097_CLEAR_COLOR_MASK))
         return;                            /* depth/stencil only */
     if (!s_gpu.color_offset || !s_gpu.pitch || !s_gpu.clip_h || bpp == 0)
         return;
+    if (surface_swizzled()) {
+        sw = nv2a_swizzle_side((s_gpu.format >> 16) & 0x1F);
+        sh = nv2a_swizzle_side((s_gpu.format >> 24) & 0x1F);
+    }
     {
         uint32_t base = dma_resolve(s_gpu.color_offset);
         if (surface_write_refused(base,
-                                  (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch,
+                                  surface_swizzled() ? sw * sh * bpp : sh * s_gpu.pitch,
                                   "clear"))
             return;
         s_gpu.color_base = base;
     }
-    /* The clip, bounded by SET_CLEAR_RECT (nv2a_clear_box), as the GPU
-     * backends clear: Burnout 3 clears 159x344 regions of its back buffer. */
-    if (!nv2a_clear_box(&s_gpu, s_gpu.clip_x + s_gpu.clip_w, s_gpu.clip_y + s_gpu.clip_h, b))
+    /* SET_CLEAR_RECT, else the clip (nv2a_clear_box), as the GPU backends
+     * clear: Burnout 3 clears 159x344 regions of its back buffer. */
+    if (!nv2a_clear_box(&s_gpu, sw, sh, b))
         b[0] = b[1] = b[2] = b[3] = 0;   /* nothing to fill; still a clear */
 
     for (y = b[1]; y < b[3]; y++) {
@@ -1758,6 +1768,17 @@ static uint32_t wrap_coord(uint32_t c, uint32_t size, uint32_t mode)
     return c >= size ? size - 1 : c;       /* clamp, and everything else */
 }
 
+/* BORDER on an axis whose coordinate is off the texture: the tap is the
+ * border colour, not a texel (nv2a_stage_decode has the rule). A negative
+ * coordinate arrives here as a large unsigned one, as wrap_signed's -1
+ * does. */
+static int tex_border_tap(const Texture *t, uint32_t u, uint32_t v)
+{
+    return t->border_on
+        && ((t->addr_u == NV2A_ADDR_BORDER && u >= t->width)
+            || (t->addr_v == NV2A_ADDR_BORDER && v >= t->height));
+}
+
 static uint64_t s_tex_fail[256];        /* texels refused, by format code */
 
 /* s_tex_fail[k]++, returning the old count: raster threads sample too. */
@@ -1778,6 +1799,10 @@ static int sample_tex(const Texture *t, uint32_t u, uint32_t v, uint32_t *argb)
 
     if (!t->valid)
         return 0;
+    if (tex_border_tap(t, u, v)) {
+        *argb = t->border;
+        return 1;
+    }
     u = wrap_coord(u, t->width,  t->addr_u);
     v = wrap_coord(v, t->height, t->addr_v);
 
@@ -2160,9 +2185,13 @@ static void raster_triangle(const float a[2], const float b[2],
                 uint32_t texel;
                 float su = (w1 * uv[0][0] + w2 * uv[1][0] + w0 * uv[2][0]) / area;
                 float sv = (w1 * uv[0][1] + w2 * uv[1][1] + w0 * uv[2][1]) / area;
-                if (su < 0.0f) su = 0.0f;
-                if (sv < 0.0f) sv = 0.0f;
-                if (sample_texture((uint32_t)su, (uint32_t)sv, &texel)) {
+                /* Left of or above the texture: the edge texel, or for a
+                 * border axis an off-texture coordinate (tex_border_tap). */
+                int bu = s_gpu.tex.border_on && s_gpu.tex.addr_u == NV2A_ADDR_BORDER;
+                int bv = s_gpu.tex.border_on && s_gpu.tex.addr_v == NV2A_ADDR_BORDER;
+                uint32_t iu = su < 0.0f ? (bu ? UINT32_MAX : 0u) : (uint32_t)su;
+                uint32_t iv = sv < 0.0f ? (bv ? UINT32_MAX : 0u) : (uint32_t)sv;
+                if (sample_texture(iu, iv, &texel)) {
                     put_pixel(mem, bpp, x, y, texel);
                     continue;
                 }
@@ -2942,6 +2971,9 @@ static int depth_pass(float z, float stored)
     return nv2a_cmp_test_f(nv2a_cmp_from_gl(s_vsh.depth_func), z, stored);
 }
 
+/* A stage tap's coordinate on one axis: wrapped, clamped, or -1 off the
+ * texture under BORDER, which texel_live and texel_cached read as the
+ * border colour. */
 static int wrap_signed(int c, uint32_t size, uint32_t mode)
 {
     if (!size)
@@ -2950,6 +2982,8 @@ static int wrap_signed(int c, uint32_t size, uint32_t mode)
         int m = c % (int)size;
         return m < 0 ? m + (int)size : m;
     }
+    if (mode == NV2A_ADDR_BORDER && (c < 0 || c >= (int)size))
+        return -1;
     if (c < 0) return 0;
     return c >= (int)size ? (int)size - 1 : c;
 }
@@ -3295,6 +3329,8 @@ static void vsh_build_stages(void)
         t->color  = st.color;
         t->addr_u = st.addr_u;
         t->addr_v = st.addr_v;
+        t->border = st.border;
+        t->border_on = 1;   /* the decode keeps BORDER only with the colour */
         t->palette = st.palette;
         t->pal_len = st.pal_len;
         t->filter = st.filter;
@@ -4058,11 +4094,17 @@ static void tc_fill_locked(TexCacheEntry *e, const Texture *t, uint32_t l,
     s_rt.tex += rt_now() - t0;
 }
 
-/* Texel (iu, iv) of level l, already wrapped, from the cache. */
+/* Texel (iu, iv) of level l, already wrapped, from the cache; -1 on
+ * either axis is the border colour (wrap_signed). */
 static inline void texel_cached(TexCacheEntry *e, int n, uint32_t l, int iu, int iv,
                                 float o[4])
 {
-    uint32_t tile = ((uint32_t)iv >> TC_TILE_LOG) * e->ltx[l] + ((uint32_t)iu >> TC_TILE_LOG);
+    uint32_t tile;
+    if ((iu | iv) < 0) {
+        rc_unpack_fast(s_stage_tex[n].border, o);
+        return;
+    }
+    tile = ((uint32_t)iv >> TC_TILE_LOG) * e->ltx[l] + ((uint32_t)iu >> TC_TILE_LOG);
     if (!tile_ready(&e->tile_ok[e->ltile[l] + tile]))
         tc_fill(e, &s_stage_tex[n], l, tile);
     rc_unpack_fast(e->texels[e->ltex[l] + (size_t)iv * e->lw[l] + (uint32_t)iu], o);
@@ -4717,12 +4759,23 @@ static void fast_batch_setup(void)
  *   -CLIP_GUARD <= x, y <= CLIP_GUARD   a guard band, so a vertex just in
  *                                       front of the eye does not hand the
  *                                       edge functions 1e8-pixel operands
- *   0 <= z <= zmax                      with depth on only: the NV2A culls
- *                                       fragments outside [zmin, zmax]
+ *   z >= 0                              always: the NV2A clips at the near
+ *                                       plane whatever the depth test says
+ *                                       (xemu's ZCLAMP CULL; the GPU backends
+ *                                       clip there too), so a depth-off batch
+ *                                       crossing it must not draw the part
+ *                                       in front of it (upstream #211)
+ *   z <= zmax                           with depth on only, matching what
+ *                                       this path drew before: the NV2A culls
+ *                                       fragments beyond zmax
  *                                       (ZMIN_MAX_CONTROL CULL_NEAR_FAR, the
  *                                       XDK default), and since screen z is
  *                                       affine in x, y, clipping here is
- *                                       exactly that cull
+ *                                       exactly that cull. Whether it culls
+ *                                       with depth off too is open: xemu's
+ *                                       ZCLAMP CULL is not gated on the depth
+ *                                       test, and the GPU backends clip far
+ *                                       with depth off
  *
  * A triangle with all three vertices inside every plane goes to the
  * rasteriser untouched, so nothing that drew before changes by a bit. Only
@@ -4773,7 +4826,9 @@ static int clip_inside_all(const XfVert *v, int nplanes, float zmax)
         return 0;
     if (fabsf(v->x) > CLIP_GUARD || fabsf(v->y) > CLIP_GUARD)
         return 0;
-    if (nplanes > 5 && (v->z < 0.0f || v->z > zmax))
+    if (nplanes > 5 && v->z < 0.0f)
+        return 0;
+    if (nplanes > 6 && v->z > zmax)
         return 0;
     return 1;
 }
@@ -4819,7 +4874,7 @@ static void clip_tri(const XfVert *a, const XfVert *b, const XfVert *c,
     const XfVert *in3[3];
     ClipVert *src = buf[0], *dst = buf[1];
     float zmax = vsh_zmax();
-    int nplanes = s_vsh.depth_enable ? 7 : 5;
+    int nplanes = s_vsh.depth_enable ? 7 : 6;   /* far with depth on only */
     int n = 3, plane, i, k;
 
     if (!a->ok || !b->ok || !c->ok) {
@@ -6664,6 +6719,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
     case NV097_SET_TEXTURE_FORMAT:
         s_gpu.tex.color = (param >> 8) & 0xFF;
+        s_gpu.tex.border_on = (param >> 3) & 1;   /* BORDER_SOURCE: colour */
         /* A swizzled texture carries its own dimensions here, as log2 in
          * BASE_SIZE_U/V (nv2a_regs.h: 0x00F00000 / 0x0F000000). It has to:
          * SET_TEXTURE_IMAGE_RECT describes a linear image, and a title that
@@ -6678,9 +6734,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
 
     case NV097_SET_TEXTURE_ADDRESS:
-        /* Four bits per axis. 1 is wrap, 3 is clamp-to-edge; the rest (mirror,
-         * border) fall back to clamp, which is wrong at an edge rather than
-         * wrong everywhere. */
+        /* Four bits per axis. 1 is wrap, 3 is clamp-to-edge, 4 is border
+         * (sample_tex); mirror falls back to clamp, which is wrong at an edge
+         * rather than wrong everywhere. */
         s_gpu.tex.addr_u =  param        & 0xF;
         s_gpu.tex.addr_v = (param >>  8) & 0xF;
         record_tex_reg(method, param);

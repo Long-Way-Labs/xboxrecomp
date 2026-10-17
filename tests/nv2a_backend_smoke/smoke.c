@@ -787,16 +787,20 @@ static void clear_rect(uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
     M(0x1D9C, (y1 << 16) | y0);
 }
 
-enum { CC_CLIP, CC_RECT, CC_GROW, CC_GROW2, CC_DRAW, CC_DRAW3 };
+enum { CC_CLIP, CC_RECT, CC_GROW, CC_GROW2, CC_DRAW, CC_DRAW3, CC_RECT2, CC_COUNT };
 
 static void clip_stream(int cc)
 {
     switch (cc) {
-    case CC_CLIP:   /* red over 640x480, then a 160x120 clip at (100,100) blue */
+    case CC_CLIP:   /* red over 640x480, then a 160x120 clip at (100,100) blue,
+                     * with the clear rect the clip, as D3D's Clear sends it: a
+                     * set rect alone bounds a clear (nv2a_clear_box) */
         surf_clip(BUF0, 0, 0, W, H);
         clear_to(0xFFFF0000u);
         surf_clip(BUF0, 100, 100, 160, 120);
+        clear_rect(100, 100, 259, 219);
         clear_to(0xFF0000FFu);
+        clear_rect(0, 0, W - 1, H - 1);
         break;
     case CC_RECT:   /* red, then the whole clip with a clear rect, green */
         surf_clip(BUF0, 0, 0, W, H);
@@ -804,6 +808,17 @@ static void clip_stream(int cc)
         clear_rect(300, 300, 339, 339);
         clear_to(0xFF00FF00u);
         clear_rect(0, 0, W - 1, H - 1);
+        break;
+    case CC_RECT2:  /* red, then a 160x120 clip at (100,100) and a larger clear
+                     * rect, green: the rect alone, ended by the clip's far
+                     * corner (the pitch surface's end), not cut to the clip */
+        surf_clip(BUF0, 0, 0, W, H);
+        clear_to(0xFFFF0000u);
+        surf_clip(BUF0, 100, 100, 160, 120);
+        clear_rect(50, 50, 399, 299);
+        clear_to(0xFF00FF00u);
+        clear_rect(0, 0, W - 1, H - 1);
+        surf_clip(BUF0, 0, 0, W, H);
         break;
     case CC_DRAW:   /* red, then a 160x120 clip at (100,100) and a blue quad */
     case CC_DRAW3: {/* past it on every side: the clip scissors the quad */
@@ -841,7 +856,7 @@ static void fill(uint32_t buf, uint32_t argb)
 
 /* The pixels each clip case must show, on both paths. */
 /* The clear rect's (339,339) and (340,339) pin its inclusive max edge. */
-static const struct probe s_clip_probe[6][6] = {
+static const struct probe s_clip_probe[CC_COUNT][6] = {
     {{50, 50, 0xFFFF0000u}, {150, 150, 0xFF0000FFu}, {300, 300, 0xFFFF0000u}, {0}},
     {{320, 320, 0xFF00FF00u}, {350, 350, 0xFFFF0000u}, {299, 320, 0xFFFF0000u},
      {339, 339, 0xFF00FF00u}, {340, 339, 0xFFFF0000u}, {0}},
@@ -852,9 +867,13 @@ static const struct probe s_clip_probe[6][6] = {
      {150, 99, 0xFFFF0000u}, {260, 150, 0xFFFF0000u}, {150, 220, 0xFFFF0000u}},
     {{100, 100, 0xFF0000FFu}, {259, 219, 0xFF0000FFu}, {99, 150, 0xFFFF0000u},
      {150, 99, 0xFFFF0000u}, {260, 150, 0xFFFF0000u}, {150, 220, 0xFFFF0000u}},
+    /* (50,50)-(259,219) green: above and left of the clip too. */
+    {{50, 50, 0xFF00FF00u}, {60, 150, 0xFF00FF00u}, {259, 219, 0xFF00FF00u},
+     {49, 150, 0xFFFF0000u}, {260, 150, 0xFFFF0000u}, {150, 220, 0xFFFF0000u}},
 };
-static const char *const s_clip_name[6] = {"clip clear", "clear rect", "grow", "grow x2",
-                                           "draw clip", "draw clip x3"};
+static const char *const s_clip_name[CC_COUNT] = {"clip clear", "clear rect", "grow",
+                                                  "grow x2", "draw clip", "draw clip x3",
+                                                  "rect > clip"};
 
 static int clip_probes(int cc, const char *path, const uint32_t *px)
 {
@@ -870,7 +889,7 @@ static int clip_probes(int cc, const char *path, const uint32_t *px)
     return ok;
 }
 
-/* The CPU halves of the clip clear, clear rect and draw clip cases, before the backend
+/* The CPU halves of the clip clear, clear rect, draw clip and rect > clip cases, before the backend
  * check: the CPU path's clear box (nv2a_clear_box) needs no GPU, so a Mac run
  * without the Metal backend still checks it. On a Metal run clip_cases
  * repeats them. Proton never builds this test; its check is
@@ -881,13 +900,124 @@ static int clip_cpu_cases(void)
     int cc, f = 0;
 
     nv2a_pb_set_backend(nv2a_pb_cpu_backend());
-    for (cc = CC_CLIP; cc <= CC_DRAW; cc++) {
-        if (cc == CC_GROW || cc == CC_GROW2)
+    for (cc = CC_CLIP; cc < CC_COUNT; cc++) {
+        if (cc == CC_GROW || cc == CC_GROW2 || cc == CC_DRAW3)
             continue;   /* Metal's seeds; nothing the CPU path alone shows */
         fill(BUF0, PATTERN);
         clip_stream(cc);
         memcpy(px, guest(BUF0), W * H * 4);
         f += !clip_probes(cc, "cpu", px);
+    }
+    surf_clip(BUF0, 0, 0, W, H);
+    nv2a_pb_set_backend(NULL);
+    return f;
+}
+
+/* Texture address mode 4, border (Burnout 3 sets it on stages 0-3 with the
+ * border colour as the source, colour 0x00000000). The checker on a quad
+ * whose UVs run from -0.5 to 1.5: the taps past the texture take
+ * SET_TEXTURE_BORDER_COLOR, the middle the checker. The quad sits 1/32
+ * pixel off the grid so no pixel centre lands on a texel edge. With the
+ * texture as the border source (FORMAT bit 3 clear) the edge texel stands
+ * in, so the corner is the checker's green column. Metal has three sampler
+ * border colours (transparent black, opaque black and white) and clamps to
+ * the edge for any other, so the arbitrary colour is checked on the CPU
+ * path alone; D3D11 takes any colour (d3d11_backend_smoke). */
+enum { BC_ZERO, BC_WHITE, BC_ODD, BC_TEXSRC, BC_COUNT };
+static const uint32_t s_bc_colour[BC_COUNT] = {0x00000000u, 0xFFFFFFFFu, 0xFF20C040u,
+                                               0xFFFFFFFFu};
+static const char *const s_bc_name[BC_COUNT] = {"border 0", "border white", "border odd",
+                                                "border tex"};
+
+static void border_stream(int bc)
+{
+    static const uint32_t white[4] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+    static const float uv[4][2] = {{-0.5f, -0.5f}, {1.5f, -0.5f}, {1.5f, 1.5f}, {-0.5f, 1.5f}};
+    const float o = 1.0f / 32.0f;
+    int a;
+
+    surf_clip(BUF0, 0, 0, W, H);
+    clear_to(0xFF404040u);
+    for (a = 0; a < 16; a++)
+        M(0x1760 + 4 * a, a == 0 ? 0x42u : a == 3 ? 0x40u : a == 9 ? 0x22u : 0x02u);
+    stage0_checker();
+    M(0x1B04, (0x06u << 8) | (TEX_LOG2 << 20) | (TEX_LOG2 << 24) | (1u << 4) | (2u << 0)
+              | (bc == BC_TEXSRC ? 0u : 1u << 3));   /* BORDER_SOURCE: colour */
+    M(0x1B08, 0x00000404u);                /* border u, border v */
+    M(0x1B24, s_bc_colour[bc]);            /* TEXTURE_BORDER_COLOR(0) */
+    quad_uv(100.0f + o, 100.0f + o, 300.0f + o, 300.0f + o, white, uv);
+    M(0x1B08, 0x00000101u);
+    M(0x1B24, 0);
+    M(0x1B0C, 0);
+    M(0x1760 + 4 * 9, 0x02u);
+}
+
+static int border_probes(int bc, const char *path, const uint32_t *px)
+{
+    /* Left, right, above and below the texture, then its middle texel
+     * (32,32), orange. A transparent border writes alpha 0 (blend off), so
+     * BC_ZERO checks all 32 bits: compare() reads B/G/R only, and opaque
+     * black would pass for it. */
+    static const uint32_t at[5][2] = {{120, 200}, {290, 200}, {200, 120}, {200, 290},
+                                      {200, 200}};
+    uint32_t opaque = bc == BC_ZERO ? 0 : 0xFF000000u;
+    uint32_t want = (bc == BC_TEXSRC ? 0xFF00FF00u : s_bc_colour[bc]) | opaque;
+    int k, ok = 1;
+    for (k = 0; k < 5; k++) {
+        uint32_t x = at[k][0], y = at[k][1];
+        uint32_t w = k == 4 ? 0xFFFF8000u : want;
+        uint32_t got = px[y * W + x] | (k == 4 ? 0xFF000000u : opaque);
+        if (bc == BC_TEXSRC && k != 0 && k != 2 && k != 4)
+            continue;   /* the edge texels there are the checker's own */
+        if (bc == BC_TEXSRC && k == 2)
+            w = 0xFFFFFFFFu;   /* above: the white top row */
+        fprintf(stderr, "[backend-smoke] %-12s %s pixel (%u,%u) 0x%08X want 0x%08X %s\n",
+                s_bc_name[bc], path, x, y, got, w, got == w ? "PASS" : "FAIL");
+        ok &= got == w;
+    }
+    return ok;
+}
+
+/* The CPU path for every case and, with Metal, the frames compared whole
+ * for the colours Metal has. Returns the failures. */
+static int border_cases(const struct nv2a_pb_backend *b)
+{
+    static uint32_t cpu[W * H];
+#ifdef __APPLE__
+    static uint32_t gpu[W * H];
+#endif
+    int bc, f = 0;
+
+    make_textures();
+    for (bc = 0; bc < BC_COUNT; bc++) {
+        int ok;
+        fill(BUF0, PATTERN);
+        nv2a_pb_set_backend(nv2a_pb_cpu_backend());
+        border_stream(bc);
+        memcpy(cpu, guest(BUF0), W * H * 4);
+        ok = border_probes(bc, "cpu", cpu);
+#ifdef __APPLE__
+        if (b && bc != BC_ODD) {
+            const uint8_t *hp;
+            uint32_t hw = 0, hh = 0;
+            fill(BUF0, PATTERN);
+            nv2a_pb_set_backend(b);
+            border_stream(bc);
+            hp = nv2a_pb_metal_host_pixels(BUF0, &hw, &hh);
+            if (!hp || hw != W || hh != H) {
+                fprintf(stderr, "[backend-smoke] %s: Metal target %ux%u FAIL\n",
+                        s_bc_name[bc], hw, hh);
+                ok = 0;
+            } else {
+                memcpy(gpu, hp, W * H * 4);
+                ok &= compare(s_bc_name[bc], cpu, gpu);
+                ok &= border_probes(bc, "gpu", gpu);
+            }
+        }
+#else
+        (void)b;
+#endif
+        f += !ok;
     }
     surf_clip(BUF0, 0, 0, W, H);
     nv2a_pb_set_backend(NULL);
@@ -905,7 +1035,7 @@ static int clip_cases(const struct nv2a_pb_backend *b, uint32_t *cpu, uint32_t *
     uint32_t tw = 0, th = 0, sw = 0, sh = 0;
     int cc, f = 0, k;
 
-    for (cc = CC_CLIP; cc <= CC_DRAW3; cc++) {
+    for (cc = CC_CLIP; cc < CC_COUNT; cc++) {
         uint32_t buf = cc == CC_GROW ? BUF3 : cc == CC_GROW2 ? BUF4 : cc == CC_DRAW3 ? BUF5 : BUF0;
         const uint8_t *hp;
         uint32_t hw = 0, hh = 0;
@@ -1761,6 +1891,10 @@ int main(int argc, char **argv)
         gpu = nv2a_pb_metal_backend();
 #endif
     if (!gpu) {
+        if (!guard && !noalias && border_cases(NULL)) {
+            fprintf(stderr, "[backend-smoke] FAIL: CPU border colour\n");
+            failures++;
+        }
         fprintf(stderr, "[backend-smoke] no backend '%s' on this host: GPU scenes"
                 " skipped\n", which);
         failures += scanout_cases();
@@ -1822,6 +1956,10 @@ int main(int argc, char **argv)
             fprintf(stderr, "[backend-smoke] FAIL: %d clip-extent cases\n", f);
         failures += f;
         failures += occ_case(gpu);
+        f = border_cases(gpu);
+        if (f)
+            fprintf(stderr, "[backend-smoke] FAIL: %d border colour cases\n", f);
+        failures += f;
     }
     if (gpu == nv2a_pb_metal_backend() && run(nv2a_pb_cpu_backend(), SC_CLEAR_QUAD, cpu_px, 0)) {
         int f = writeback_cases(gpu, cpu_px, gpu_px);

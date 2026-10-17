@@ -182,6 +182,17 @@ void nv2a_stage_decode(int n, const uint32_t *r, const uint8_t *set,
               ? 0 : r[0x10 / 4] >> 16;
     t->addr_u =  r[0x08 / 4]       & 0xF;
     t->addr_v = (r[0x08 / 4] >> 8) & 0xF;
+    /* BORDER reads SET_TEXTURE_BORDER_COLOR (0x1B24) when FORMAT's
+     * BORDER_SOURCE (bit 3) says so, as xemu does: Burnout 3 samples its
+     * full-screen passes that way on stages 0-3, border 0x00000000, so the
+     * taps past the edge are transparent black, not the edge texel. With the
+     * texture as the source the border texels would come from the image;
+     * that stays a clamp to edge, an approximation no title of ours needs. */
+    if (!((fmt >> 3) & 1u)) {
+        if (t->addr_u == NV2A_ADDR_BORDER) t->addr_u = 3;
+        if (t->addr_v == NV2A_ADDR_BORDER) t->addr_v = 3;
+    }
+    t->border = r[0x24 / 4];
     t->filter = r[0x14 / 4];
     t->cube = (int)((fmt >> 2) & 1u);
     t->dims = (fmt >> 4) & 0xFu;

@@ -257,25 +257,45 @@ static inline int nv2a_rt_overlap(uint32_t a, uint32_t an, uint32_t b, uint32_t 
     return an && bn && a < b + bn && b < a + an;
 }
 
+/* A swizzled surface's side from its SURFACE_FORMAT log2 field, at most
+ * 4096 (the NV2A limit): a garbage format would otherwise overflow the
+ * w*h*bpp extent the CPU clear checks before writing. */
+static inline uint32_t nv2a_swizzle_side(uint32_t log2)
+{
+    return 1u << (log2 > 12u ? 12u : log2);
+}
+
 /* What a colour clear covers, in guest pixels, box = {x0, y0, x1, y1} with
- * x1/y1 exclusive: the surface clip, bounded by the clear rect once the title
- * has set one (inclusive max, as xemu reads it), clamped to a w x h target.
- * 0 when nothing is left. One box for every path: since a GPU target serves
- * every clip of its surface (Burnout 3 clears 159x344 regions of its 640x480
- * back buffer), a whole-target clear would wipe what another clip drew. */
+ * x1/y1 exclusive: the clear rect once the title has set one (inclusive max),
+ * else the surface clip, clamped to the surface and to a w x h target. The
+ * rect alone, not its intersection with the clip: xemu clears the rect
+ * clamped to the surface, and upstream #212 adopts that rule. The surface is
+ * xemu's too: a swizzled one is its power-of-two FORMAT size (SSX 3 clears
+ * 128x128 under a 124x124 clip and samples the ring), a pitch one ends at
+ * the clip's far corner. A GPU target is only as large as the clips it was
+ * drawn with, so there w x h can cut a swizzled rect short; neither BLiNX 2
+ * nor Burnout 3 sends a rect past its clip. 0 when nothing is left.
+ * One box for every path: since a GPU target serves every clip of its
+ * surface (Burnout 3 clears 159x344 regions of its 640x480 back buffer), a
+ * whole-target clear would wipe what another clip drew. */
 static inline int nv2a_clear_box(const struct nv2a_pb_gpu *g, uint32_t w, uint32_t h,
                                  uint32_t box[4])
 {
     uint32_t ax = g->clip_x, ay = g->clip_y;
     uint32_t bx = g->clip_x + g->clip_w, by = g->clip_y + g->clip_h;
-    if (g->clear_rect_set) {
-        uint32_t rx0 = g->clear_rect_h & 0xFFFFu, rx1 = (g->clear_rect_h >> 16) + 1u;
-        uint32_t ry0 = g->clear_rect_v & 0xFFFFu, ry1 = (g->clear_rect_v >> 16) + 1u;
-        if (rx0 > ax) ax = rx0;
-        if (ry0 > ay) ay = ry0;
-        if (rx1 < bx) bx = rx1;
-        if (ry1 < by) by = ry1;
+    uint32_t sw = bx, sh = by;
+    if (((g->format >> 8) & 0xFu) == 2u) {   /* SURFACE_FORMAT type: swizzled */
+        sw = nv2a_swizzle_side((g->format >> 16) & 0x1Fu);
+        sh = nv2a_swizzle_side((g->format >> 24) & 0x1Fu);
     }
+    if (g->clear_rect_set) {
+        ax = g->clear_rect_h & 0xFFFFu;
+        bx = (g->clear_rect_h >> 16) + 1u;
+        ay = g->clear_rect_v & 0xFFFFu;
+        by = (g->clear_rect_v >> 16) + 1u;
+    }
+    if (w > sw) w = sw;
+    if (h > sh) h = sh;
     if (bx > w) bx = w;
     if (by > h) by = h;
     if (ax >= bx || ay >= by)
@@ -503,7 +523,11 @@ void nv2a_tex_decode(const uint8_t *mem, uint32_t fmt, uint32_t w, uint32_t h,
 
 /* One texture stage as the registers program it. */
 struct nv2a_stage {
-    uint32_t offset, color, width, height, pitch, addr_u, addr_v;
+    uint32_t offset, color, width, height, pitch;
+    uint32_t addr_u, addr_v;    /* SET_TEXTURE_ADDRESS per axis, as sampled:
+                                 * NV2A_ADDR_BORDER only with the border
+                                 * colour as the border source */
+    uint32_t border;            /* SET_TEXTURE_BORDER_COLOR, A8R8G8B8 */
     uint32_t palette, pal_len;  /* P8: resolved palette address, entries */
     uint32_t filter;            /* SET_TEXTURE_FILTER as written */
     uint32_t levels;            /* mip levels (1 for linear, or without
@@ -522,6 +546,10 @@ struct nv2a_stage {
     float    bump[4], bump_scale, bump_offset;
     int      raw_mode;  /* the shader program's mode before the gating */
 };
+
+/* SET_TEXTURE_ADDRESS modes: 1 wrap, 2 mirror, 3 clamp to edge, 4 border,
+ * 5 clamp (OpenGL's, taken as clamp to edge). */
+#define NV2A_ADDR_BORDER       4u
 
 #define NV2A_STAGE_MIPS        1u   /* count mip levels as xemu does */
 #define NV2A_STAGE_P8_PALETTE  2u   /* P8 is valid only with a palette */

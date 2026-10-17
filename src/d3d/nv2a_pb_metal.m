@@ -823,7 +823,7 @@ static RenderTarget *surface(void)
      * change (a GPU wait, and at render.scale > 1 the box filter's loss),
      * and a flip found no target of the frame's size. Draws map guest pixels
      * to NDC through rt->w/h, so a larger target keeps every position; a
-     * clear covers only its clip and clear rect (metal_on_clear) and a flip
+     * clear covers only its clear rect or clip (metal_on_clear) and a flip
      * shows only the frame's extent (present_extent). Another pitch at the
      * same offset is a new allocation, not another clip: it gets a target of
      * its own and the overlap rule retires this one. */
@@ -936,7 +936,7 @@ static id<MTLRenderPipelineState> clear_pso(int dt)
     return s_clear_pso[dt];
 }
 
-/* A colour clear covers its clip and clear rect only (nv2a_clear_box), as on
+/* A colour clear covers its clear rect, else its clip (nv2a_clear_box), as on
  * D3D11 and the CPU path: one target serves every clip of its surface
  * (rt_grow). A load action clears a whole attachment, so a box that is the
  * whole target keeps it, and a smaller one is a full-screen triangle of the
@@ -1485,14 +1485,40 @@ static id<MTLTexture> tex_bind(const Stage *t)
     return e->tex;
 }
 
-/* NV2A wrap modes: 1 wrap, 2 mirror, 3 clamp to edge, 4 border, 5 clamp. */
-static MTLSamplerAddressMode address_mode(uint32_t m)
+/* NV2A wrap modes: 1 wrap, 2 mirror, 3 clamp to edge, 4 border, 5 clamp.
+ * Border takes the stage's SET_TEXTURE_BORDER_COLOR (nv2a_stage_decode),
+ * but a Metal sampler offers only three border colours: border_colour picks
+ * the one the register names, and any other colour stays a clamp to edge
+ * (logged once). Burnout 3's is 0x00000000, transparent black. */
+static MTLSamplerAddressMode address_mode(uint32_t m, int border)
 {
     switch (m) {
     case 1:  return MTLSamplerAddressModeRepeat;
     case 2:  return MTLSamplerAddressModeMirrorRepeat;
+    case NV2A_ADDR_BORDER:
+        if (border)
+            return MTLSamplerAddressModeClampToBorderColor;
+        return MTLSamplerAddressModeClampToEdge;
     default: return MTLSamplerAddressModeClampToEdge;
     }
+}
+
+/* MTLSamplerBorderColor + 1 for an A8R8G8B8 border Metal can give, else
+ * 0. */
+static int border_colour(uint32_t argb)
+{
+    static int said;
+    switch (argb) {
+    case 0x00000000u: return 1 + MTLSamplerBorderColorTransparentBlack;
+    case 0xFF000000u: return 1 + MTLSamplerBorderColorOpaqueBlack;
+    case 0xFFFFFFFFu: return 1 + MTLSamplerBorderColorOpaqueWhite;
+    }
+    if (!said) {
+        said = 1;
+        fprintf(stderr, LOGP "texture border colour 0x%08X has no Metal sampler"
+                " colour: clamping to the edge instead\n", argb);
+    }
+    return 0;
 }
 
 /* SET_TEXTURE_FILTER as the D3D11 backend reads it (filter_linear,
@@ -1514,9 +1540,12 @@ static id<MTLSamplerState> sampler(const Stage *t, int bump_source)
     int mn, mg, mip, i;
     unsigned an;
     uint64_t key;
+    int bc = 0;
 
     if (point < 0)
         point = recomp_env(RENV_METAL_POINT) != NULL;
+    if (u == NV2A_ADDR_BORDER || v == NV2A_ADDR_BORDER)
+        bc = border_colour(t->border);
     mn = !point && filter_linear(t->filter, 0);
     mg = !point && filter_linear(t->filter, 1);
     mip = t->levels > 1 ? filter_mip(t->filter) : 0;
@@ -1524,7 +1553,7 @@ static id<MTLSamplerState> sampler(const Stage *t, int bump_source)
      * bit: a bump source in one draw and plain in the next gets its own. */
     an = nv2a_stage_aniso(t, mip, mn, bump_source);
     key = u | v << 4 | (uint64_t)mn << 8 | (uint64_t)mg << 9 | (uint64_t)mip << 10
-        | (uint64_t)an << 35;
+        | (uint64_t)an << 35 | (uint64_t)bc << 40;
     if (mip)
         key |= (uint64_t)t->lod_min << 25 | (uint64_t)t->lod_max << 29;
     for (i = 0; i < s_smp_n; i++)
@@ -1535,9 +1564,11 @@ static id<MTLSamplerState> sampler(const Stage *t, int bump_source)
     sd.magFilter = mg ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
     sd.mipFilter = mip == 2 ? MTLSamplerMipFilterLinear
                  : mip == 1 ? MTLSamplerMipFilterNearest : MTLSamplerMipFilterNotMipmapped;
-    sd.sAddressMode = address_mode(u);
-    sd.tAddressMode = address_mode(v);
+    sd.sAddressMode = address_mode(u, bc);
+    sd.tAddressMode = address_mode(v, bc);
     sd.rAddressMode = MTLSamplerAddressModeClampToEdge;
+    if (bc)
+        sd.borderColor = (MTLSamplerBorderColor)(bc - 1);
     sd.lodMinClamp = mip ? (float)t->lod_min : 0.0f;
     sd.lodMaxClamp = mip ? (float)t->lod_max : 0.0f;
     if (an) {

@@ -83,6 +83,9 @@ target_include_directories(xbox_d3d8 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 if(NOT WIN32)
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/pb_tex_cache
                      ${CMAKE_CURRENT_BINARY_DIR}/pb_tex_cache)
+    # And its vertex-program path's near clip and border colour.
+    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/pb_clip_border
+                     ${CMAKE_CURRENT_BINARY_DIR}/pb_clip_border)
     # And the semaphore release's context DMA base (RAMHT/PRAMIN lookup).
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/pb_semaphore
                      ${CMAKE_CURRENT_BINARY_DIR}/pb_semaphore)

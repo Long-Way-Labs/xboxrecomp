@@ -73,6 +73,23 @@ int d3d8_vsh_generate_hlsl_ex(const NV2AVshProgram *program, unsigned flags,
     "}\n"
 
 /**
+ * nv2a_clip_kills(cm, t): whether a CLIPPLANE (texture-shader mode 5) stage
+ * kills the pixel. cm is the stage's nv2a_ps_consts.clip_mode, 0x10 | its
+ * nibble of SET_SHADER_CLIP_PLANE_MODE (0 when the stage is not CLIPPLANE),
+ * and t its interpolated coordinate, not divided by q: component j is a
+ * user clip-plane distance, and the pixel dies at t[j] >= 0 when bit j is
+ * set, at t[j] < 0 when it is clear (xemu psh.c; the CPU path's
+ * stage_clip_kills). The callers discard at the end, beside the alpha
+ * test, so every derivative before it sees the whole quad. The vector
+ * ternary is FXC's (D3DCompile); DXC with HLSL 2021 needs select() there.
+ */
+#define D3D8_HLSL_CLIP_KILLS \
+    "bool nv2a_clip_kills(uint cm, float4 t) {\n" \
+    "    bool4 ge = ((uint4(cm, cm, cm, cm) >> uint4(0u, 1u, 2u, 3u)) & 1u) != 0u;\n" \
+    "    return (cm & 16u) != 0u && any(ge ? t >= 0.0 : t < 0.0);\n" \
+    "}\n"
+
+/**
  * Generate HLSL pixel shader source from combiner state.
  *
  * The shader evaluates the combiners the way nv2a_combiner.c's evaluator does

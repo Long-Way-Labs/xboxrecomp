@@ -26,8 +26,8 @@
 #define NPROG 400
 #define NCOMB 400
 #define NCASE (2 * NPROG + NCOMB)
-#define EXPECTED_HASH 0x1175d806u      /* all cases, one FNV-1a */
-#define EXPECTED_CHARS 7375660u        /* re-recorded: BUMPENVMAP constants in the cbuffer */
+#define EXPECTED_HASH 0xe55d6979u      /* all cases, one FNV-1a */
+#define EXPECTED_CHARS 7395312u        /* re-recorded: CLIPPLANE clip_mode in the cbuffer */
 
 #include "expected.h"   /* s_expect[NCASE], or HLSL_NO_EXPECT */
 
@@ -91,7 +91,9 @@ static int write_expect(const char *path)
 
 /* Texture-shader modes the hashes above would only catch as "changed": a
  * NONE stage reads (0, 0, 0, 1), as xemu, and CLIPPLANE reads 0 with no
- * texture bound. Stage 0 2D, 1 NONE, 2 CLIPPLANE, 3 NONE. */
+ * texture bound and kills from its own clip_mode word, the only stage that
+ * does. Stage 0 2D, 1 NONE, 2 CLIPPLANE, 3 NONE; then stage 0 alone, which
+ * emits no kill and no helper. */
 static int texmode_check(void)
 {
     static const uint32_t zero[8];
@@ -111,6 +113,20 @@ static int texmode_check(void)
     }
     if (strstr(text, "\n    x10 =") || strstr(text, "Texture2D tex2") || strstr(text, "tex2.Sample")) {
         printf("FAIL: the CLIPPLANE stage is sampled or written\n");
+        bad = 1;
+    }
+    if (!strstr(text, "bool nv2a_clip_kills(uint cm, float4 t)")
+            || !strstr(text, "if (nv2a_clip_kills(clip_mode[2], i.tc2)) discard;")
+            || strstr(strstr(text, "nv2a_clip_kills(clip_mode[") + 1, "nv2a_clip_kills(clip_mode[")) {
+        printf("FAIL: the CLIPPLANE stage does not kill, or another stage does\n");
+        bad = 1;
+    }
+    memset(&st, 0, sizeof st);
+    d3d8_combiners_from_regs(zero, zero, zero, zero, 1u, 0u, 0u, 1u, &st);
+    if (d3d8_combiners_generate_hlsl(&st, text, (int)sizeof text) <= 0)
+        return 1;
+    if (strstr(text, "nv2a_clip_kills")) {
+        printf("FAIL: a shader with no CLIPPLANE stage tests clip planes\n");
         bad = 1;
     }
     return bad;

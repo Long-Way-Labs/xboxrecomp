@@ -436,6 +436,10 @@ BOOL d3d8_combiners_prepare_draw(void)
             cb->tex_scale[i][0] = cb->tex_scale[i][1] = 1.0f;
             cb->tex_scale[i][2] = cb->tex_scale[i][3] = 1.0f;
             cb->tex_mode[i] = (UINT)g_combiner_state.tex_mode[i];
+            /* A WRITE_DISCARD map holds garbage. This path keeps no
+             * SET_SHADER_CLIP_PLANE_MODE, so a CLIPPLANE stage kills nothing
+             * here, as before the constant existed. */
+            cb->clip_mode[i] = 0;
         }
 
         ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_combiner_cb, 0);

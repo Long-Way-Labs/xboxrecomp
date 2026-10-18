@@ -434,6 +434,92 @@ static int index_cases(const uint32_t *buf)
     return f;
 }
 
+/* A CLIPPLANE stage (texture-shader mode 5) kills by its coordinate's
+ * sign: SHADER_CLIP_PLANE_MODE bit 4n+j set kills tc[j] >= 0, clear kills
+ * tc[j] < 0. u runs -1..1 across each quad, so the stage's nibble 0 keeps
+ * the right half and nibble 1 the left (nv2a_backend_smoke's clipplane
+ * scenes, on D3D11). Drawn through a vertex program (oT<stage> = v9), with
+ * one combiner stage, R0 = V0, as the game does, or with none (rc 0), which
+ * takes the basic shader and its stage-0 kill. The other stage's nibble is
+ * always the opposite one, so a kill that reads the wrong nibble flips both
+ * quads. Returns the failures. */
+static int clipplane_case(uint32_t buf, const char *what, int stage, int rc)
+{
+    static const float uv[4][2] = {{-1, 0}, {1, 0}, {1, 1}, {-1, 1}};
+    static const struct { const char *what; int x, y; uint32_t want; } pr[] = {
+        {"nibble 0, u < 0 killed", 150, 150, 0xFF603010u},
+        {"nibble 0, u >= 0 kept", 250, 150, 0xFF30C0E0u},
+        {"nibble 1, u < 0 kept", 150, 330, 0xFF30C0E0u},
+        {"nibble 1, u >= 0 killed", 250, 330, 0xFF603010u},
+    };
+    static const float y0[2] = {100.0f, 280.0f};
+    const uint32_t outs[3][2] = {{0, 0}, {3, 3}, {9u + (uint32_t)stage, 9}};   /* {o, v} */
+    unsigned i;
+    int k, f = 0;
+
+    surf_clear(buf, 640, 480, 0xFF603010u);
+    M(0x0304, 0);                              /* no blend, depth or stencil */
+    M(0x030C, 0);
+    M(0x035C, 0);
+    M(0x032C, 0);
+    M(0x1B0C, 0);                              /* stage 0 unbound */
+    M(0x1E9C, 0);                              /* PROGRAM_LOAD: slot 0 */
+    for (k = 0; k < 3; k++) {
+        M(0x0B00 + 16 * k + 0, 0);
+        M(0x0B00 + 16 * k + 4, (1u << 21) | (outs[k][1] << 9) | 0x1Bu);
+        M(0x0B00 + 16 * k + 8, 2u << 26);      /* A = v */
+        M(0x0B00 + 16 * k + 12, (0xFu << 12) | (1u << 11)
+                                | (outs[k][0] << 3) | (k == 2 ? 1u : 0u));
+    }
+    M(0x1EA0, 0);                              /* PROGRAM_START */
+    M(0x1E94, 2);                              /* EXECUTION_MODE: program */
+    M(0x1E70, 5u << (5 * stage));              /* SHADER_STAGE_PROGRAM: CLIPPLANE */
+    if (rc) {
+        M(0x0AC0, 0x04200000u);                /* COLOR_ICW 0: A V0, B 1 */
+        M(0x1E40, 0x000000C0u);                /* COLOR_OCW 0: AB -> R0 */
+        M(0x0260, 0x14200000u);                /* ALPHA_ICW 0: A V0.a, B 1 */
+        M(0x0AA0, 0x000000C0u);                /* ALPHA_OCW 0: AB -> R0 */
+        M(0x0288, 0x0000000Cu);                /* SPECULAR_FOG_CW0: D = R0 */
+        M(0x028C, 0x00001C80u);                /* SPECULAR_FOG_CW1: G = R0.a */
+    }
+    M(0x1E60, rc ? 0x00000001u : 0u);          /* COMBINER_CONTROL: 1 stage or none */
+    M(0x1760 + 4 * 9, 0x22u);                  /* attr9: float2 */
+    for (k = 0; k < 2; k++) {
+        /* SHADER_CLIP_PLANE_MODE: nibble k for the stage, 1 - k for the other */
+        M(0x17F8, ((uint32_t)k << (4 * stage)) | ((uint32_t)(1 - k) << (4 * (1 - stage))));
+        M(0x17FC, 8);
+        vertex_uv(100.0f, y0[k],          0xFF30C0E0u, uv[0]);
+        vertex_uv(300.0f, y0[k],          0xFF30C0E0u, uv[1]);
+        vertex_uv(300.0f, y0[k] + 100.0f, 0xFF30C0E0u, uv[2]);
+        vertex_uv(100.0f, y0[k] + 100.0f, 0xFF30C0E0u, uv[3]);
+        M(0x17FC, 0);
+    }
+    M(0x17F8, 0);
+    M(0x1E94, 0);                              /* fixed function again */
+    M(0x1E60, 0);                              /* combiners off */
+    M(0x1E70, 1u);                             /* stage 0 2D: the power-on mapping */
+    M(0x1760 + 4 * 9, 0x02u);
+    M(0x1B0C, 0);                              /* stage 0 off, as border_cases leaves it */
+    for (i = 0; i < sizeof pr / sizeof pr[0]; i++) {
+        uint32_t c = nv2a_pb_d3d11_pixel(buf, pr[i].x, pr[i].y);
+        int ok = (c & 0x00FFFFFFu) == (pr[i].want & 0x00FFFFFFu);
+        fprintf(stderr, "[backend-smoke] clipplane %s: %-24s 0x%08X (want 0x%08X) %s\n",
+                what, pr[i].what, c, pr[i].want, ok ? "PASS" : "FAIL");
+        f += !ok;
+    }
+    return f;
+}
+
+/* Stage 0 under a combiner, stage 1 under a combiner (the 4n nibble shift),
+ * and stage 0 with no combiners (the basic shader's kill, which only the
+ * GPU paths have: the CPU path's no-combiner rasteriser kills only a
+ * textured stage 0). Returns the failures. */
+static int clipplane_cases(uint32_t buf)
+{
+    return clipplane_case(buf, "t0", 0, 1) + clipplane_case(buf, "t1", 1, 1)
+           + clipplane_case(buf, "t0 basic", 0, 0);
+}
+
 /* Present a 320x240 frame of a 640x480 target (buf, bound): red whole
  * frames first, into both swap-chain buffers, then more than
  * PRESENT_STALE_FLIPS flips of a blue 320x240 clip, so the walker's present
@@ -1446,6 +1532,10 @@ int main(int argc, char **argv)
     if (border_cases(buf[0])) {
         fprintf(stderr, "[backend-smoke] FAIL: texture border colour\n");
         return 10;
+    }
+    if (clipplane_cases(buf[0])) {
+        fprintf(stderr, "[backend-smoke] FAIL: CLIPPLANE texture-shader kills\n");
+        return 11;
     }
     if (surface_cases(buf[0])) {
         fprintf(stderr, "[backend-smoke] FAIL: present.surface=internal scale change\n");

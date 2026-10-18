@@ -184,9 +184,12 @@ static void make_textures(void)
         }
 }
 
-enum { SC_CLEAR_QUAD, SC_CHECKER, SC_YUY2, SC_BLEND, SC_BIGIDX, SC_ELEM32, SC_COUNT };
-static const char *const s_scene_name[SC_COUNT] = {"clear_quad", "checker", "yuy2", "blend",
-                                                   "bigidx", "elem32"};
+/* SC_CLIPBASIC is past SC_COUNT: a GPU-only scene, outside the compare. */
+enum { SC_CLEAR_QUAD, SC_CHECKER, SC_YUY2, SC_BLEND, SC_BIGIDX, SC_ELEM32, SC_CLIPPLANE,
+       SC_CLIPPLANE1, SC_COUNT, SC_CLIPBASIC = SC_COUNT };
+static const char *const s_scene_name[SC_COUNT + 1] = {
+    "clear_quad", "checker", "yuy2", "blend", "bigidx", "elem32", "clipplane", "clipplane1",
+    "clipbasic"};
 
 /* bigidx: 40 x 30 cells of 16 pixels, a 12-pixel quad in each, one batch. */
 #define GRID_COLS  40u
@@ -204,6 +207,12 @@ static const struct probe s_probe_bigidx[] = {
 static const struct probe s_probe_elem32[] = {
     {470, 370, COL_TRI},                    /* the last triangle's corner */
     {150, 330, 0xFFE02020u},                /* the red rectangle */
+};
+#define COL_CLIP 0xFF30C0E0u                /* clipplane's quads */
+#define COL_BG   0xFF603010u                /* COLOR_CLEAR_VALUE */
+static const struct probe s_probe_clip[] = {
+    {150, 150, COL_BG},   {250, 150, COL_CLIP},  /* nibble 0: dies at u < 0 */
+    {150, 330, COL_CLIP}, {250, 330, COL_BG},    /* nibble 1: dies at u >= 0 */
 };
 
 /* Vertex arrays at VB_GUEST: attr0 float4 position (pixels, w 1) and attr3
@@ -282,6 +291,60 @@ static void stage0_checker(void)
     M(0x1B0C, 0x40000000u);                /* CONTROL0: enable */
 }
 
+/* Texture-shader mode 5 (CLIPPLANE) on `stage` under one register-combiner
+ * stage, R0 = V0, and a final combiner that outputs R0 (rc), or under no
+ * combiners (the GPU paths' basic shader, stage 0 only). The stage's
+ * coordinate runs u from -1 to 1 across each quad (v 0..1, z 0, w 1), with
+ * u = 0 between pixel columns 199 and 200, so no pixel centre sits on the
+ * plane. The top quad takes nibble 0 for the stage (every component dies at
+ * < 0: the left half goes), the bottom one nibble 1 (u dies at >= 0: the
+ * right half goes); the other stage's nibble is the opposite, so a kill
+ * that reads the wrong nibble flips both quads. With combiners the CPU path
+ * (stage_clip_kills) is the reference; a GPU path that ignores the plane
+ * draws both quads whole. Without them the CPU path kills only a textured
+ * stage 0, so the basic scene is checked by its probes alone. The quads go
+ * through a vertex program (mov oPos, v0; mov oD0, v3; mov oT<stage>, v9,
+ * as d3d11_backend_smoke's), since only the CPU path's program rasteriser
+ * runs texture shaders and combiners. */
+static void scene_clipplane(int stage, int rc)
+{
+    static const uint32_t c[4] = {COL_CLIP, COL_CLIP, COL_CLIP, COL_CLIP};
+    static const float uv[4][2] = {{-1, 0}, {1, 0}, {1, 1}, {-1, 1}};
+    const uint32_t outs[3][2] = {{0, 0}, {3, 3}, {9u + (uint32_t)stage, 9}};   /* {o, v} */
+    int k;
+
+    M(0x1E9C, 0);                          /* PROGRAM_LOAD: slot 0 */
+    for (k = 0; k < 3; k++) {
+        M(0x0B00 + 16 * k + 0, 0);
+        M(0x0B00 + 16 * k + 4, (1u << 21) | (outs[k][1] << 9) | 0x1Bu);
+        M(0x0B00 + 16 * k + 8, 2u << 26);  /* A = v */
+        M(0x0B00 + 16 * k + 12, (0xFu << 12) | (1u << 11)
+                                | (outs[k][0] << 3) | (k == 2 ? 1u : 0u));
+    }
+    M(0x1EA0, 0);                          /* PROGRAM_START */
+    M(0x1E94, 2);                          /* EXECUTION_MODE: program */
+    M(0x1E70, 5u << (5 * stage));          /* SHADER_STAGE_PROGRAM: CLIPPLANE */
+    if (rc) {
+        M(0x0AC0, 0x04200000u);            /* COLOR_ICW 0: A V0, B 1 */
+        M(0x1E40, 0x000000C0u);            /* COLOR_OCW 0: AB -> R0 */
+        M(0x0260, 0x14200000u);            /* ALPHA_ICW 0: A V0.a, B 1 */
+        M(0x0AA0, 0x000000C0u);            /* ALPHA_OCW 0: AB -> R0 */
+        M(0x0288, 0x0000000Cu);            /* SPECULAR_FOG_CW0: D = R0 */
+        M(0x028C, 0x00001C80u);            /* SPECULAR_FOG_CW1: G = R0.a */
+    }
+    M(0x1E60, rc ? 0x00000001u : 0u);      /* COMBINER_CONTROL: 1 stage or none */
+    M(0x1760 + 4 * 9, 0x22u);              /* attr9: float2 */
+    M(0x17F8, 0x1u << (4 * (1 - stage)));  /* SHADER_CLIP_PLANE_MODE: nibble 0 */
+    quad_uv(100.0f, 100.0f, 300.0f, 200.0f, c, uv);
+    M(0x17F8, 0x1u << (4 * stage));        /* nibble 1 */
+    quad_uv(100.0f, 280.0f, 300.0f, 380.0f, c, uv);
+    M(0x17F8, 0);
+    M(0x1E94, 0);                          /* fixed function again */
+    M(0x1E60, 0);                          /* combiners off */
+    M(0x1E70, 1u);                         /* stage 0 2D: the power-on mapping */
+    M(0x1760 + 4 * 9, 0x02u);
+}
+
 /* One scene into the surface at `buf`, then the flip. */
 static void scene(int sc, uint32_t buf, uint32_t other)
 {
@@ -305,6 +368,12 @@ static void scene(int sc, uint32_t buf, uint32_t other)
     for (a = 0; a < 16; a++)               /* VERTEX_DATA_ARRAY_FORMAT */
         M(0x1760 + 4 * a, a == 0 ? 0x42u : a == 3 ? 0x40u : 0x02u);
 
+    if (sc == SC_CLIPPLANE || sc == SC_CLIPPLANE1 || sc == SC_CLIPBASIC) {
+        scene_clipplane(sc == SC_CLIPPLANE1, sc != SC_CLIPBASIC);
+        M(0x0210, other);
+        M(0x0130, 0);
+        return;
+    }
     if (sc == SC_BIGIDX || sc == SC_ELEM32) {
         if (sc == SC_BIGIDX)
             scene_bigidx();
@@ -1829,15 +1898,19 @@ static int mode_height_cases(const struct nv2a_pb_backend *gpu)
     return f;
 }
 
-/* The absolute checks of bigidx and elem32, on one path's frame. */
+/* The absolute checks of bigidx, elem32 and the clipplane scenes, on one
+ * path's frame. */
 static int probes_ok(int sc, const char *path, const uint32_t *px)
 {
-    const struct probe *p = sc == SC_BIGIDX ? s_probe_bigidx : s_probe_elem32;
+    const struct probe *p = sc == SC_BIGIDX ? s_probe_bigidx
+                          : sc == SC_ELEM32 ? s_probe_elem32 : s_probe_clip;
     uint32_t n = sc == SC_BIGIDX ? sizeof s_probe_bigidx / sizeof *p
-                                 : sizeof s_probe_elem32 / sizeof *p, i;
+               : sc == SC_ELEM32 ? sizeof s_probe_elem32 / sizeof *p
+                                 : sizeof s_probe_clip / sizeof *p, i;
     int ok = 1;
 
-    if (sc != SC_BIGIDX && sc != SC_ELEM32)
+    if (sc != SC_BIGIDX && sc != SC_ELEM32 && sc != SC_CLIPPLANE && sc != SC_CLIPPLANE1
+            && sc != SC_CLIPBASIC)
         return 1;
     for (i = 0; i < n; i++) {
         uint32_t got = px[p[i].y * W + p[i].x] & 0x00FFFFFFu;
@@ -1960,6 +2033,12 @@ int main(int argc, char **argv)
         if (f)
             fprintf(stderr, "[backend-smoke] FAIL: %d border colour cases\n", f);
         failures += f;
+        /* The basic shader's CLIPPLANE stage-0 kill: probes only (see
+         * scene_clipplane). */
+        if (!run(gpu, SC_CLIPBASIC, gpu_px, k++) || !probes_ok(SC_CLIPBASIC, "gpu", gpu_px)) {
+            fprintf(stderr, "[backend-smoke] FAIL: clipbasic, the no-combiner CLIPPLANE kill\n");
+            failures++;
+        }
     }
     if (gpu == nv2a_pb_metal_backend() && run(nv2a_pb_cpu_backend(), SC_CLEAR_QUAD, cpu_px, 0)) {
         int f = writeback_cases(gpu, cpu_px, gpu_px);

@@ -85,6 +85,11 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
     EMIT("%s", s_rc_helpers);
     if (state->rect_snap)
         EMIT("%s", D3D8_MSL_SNAP_UV);
+    for (i = 0; i < NV2A_MAX_TEXTURES; i++)
+        if ((int)state->tex_mode[i] == NV2A_TEXMODE_CLIPPLANE) {
+            EMIT("%s", D3D8_MSL_CLIP_KILLS);
+            break;
+        }
 
     EMIT("fragment float4 fs_main(VOut i [[stage_in]],\n"
          "                        constant PsConsts &pc [[buffer(0)]]");
@@ -238,6 +243,11 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
     }
     EMIT("        res = float4(saturate(A * B + (1.0 - A) * C + D), G);\n");
     EMIT("    }\n");
+
+    /* ---- CLIPPLANE stages: the coordinate's four plane distances ---- */
+    for (i = 0; i < NV2A_MAX_TEXTURES; i++)
+        if ((int)state->tex_mode[i] == NV2A_TEXMODE_CLIPPLANE)
+            EMIT("    if (nv2a_clip_kills(pc.clip_mode[%d], i.t%d)) discard_fragment();\n", i, i);
 
     /* ---- Alpha test: D3DCMP numbering on 8-bit values ---- */
     EMIT("    if (pc.atest.z != 0u) {\n"

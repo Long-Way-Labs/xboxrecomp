@@ -45,9 +45,16 @@ extern "C" {
     "struct PsConsts {\n" \
     "    float4 c0[8]; float4 c1[8]; float4 fc0; float4 fc1; float4 fog_color;\n" \
     "    uint4 atest; uint4 alpha_only; float4 tex_scale[4]; uint4 tex_mode;\n" \
-    "    float4 bump[4]; float4 bumpls[4];\n" \
+    "    float4 bump[4]; float4 bumpls[4]; uint4 clip_mode;\n" \
     "    float4 tex_bias;\n" \
     "};\n"
+
+/** D3D8_HLSL_CLIP_KILLS (d3d8_hlsl.h) in MSL. */
+#define D3D8_MSL_CLIP_KILLS \
+    "bool nv2a_clip_kills(uint cm, float4 t) {\n" \
+    "    bool4 ge = ((uint4(cm) >> uint4(0u, 1u, 2u, 3u)) & 1u) != 0u;\n" \
+    "    return (cm & 16u) != 0u && any(select(t < 0.0, t >= 0.0, ge));\n" \
+    "}\n"
 
 /** D3D8_HLSL_SNAP_UV (d3d8_hlsl.h) in MSL; pos is [[position]].xy. */
 #define D3D8_MSL_SNAP_UV \

@@ -129,7 +129,7 @@ _Static_assert(offsetof(struct nv2a_vp_consts, u) == 48, "nv2a_vp_consts.u moved
 /* PsConsts (MSL): float4 c0[8], c1[8], fc0, fc1, fog_color; uint4 atest
  * (x alpha_ref as float bits, y alpha_func, z alpha_test_enable, w fog_enable);
  * uint4 alpha_only; float4 tex_scale[4]; uint4 tex_mode; float4 bump[4];
- * float4 bumpls[4] (BUMPENVMAP). */
+ * float4 bumpls[4] (BUMPENVMAP); uint4 clip_mode (CLIPPLANE). */
 #define PS_AT(m, off) \
     _Static_assert(offsetof(struct nv2a_ps_consts, m) == (off), "nv2a_ps_consts." #m " moved")
 PS_AT(c0, 0);
@@ -146,8 +146,9 @@ PS_AT(tex_scale, 336);
 PS_AT(tex_mode, 400);
 PS_AT(bump, 416);
 PS_AT(bumpls, 480);
+PS_AT(clip_mode, 544);
 #undef PS_AT
-_Static_assert(sizeof(struct nv2a_ps_consts) == 544, "nv2a_ps_consts size changed");
+_Static_assert(sizeof(struct nv2a_ps_consts) == 560, "nv2a_ps_consts size changed");
 
 /* The MSL PsConsts: the shared constants plus Metal's own trailing float4
  * tex_bias (per stage mip LOD bias, passed to sample() as bias()). Kept out
@@ -156,7 +157,7 @@ typedef struct {
     struct nv2a_ps_consts b;
     float tex_bias[4];
 } MsPsConsts;
-_Static_assert(offsetof(MsPsConsts, tex_bias) == 544 && sizeof(MsPsConsts) == 560,
+_Static_assert(offsetof(MsPsConsts, tex_bias) == 560 && sizeof(MsPsConsts) == 576,
                "MsPsConsts.tex_bias moved");
 _Static_assert(sizeof(float) == 4 && sizeof(uint32_t) == 4, "alpha_ref is read as uint bits");
 
@@ -190,10 +191,11 @@ static const char s_msl[] =
     "    return o;\n"
     "}\n"
     /* Batches without register combiners (and, in M1, all of them): the CPU
-     * path's MODULATE, oD0 * T0 when stage 0 is on, then the alpha test
-     * (D3DCMP numbering, on the 8-bit values the way the CPU compares them).
-     * Line for line the D3D11 backend's s_ps_src. */
+     * path's MODULATE, oD0 * T0 when stage 0 is on, a CLIPPLANE stage 0's
+     * kill, then the alpha test (D3DCMP numbering, on the 8-bit values the
+     * way the CPU compares them). Line for line the D3D11 backend's s_ps_src. */
     D3D8_MSL_SNAP_UV
+    D3D8_MSL_CLIP_KILLS
     "fragment float4 fs_basic(VOut i [[stage_in]],\n"
     "                         constant PsConsts &pc [[buffer(0)]],\n"
     "                         texture2d<float> tex0 [[texture(0)]],\n"
@@ -207,6 +209,7 @@ static const char s_msl[] =
     "        uv = nv2a_snap_uv(uv, i.pos.xy, pc.tex_scale[0]);\n"
     "        c *= tex0.sample(samp0, uv * pc.tex_scale[0].xy, bias(pc.tex_bias.x));\n"
     "    }\n"
+    "    if (nv2a_clip_kills(pc.clip_mode.x, i.t0)) discard_fragment();\n"
     "    if (pc.atest.z != 0u) {\n"
     "        float ref = as_type<float>(pc.atest.x);\n"
     "        uint a = (uint)(saturate(c.a) * 255.0 + 0.5), r = (uint)(ref * 255.0 + 0.5);\n"
@@ -1285,7 +1288,7 @@ static void build_stages(void)
                           NV2A_STAGE_P8_PALETTE | NV2A_STAGE_PITCH_LINEAR
                           | (no_mips() ? 0u : NV2A_STAGE_MIPS), t);
         if (t->mode == 5)
-            t->mode = 0;    /* CLIP_PLANE: no texture */
+            t->mode = 0;    /* CLIP_PLANE: no texture; the kill is clip_mode's */
     }
 }
 

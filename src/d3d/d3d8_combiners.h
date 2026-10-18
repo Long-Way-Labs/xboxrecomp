@@ -73,6 +73,7 @@ typedef struct NV2APSConstants {
     UINT  tex_mode[NV2A_MAX_TEXTURES];         /* NV2ATextureMode per stage */
     float bump[NV2A_MAX_TEXTURES][4];       /* BUMPENVMAP matrix (nv2a_ps_consts) */
     float bumpls[NV2A_MAX_TEXTURES][4];     /* x: luminance scale, y: offset */
+    UINT  clip_mode[NV2A_MAX_TEXTURES];     /* CLIPPLANE kill (nv2a_ps_consts) */
 } NV2APSConstants;
 
 /* ================================================================

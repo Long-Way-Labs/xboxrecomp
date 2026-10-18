@@ -232,7 +232,8 @@ void nv2a_stage_decode(int n, const uint32_t *r, const uint8_t *set,
     memcpy(&t->bump_scale, &r[0x38 / 4], 4);
     memcpy(&t->bump_offset, &r[0x3C / 4], 4);
     /* PASSTHRU and CLIPPLANE have no texture to be valid: they stay. The
-     * GPU backends drop CLIPPLANE to 0 themselves (no per-pixel kill yet). */
+     * GPU backends bind CLIPPLANE as 0 (no texture) and kill its pixels from
+     * nv2a_ps_consts.clip_mode instead. */
     if (mode != 4 && mode != 5 && (!on || !t->valid))
         mode = 0;
     t->mode = mode;
@@ -366,6 +367,9 @@ void nv2a_ps_consts_fill(const struct nv2a_pb_vsh *v,
         memcpy(pc->bump[n], t->bump, sizeof pc->bump[n]);
         pc->bumpls[n][0] = t->bump_scale;
         pc->bumpls[n][1] = t->bump_offset;
+        /* raw_mode, not mode: the backends bind a CLIPPLANE stage as 0. */
+        if (t->raw_mode == 5)
+            pc->clip_mode[n] = 0x10u | ((v->clip_plane_mode >> (4 * n)) & 0xFu);
     }
     for (n = 0; n < 8; n++) {
         nv2a_argb_to_float4(v->rc_f0[n], pc->c0[n]);

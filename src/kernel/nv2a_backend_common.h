@@ -934,6 +934,13 @@ struct nv2a_ps_consts {
      * offset (y). */
     float    bump[4][4];
     float    bumpls[4][4];
+    /* CLIPPLANE (mode 5) stages: 0x10 | the stage's nibble of
+     * SET_SHADER_CLIP_PLANE_MODE, else 0. Bit j set kills the pixel where
+     * the interpolated coordinate's component j is >= 0, clear where it is
+     * < 0 (stage_clip_kills). The flag is there because nibble 0 is a real
+     * setting and tex_mode reads 0 for a CLIPPLANE stage, which binds no
+     * texture: without it fs_basic could not tell the stage from NONE. */
+    uint32_t clip_mode[4];
 };
 
 /* tex_scale[n].z for stage t at render scale `scale`: the scale when the

@@ -179,6 +179,7 @@ PS_ABI_SAME(tex_scale, tex_scale);
 PS_ABI_SAME(tex_mode, tex_mode);
 PS_ABI_SAME(bump, bump);
 PS_ABI_SAME(bumpls, bumpls);
+PS_ABI_SAME(clip_mode, clip_mode);
 _Static_assert(sizeof(PsConsts) == sizeof(NV2APSConstants),
                "PsConsts and NV2APSConstants differ in size");
 #undef PS_ABI_SAME
@@ -188,7 +189,7 @@ _Static_assert(sizeof(PsConsts) == sizeof(NV2APSConstants),
     "    float4 c0[8]; float4 c1[8]; float4 fc0; float4 fc1; float4 fog_color;\n" \
     "    float alpha_ref; uint alpha_func; uint alpha_test_enable; uint fog_enable;\n" \
     "    uint4 alpha_only; float4 tex_scale[4]; uint4 tex_mode;\n" \
-    "    float4 bump[4]; float4 bumpls[4];\n" \
+    "    float4 bump[4]; float4 bumpls[4]; uint4 clip_mode;\n" \
     "};\n"
 
 static uint64_t s_presents, s_clears, s_draws, s_draws_skipped;
@@ -385,12 +386,13 @@ static ID3D11Buffer *make_buffer(UINT size, UINT bind)
     "};\n"
 
 /* Batches without register combiners: the CPU path's MODULATE, oD0 * T0
- * when stage 0 is on, then the alpha test (D3DCMP numbering, on the 8-bit
- * values the way the CPU compares them). */
+ * when stage 0 is on, a CLIPPLANE stage 0's kill, then the alpha test
+ * (D3DCMP numbering, on the 8-bit values the way the CPU compares them). */
 static const char s_ps_src[] =
     VS_OUT_DECL
     PS_CB_DECL
     D3D8_HLSL_SNAP_UV
+    D3D8_HLSL_CLIP_KILLS
     "Texture2D tex0 : register(t0);\n"
     "SamplerState samp0 : register(s0);\n"
     "float4 main(VS_OUT i) : SV_Target {\n"
@@ -405,6 +407,7 @@ static const char s_ps_src[] =
     "        if (alpha_only.x == 2u) t.a = 1.0;\n"
     "        c *= t;\n"
     "    }\n"
+    "    if (nv2a_clip_kills(clip_mode.x, i.oT0)) discard;\n"
     "    if (alpha_test_enable != 0u) {\n"
     "        uint a = (uint)(saturate(c.a) * 255.0 + 0.5), r = (uint)(alpha_ref * 255.0 + 0.5);\n"
     "        bool ok = true;\n"
@@ -1593,8 +1596,8 @@ static void build_stages(void)
             }
         }
         if (t->mode == 5)
-            t->mode = 0;    /* CLIP_PLANE: no texture, the register reads 0
-                             * (ponytail: its per-pixel discard is not done) */
+            t->mode = 0;    /* CLIP_PLANE: no texture, the register reads 0;
+                             * the kill is clip_mode's (nv2a_ps_consts_fill) */
     }
 }
 

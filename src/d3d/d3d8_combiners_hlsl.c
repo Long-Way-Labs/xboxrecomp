@@ -92,7 +92,7 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
          "    float4 c0[8]; float4 c1[8]; float4 fc0; float4 fc1; float4 fog_color;\n"
          "    float alpha_ref; uint alpha_func; uint alpha_test_enable; uint fog_enable;\n"
          "    uint4 alpha_only; float4 tex_scale[4]; uint4 tex_mode;\n"
-         "    float4 bump[4]; float4 bumpls[4];\n"
+         "    float4 bump[4]; float4 bumpls[4]; uint4 clip_mode;\n"
          "};\n");
 
     /* ---- Input: a prefix of d3d8_vsh.c's VS_OUT ---- */
@@ -110,6 +110,11 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
     EMIT("%s", s_rc_helpers);
     if (state->rect_snap)
         EMIT("%s", D3D8_HLSL_SNAP_UV);
+    for (i = 0; i < NV2A_MAX_TEXTURES; i++)
+        if ((int)state->tex_mode[i] == NV2A_TEXMODE_CLIPPLANE) {
+            EMIT("%s", D3D8_HLSL_CLIP_KILLS);
+            break;
+        }
 
     EMIT("float4 main(PS_IN i) : SV_Target {\n");
     for (k = 0; k < 16; k++)
@@ -256,6 +261,11 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
     }
     EMIT("        res = float4(saturate(A * B + (1.0 - A) * C + D), G);\n");
     EMIT("    }\n");
+
+    /* ---- CLIPPLANE stages: the coordinate's four plane distances ---- */
+    for (i = 0; i < NV2A_MAX_TEXTURES; i++)
+        if ((int)state->tex_mode[i] == NV2A_TEXMODE_CLIPPLANE)
+            EMIT("    if (nv2a_clip_kills(clip_mode[%d], i.tc%d)) discard;\n", i, i);
 
     /* ---- Alpha test: D3DCMP numbering on 8-bit values ---- */
     EMIT("    if (alpha_test_enable != 0u) {\n"

@@ -29,6 +29,12 @@ add_compile_definitions(
 
 # Option to build examples
 
+# The umbrella target the game links (filled in below): made first so the
+# reproducible-build flags reach the libraries and, through it, the game.
+add_library(xboxrecomp INTERFACE)
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/reproducible.cmake)
+xboxrecomp_reproducible(xboxrecomp ${CMAKE_CURRENT_SOURCE_DIR})
+
 # ── Runtime Libraries ─────────────────────────────────────────
 
 # Platform: Win32/NT type vocabulary + POSIX implementation of generic
@@ -89,7 +95,6 @@ if(XBOXRECOMP_ENHANCE)
     # In the list, so GNU ld sees it inside the group below.
     list(APPEND XBOXRECOMP_LIBS xbox_enhance)
 endif()
-add_library(xboxrecomp INTERFACE)
 if(UNIX AND NOT APPLE)
     # The archives call each other both ways (the APU reaches the kernel's
     # memory map, the kernel raises the APU's interrupt). GNU ld scans each

@@ -9,6 +9,20 @@ blinx2-v0.3.2; earlier tags are described by their commits.
 
 ## [Unreleased]
 
+## [blinx2-v0.5.1] - 2026-10-17
+
+### Added
+- Reproducible builds, opt-in per game through `cmake/reproducible.cmake`:
+  file prefix maps for the game, the toolkit, the build tree and the
+  llvm-mingw root, no link timestamp and a stable PDB, so the same
+  sources and options give the same bytes in any folder. Packagers use
+  this to ship patch updates with only the files that changed.
+
+### Fixed
+- Texture-shader CLIPPLANE stages now kill pixels on the Metal and D3D11
+  backends, as the CPU rasteriser already did; before, user clip planes
+  cut nothing on the GPU paths.
+
 ## [blinx2-v0.5.0] - 2026-10-17
 
 ### Changed
